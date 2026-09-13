@@ -517,6 +517,34 @@ class RetopPatchState(bpy.types.PropertyGroup):
     # span_u/span_v/span directly. Cleared whenever the active patch changes.
     side_overrides: bpy.props.StringProperty(name="Side Overrides", default="")
 
+    # --- the corner set of the active patch (Ctrl+click a side to edit it) ---
+    #
+    # A Plasticity face with five B-rep vertices is filled by the N-Side fan,
+    # and the fan is often not what the shape wants: a pentagon born of a quad
+    # with one corner cut reads as a *quad* whose bottom side is two sides in a
+    # row. Demoting that junction -- keeping the vertex, dropping its status as
+    # a side boundary -- is what turns the five sides into four groups, and
+    # `find_generator` then picks the Quad it should have had all along.
+    #
+    # A sub-state of ADJUST rather than a phase of its own: the patch is still
+    # open and still has spans, so every `session_phase == 'ADJUST'` test in the
+    # overlay and the operators stays true. What the flag does is take the
+    # mouse and the commit keys for the length of the edit -- see
+    # `operators._in_phase`, which is where the exclusion lives once.
+    corner_edit: bpy.props.BoolProperty(name="Editing Corners", default=False)
+    # Corner nearest the cursor while that is on, by flat side index -- a
+    # corner is named by the side it *starts*, which is what makes "merge into
+    # the previous side" the one unambiguous reading of a click.
+    hovered_corner: bpy.props.IntProperty(name="Hovered Corner", default=-1)
+    # The demoted ones, as a JSON list of those same indices. Per patch:
+    # cleared by `set_active_patch` with the pins, since both name a side by an
+    # index that means nothing on the next patch.
+    corner_overrides: bpy.props.StringProperty(name="Corner Overrides", default="")
+    # What to put back on Esc. The edit is a session in miniature -- several
+    # clicks, then accept or cancel -- so it owes the user a way out that does
+    # not commit the patch.
+    corner_edit_backup: bpy.props.StringProperty(name="Corner Backup", default="")
+
     # --- retop session (see operators.RETOP_OT_session) ---
     session_active: bpy.props.BoolProperty(name="Session Active", default=False)
     session_object_name: bpy.props.StringProperty(name="Session Object", default="")

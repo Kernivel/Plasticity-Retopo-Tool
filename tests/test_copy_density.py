@@ -174,8 +174,17 @@ class FakeEvent:
 
 plain = pr.keymap.session_actions_for(FakeEvent('LEFTMOUSE'))
 ctrl = pr.keymap.session_actions_for(FakeEvent('LEFTMOUSE', ctrl=True))
-check("a plain left click is the side picker's", plain == ["pin_neighbour"], plain)
-check("and Ctrl+click is the density copy", ctrl == ["copy_spans"], ctrl)
+# Each button now carries two actions, separated by their polls rather than by
+# their modifiers: the corner editor takes both while it is open, and declares
+# them first so it wins. What must not change is which one answers with the
+# editor closed, which is every case this file is about.
+check("a plain left click offers the side picker, under the corner editor",
+      plain == ["corner_toggle", "pin_neighbour"], plain)
+check("and Ctrl+click offers the density copy, under the corner editor",
+      ctrl == ["corners_edit", "copy_spans"], ctrl)
+check("with the editor closed the corner actions poll false, so the click is the copy's",
+      not state.corner_edit and not bpy.ops.retop.toggle_corner.poll()
+      and not bpy.ops.retop.corners_accept.poll())
 check("the two never resolve to each other -- modifiers compare exactly",
       not set(plain) & set(ctrl), (plain, ctrl))
 

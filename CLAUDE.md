@@ -1072,6 +1072,77 @@ to exchange, which is reported rather than ignored. The tooltip shows the
 spans **as the next click would apply them**, so it previews the click instead
 of describing the record.
 
+**Which corners are side boundaries is a choice, and `Ctrl`+click on a side
+opens it.** A Plasticity face with five B-rep vertices goes to the N-Side fan,
+and the fan is usually not what the shape wants: a pentagon born of a quad with
+one corner cut, chamfered or booleaned reads as a *quad* whose bottom side
+happens to be two sides in a row. Turning that junction off — keeping the
+vertex, dropping its status as a side boundary — merges the two sides meeting
+there, and four groups is what `find_generator` should then be handed.
+
+**A corner, not a side, and that is the whole of the gesture.** "Turn side 2
+off" has to say whether 2 joins 1 or 3; "turn this corner off" merges the two
+sides that meet at it and there is nothing left to choose. A corner is named by
+the side it *starts*, so one flat index serves the overlay, the hit test and
+the stored override. `sidematch.corner_groups` / `loop_group_counts` are the
+grouping, in `sidematch` because the **overlay** reads them on every redraw and
+a draw handler may never import `operators`; only `nearest_corner_to_cursor`
+stays there, since it needs a region.
+
+**A sub-state of `ADJUST`, never a phase of its own.** `session_phase ==
+'ADJUST'` is tested at some twenty places — eight in `overlay` alone — and the
+patch is still open, still has spans, still has a preview, so every one of them
+must stay true. An enum value would have turned them all off in silence.
+`state.corner_edit` is the flag and `operators._in_phase` is where the
+exclusion lives once, so every action polling through it is inert for the
+length of the edit without restating it; the two CAD displays opt back in with
+`during_corner_edit=True`, because the structure is read *while* choosing
+corners. `commit`, `back`, `pin_neighbour`, `copy_spans` and `delete_patch`
+spell their own polls and exclude it by hand.
+
+**One key, two meanings, resolved by poll — and both halves written out.** The
+editor takes the plain click, `Enter`/right-click and `Esc`; it wins by being
+declared **first** in `ACTIONS` *and* by the patch's own actions polling on it
+being closed. Either alone would work today, and "it works by an order nothing
+states" is exactly what sent `Tab` to `object.editmode_toggle`. `Ctrl`+click is
+split the way the plain click already is — by what is under the cursor: a
+**side** of this patch opens the editor, anything else copies a density. So
+`copy_spans` now polls `hovered_side == -1`, and `_modal_match` stops writing
+`copy_hover_face_id` while a side is hovered — an amber outline promising a
+copy and delivering a mode is the failure the hover exists to prevent. Neither
+branch destroys anything, which is what makes a few pixels of ambiguity
+affordable; `X` falling through to `object.delete` is what it looks like when
+that is not true.
+
+**A loop is never taken below two sides.** One closed side is what
+`sides.synthesise_corners` exists to undo, and `find_generator` starts at
+Wedge 2 — so demoting the last corner of a loop would leave the patch silently
+unpickable. Refused at the click, while the editor is still open to undo it.
+Esc restores the set the editor was opened with (`corner_edit_backup`): the
+edit is several clicks long, so it owes a way out that neither commits the
+patch nor keeps a half-made corner set.
+
+The overlay paints the sides **by group** while it is open, in colours that are
+neither green nor red — those two mean "welds" and "cracks" everywhere else
+here, and a group is neither — with the side picker's own colours and tooltip
+suppressed for the duration. A demoted corner is drawn small and dark rather
+than not at all: it is still a vertex of the mesh, and one that vanished would
+read as geometry lost. `tests/test_corner_edit.py`.
+
+**Not wired into the generators yet.** The grouping is chosen, stored and
+drawn; `_generate_for_face` still hands the ungrouped sides over, so a pentagon
+is still filled by the fan. The test says so out loud so a green suite is not
+read as "five-sided patches are handled". What the next step needs, and why it
+is the only real work here: the demoted corner must stay a **mesh vertex**,
+because neighbours weld to it, and `resample_polyline_by_arclength` over a
+merged side would slide off it — so the group's span has to be allocated per
+sub-side as integers, the way `nside.spoke_allocation` allocates spokes.
+Matching stays per *real* side throughout (`side_neighbours` and `_match_pool`
+must keep seeing five), and what is given up is that corner's
+`retop_source_vid`: it welds by proximity instead of identity, and span
+propagation out of it stops — the same trade `sidematch._recut_arbitrary_loop`
+already accepts.
+
 **A neighbour covering part of a side is completed, not refused — and only
 when you point at it.** A bore's rim is one long cornerless side and the patch
 beside it may touch an eighth of it; matching used to refuse outright. What it

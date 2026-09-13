@@ -462,6 +462,82 @@ PIN_EXCLUDED = "-"
 PIN_KINDS = (PIN_NEIGHBOUR, PIN_EXCLUDED)
 
 
+# --- the corner set of the active patch --------------------------------------
+#
+# A corner is named by the side it *starts*, which is the whole reason the
+# gesture is unambiguous. "Turn side 2 off" has to say whether 2 joins 1 or 3;
+# "turn this corner off" merges the two sides that meet at it and there is
+# nothing to choose. The flat side index doubles as the corner index, so the
+# overlay, the hit test and the stored override all speak one language.
+
+
+def demoted_corners(state: "state_mod.RetopPatchState") -> set[int]:
+    """The corner indices the user has turned off on the active patch."""
+    raw = getattr(state, "corner_overrides", "")
+    if not raw:
+        return set()
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        return set()
+    return {int(index) for index in stored} if isinstance(stored, list) else set()
+
+
+def set_demoted_corners(state: "state_mod.RetopPatchState", indices: "set[int]") -> None:
+    state.corner_overrides = json.dumps(sorted(indices)) if indices else ""
+
+
+def corner_groups(
+    references: "list[SideReference]", demoted: "set[int]"
+) -> list[list[int]]:
+    """The sides of every loop, gathered into the groups a demoted corner makes.
+
+    One list per group, holding flat side indices in boundary order. A group is
+    what a generator will eventually see as one side -- so the *count* of them
+    per loop is what picks the generator, and a loop can never be allowed
+    below two.
+    """
+    by_loop: dict[int, list[SideReference]] = {}
+    for reference in references:
+        by_loop.setdefault(reference.loop, []).append(reference)
+
+    groups: list[list[int]] = []
+    for loop in sorted(by_loop):
+        ring = [ref.index for ref in sorted(by_loop[loop], key=lambda r: r.in_loop)]
+        kept = [position for position, index in enumerate(ring) if index not in demoted]
+        if not kept:
+            # Every corner of the loop turned off: it is one closed side again,
+            # which is exactly what `sides.synthesise_corners` exists to undo.
+            # Reported as one group rather than none so the caller can refuse.
+            groups.append(list(ring))
+            continue
+        # Start at a corner that survived, so a group never straddles the
+        # arbitrary point the half-edge walk happened to begin at.
+        ring = ring[kept[0]:] + ring[:kept[0]]
+        current: list[int] = []
+        for index in ring:
+            if index not in demoted and current:
+                groups.append(current)
+                current = []
+            current.append(index)
+        if current:
+            groups.append(current)
+    return groups
+
+
+def loop_group_counts(
+    references: "list[SideReference]", demoted: "set[int]"
+) -> dict[int, int]:
+    """How many groups each loop is left with -- the side count a generator
+    would be offered."""
+    loop_of = {reference.index: reference.loop for reference in references}
+    counts: dict[int, int] = {}
+    for group in corner_groups(references, demoted):
+        loop = loop_of.get(group[0], 0)
+        counts[loop] = counts.get(loop, 0) + 1
+    return counts
+
+
 def side_override_map(state: "state_mod.RetopPatchState") -> dict[int, str]:
     """The manual per-side pins, as {flat index: PIN_*}."""
     if not state.side_overrides:

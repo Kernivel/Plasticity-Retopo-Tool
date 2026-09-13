@@ -5,7 +5,7 @@ bl_info = {
     # files, which is why scripts/build_zip.py refuses to build when they
     # disagree. Blender parses this as source before any of this code runs, so
     # nothing can derive it.
-    "version": (0, 68, 0),
+    "version": (0, 69, 0),
     "blender": (4, 2, 0),
     "location": "View3D > N-panel > Retop",
     "description": "Patch-based retopology assistant for meshes imported via the Plasticity bridge",

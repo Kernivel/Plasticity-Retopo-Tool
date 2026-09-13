@@ -103,6 +103,42 @@ for ngon in (False, True):
         check(f"_draw_points survives ngon={ngon} match={match}",
               call(overlay._draw_points, "_draw_points"))
 
+# The corner editor draws its own groups and its own dots, off the side
+# picker's code path entirely -- so it needs its own pass through both
+# handlers, with sides present *and* absent: the empty case is what a draw
+# fired between two patches sees.
+for corners in (False, True):
+    state.corner_edit = corners
+    state.hovered_corner = 1 if corners else -1
+    check(f"_draw_points survives corner_edit={corners}",
+          call(overlay._draw_points, "_draw_points"))
+    check(f"_draw survives corner_edit={corners}", call(overlay._draw, "_draw"))
+
+state.corner_edit = True
+pr.sidematch._active_sides = [
+    pr.sidematch.SideReference(n, 0, n, [], None, None) for n in range(5)]
+pr.sidematch.set_demoted_corners(state, {2})
+# With sides actually present the group drawing runs past its early exits and
+# reaches the GPU, which headless Blender has none of -- so the assertion is
+# that *that* is the only thing it hits. A missing name would raise here first,
+# which is the whole reason this file calls the callbacks at all.
+try:
+    overlay._draw_points()
+    reached = "no error"
+except SystemError as exc:
+    reached = "gpu" if "background mode" in str(exc) else repr(exc)
+except Exception as exc:  # noqa: BLE001
+    reached = repr(exc)
+check("the corner groups draw down to the GPU call and no further",
+      reached in ("gpu", "no error"), reached)
+check("_draw_corner_dots survives with no region",
+      call(lambda: overlay._draw_corner_dots(bpy.context, state, None),
+           "_draw_corner_dots"))
+pr.sidematch._active_sides = []
+pr.sidematch.set_demoted_corners(state, set())
+state.corner_edit = False
+state.hovered_corner = -1
+
 check("with no preview there are no vertex coords",
       overlay._preview_vertex_coords() is None)
 check("and with no active patch, no side references to draw",

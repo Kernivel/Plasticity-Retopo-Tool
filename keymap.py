@@ -76,6 +76,27 @@ ACTIONS: tuple[tuple[str, str, str, str, dict[str, object], list[dict[str, objec
     # neighbour across it or it does not -- so there is no second gesture and
     # no modifier: clicking a matched side releases it, clicking a released one
     # matches it again.
+    # The corner editor takes the same three gestures the patch does, and gets
+    # them by declaring them *first*: `session_actions_for` returns every
+    # action bound to an event and `_dispatch_bound` runs the first whose poll
+    # passes, so a sub-mode wins simply by polling on itself while the actions
+    # below poll on it being off. Both halves are written out -- these come
+    # first *and* the others exclude it -- because "it works by an order
+    # nothing states" is what sent `Tab` to `object.editmode_toggle`.
+    ("corner_toggle", "Turn corner on / off", SESSION, "retop.toggle_corner", {},
+     [_b('LEFTMOUSE')]),
+    ("corners_accept", "Keep corner set", SESSION, "retop.corners_accept", {},
+     [_b('RET'), _b('NUMPAD_ENTER'), _b('RIGHTMOUSE')]),
+    ("corners_cancel", "Cancel corner edit", SESSION, "retop.corners_cancel", {},
+     [_b('ESC')]),
+    # Ctrl+click already meant "take that patch's density", and it still does
+    # -- pointing at a *patch*. Pointing at a *side* of the patch being
+    # adjusted opens the corner editor instead, which is the same
+    # what-is-under-the-cursor split the plain click already makes between
+    # `pin_neighbour` and the commit fallback. Neither branch is destructive,
+    # so a missed aim by a few pixels costs a re-click either way.
+    ("corners_edit", "Edit corners", SESSION, "retop.edit_corners", {},
+     [_b('LEFTMOUSE', ctrl=True)]),
     ("pin_neighbour", "Match side", SESSION, "retop.pin_side",
      {}, [_b('LEFTMOUSE')]),
     # Ctrl on the same button, and the modifier comparison is exact (`_matches`),
