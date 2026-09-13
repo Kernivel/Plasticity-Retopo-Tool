@@ -245,6 +245,255 @@ Two consequences worth holding on to:
   construction, so measuring a patch's accuracy at its vertices reads ~0 on every
   shape and proves nothing. The benchmark measures across face *interiors*.
 
+## The Coons patch itself
+
+The fill above is a **Coons patch**: the surface that a quadrilateral's four
+boundary curves imply, and nothing more. The idea in one line — *blend the
+boundary twice, then subtract what the two blends counted twice.*
+
+Half the difficulty is the notation, so:
+
+| | |
+|---|---|
+| `u`, `v` | two numbers from 0 to 1 — the same coordinates as a UV map. A unit square is the domain; the patch is its image. |
+| `C0(u)`, `C1(u)` | the bottom and top boundary curves, walked by `u`. |
+| `D0(v)`, `D1(v)` | the left and right boundary curves, walked by `v`. |
+| `P00 P10 P01 P11` | the four corners. **Each belongs to two curves at once**, and that sharing is the whole problem below. |
+| `S(u, v)` | the point of the surface. |
+
+Three terms are built from those, and combined as `S = Sv + Su − B`:
+
+- `Sv = (1-v)·C0(u) + v·C1(u)` — ruled between **bottom and top**. It honours
+  those two curves exactly and knows nothing about the sides.
+- `Su = (1-u)·D0(v) + u·D1(v)` — ruled between **left and right**. It honours the
+  sides and knows nothing about the bottom and top.
+- `B(u, v) = (1-u)(1-v)·P00 + u(1-v)·P10 + (1-u)v·P01 + uv·P11` — the **bilinear**
+  blend of the four corners alone: the warped quad you would get by ignoring the
+  curvature of every edge.
+
+<figure class="diagram" markdown="0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 175" role="img" aria-label="The two ruled surfaces, minus the bilinear patch of the corners, equals the Coons patch">
+  <defs>
+    <path id="cnBot" d="M10 80Q55 94 100 78"/>
+    <path id="cnTop" d="M14 22Q56 8 98 18"/>
+    <path id="cnLeft" d="M10 80Q8 50 14 22"/>
+    <path id="cnRight" d="M100 78Q105 48 98 18"/>
+  </defs>
+
+  <g transform="translate(15,20)">
+    <use href="#cnBot" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+    <use href="#cnTop" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+    <use href="#cnLeft" fill="none" stroke="#c9d2d8" stroke-width="1.5"/>
+    <use href="#cnRight" fill="none" stroke="#c9d2d8" stroke-width="1.5"/>
+    <g fill="none" stroke="#27ae60" stroke-width="1">
+      <path d="M32.5 85.1V16.5M55 86.5L56 14M77.5 84.1L77 14.5"/>
+    </g>
+  </g>
+
+  <g transform="translate(155,20)">
+    <use href="#cnBot" fill="none" stroke="#c9d2d8" stroke-width="1.5"/>
+    <use href="#cnTop" fill="none" stroke="#c9d2d8" stroke-width="1.5"/>
+    <use href="#cnLeft" fill="none" stroke="#d35400" stroke-width="2.5"/>
+    <use href="#cnRight" fill="none" stroke="#d35400" stroke-width="2.5"/>
+    <g fill="none" stroke="#d35400" stroke-width="1">
+      <path d="M9.5 65.1H101.75M10 50.5H102M11.5 36.1H100.75"/>
+    </g>
+  </g>
+
+  <g transform="translate(295,20)">
+    <path d="M10 80L100 78L98 18L14 22Z" fill="none" stroke="#7f8c8d" stroke-width="2"/>
+    <g fill="none" stroke="#b9c4cc" stroke-width="1" stroke-dasharray="4 3">
+      <path d="M55 79L56 20M12 51L99 48"/>
+    </g>
+    <g fill="#7f8c8d">
+      <circle cx="10" cy="80" r="3.5"/><circle cx="100" cy="78" r="3.5"/>
+      <circle cx="98" cy="18" r="3.5"/><circle cx="14" cy="22" r="3.5"/>
+    </g>
+  </g>
+
+  <g transform="translate(435,20)">
+    <use href="#cnBot" fill="none" stroke="#8e44ad" stroke-width="2.5"/>
+    <use href="#cnTop" fill="none" stroke="#8e44ad" stroke-width="2.5"/>
+    <use href="#cnLeft" fill="none" stroke="#8e44ad" stroke-width="2.5"/>
+    <use href="#cnRight" fill="none" stroke="#8e44ad" stroke-width="2.5"/>
+    <g fill="none" stroke="#a98ac4" stroke-width="1">
+      <path d="M32.5 85.1V16.5M55 86.5L56 14M77.5 84.1L77 14.5"/>
+      <path d="M9.5 65.1H101.75M10 50.5H102M11.5 36.1H100.75"/>
+    </g>
+  </g>
+
+  <g font-family="sans-serif" font-size="18" fill="#555" text-anchor="middle">
+    <text x="137" y="75">+</text>
+    <text x="277" y="75">−</text>
+    <text x="417" y="75">=</text>
+  </g>
+
+  <g font-family="sans-serif" font-size="11" text-anchor="middle">
+    <text x="70" y="135" fill="#14512f">Sv — ruled in v</text>
+    <text x="70" y="150" fill="#777">bottom to top</text>
+    <text x="210" y="135" fill="#6b3d0c">Su — ruled in u</text>
+    <text x="210" y="150" fill="#777">left to right</text>
+    <text x="350" y="135" fill="#555">B — bilinear</text>
+    <text x="350" y="150" fill="#777">the 4 corners, counted twice</text>
+    <text x="490" y="135" fill="#4a2060">the Coons patch</text>
+    <text x="490" y="150" fill="#777">through all four curves</text>
+  </g>
+</svg>
+</figure>
+
+### Why the bilinear term has to come off
+
+Look at what each term is worth along **one** edge — the bottom one, `v = 0`:
+
+- `Sv(u, 0) = 1·C0(u) + 0·C1(u) = C0(u)` — the real boundary curve.
+- `Su(u, 0) = (1-u)·D0(0) + u·D1(0) = (1-u)·P00 + u·P10` — the straight chord
+  between the two corners.
+- `B(u, 0) = (1-u)·P00 + u·P10` — **the same chord, term for term.**
+
+<figure class="diagram" markdown="0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 470 130" role="img" aria-label="Along the bottom edge, the ruled-in-u term and the bilinear term are the same chord">
+  <g transform="translate(20,20)">
+    <path d="M0 20L110 6" fill="none" stroke="#b9c4cc" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M0 20Q55 62 110 6" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+    <g fill="#7f8c8d"><circle cx="0" cy="20" r="3.5"/><circle cx="110" cy="6" r="3.5"/></g>
+    <text x="55" y="70" font-family="sans-serif" font-size="11" fill="#14512f" text-anchor="middle">Sv at v = 0</text>
+    <text x="55" y="85" font-family="sans-serif" font-size="10" fill="#777" text-anchor="middle">the real edge curve</text>
+  </g>
+  <g transform="translate(170,20)">
+    <path d="M0 20Q55 62 110 6" fill="none" stroke="#b9c4cc" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M0 20L110 6" fill="none" stroke="#d35400" stroke-width="2.5"/>
+    <g fill="#7f8c8d"><circle cx="0" cy="20" r="3.5"/><circle cx="110" cy="6" r="3.5"/></g>
+    <text x="55" y="70" font-family="sans-serif" font-size="11" fill="#6b3d0c" text-anchor="middle">Su at v = 0</text>
+    <text x="55" y="85" font-family="sans-serif" font-size="10" fill="#777" text-anchor="middle">the straight chord</text>
+  </g>
+  <g transform="translate(320,20)">
+    <path d="M0 20Q55 62 110 6" fill="none" stroke="#b9c4cc" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M0 20L110 6" fill="none" stroke="#7f8c8d" stroke-width="2.5"/>
+    <g fill="#7f8c8d"><circle cx="0" cy="20" r="3.5"/><circle cx="110" cy="6" r="3.5"/></g>
+    <text x="55" y="70" font-family="sans-serif" font-size="11" fill="#555" text-anchor="middle">B at v = 0</text>
+    <text x="55" y="85" font-family="sans-serif" font-size="10" fill="#777" text-anchor="middle">exactly the same chord</text>
+  </g>
+</svg>
+<figcaption>Along that edge <code>Su - B</code> is zero, and what is left is <code>C0(u)</code>: the patch
+sits on its own boundary.</figcaption>
+</figure>
+
+So `Sv + Su − B = C0(u)`. The parasitic chord cancels itself out and the true
+curve is what remains — and the same argument runs on the other three edges. Put
+shortly: each ruled surface already carries the corners inside it, so adding the
+two counts the corners twice, and `B` is exactly that double contribution.
+
+The quickest way to see it is at a corner, `(0, 0)`: `Sv = P00` and `Su = P00`,
+so the sum is `2·P00`. Without the correction the patch would miss its own
+corners by a factor of two.
+
+!!! warning "It is not a refinement"
+
+    Drop the bilinear term and you do not get a slightly wrong surface — you get
+    one that no longer touches **any** of its boundary curves. For the same
+    reason the four curves must genuinely meet at the corners: sides that do not
+    close make the patch incoherent, which is why the boundary walk and the weld
+    of [step 1](patches.md) come first.
+
+### One point, step by step
+
+For a given `(u, v)`:
+
+1. Evaluate the four boundary curves: `C0(u)`, `C1(u)`, `D0(v)`, `D1(v)` — four
+   points on the border.
+2. `Sv`: blend bottom and top. The point slides along the green segment.
+3. `Su`: blend left and right. A point on the orange segment.
+4. `B`: blend the four corners — the position "without any curvature".
+5. `S = Sv + Su − B`.
+
+Because `S − Sv = Su − B`, those four points form a **parallelogram**: you start
+from `Sv` — where the bottom and top curves put you — and apply the offset the
+left and right curves have with respect to their own corners.
+
+<figure class="diagram" markdown="0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 235" role="img" aria-label="Evaluating one point: Sv, Su, B and S form a parallelogram">
+  <defs>
+    <marker id="cnArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#8e44ad"/>
+    </marker>
+  </defs>
+
+  <g transform="translate(15,20)">
+    <path d="M25 150Q135 195 245 150" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+    <path d="M25 30H245" fill="none" stroke="#27ae60" stroke-width="2.5"/>
+    <path d="M25 150Q-15 90 25 30" fill="none" stroke="#d35400" stroke-width="2.5"/>
+    <path d="M245 150V30" fill="none" stroke="#d35400" stroke-width="2.5"/>
+
+    <path d="M135 172.5V30" fill="none" stroke="#27ae60" stroke-width="1" stroke-dasharray="5 4"/>
+    <path d="M5 90H245" fill="none" stroke="#d35400" stroke-width="1" stroke-dasharray="5 4"/>
+
+    <g fill="#27ae60"><circle cx="135" cy="172.5" r="4"/><circle cx="135" cy="30" r="4"/></g>
+    <g fill="#d35400"><circle cx="5" cy="90" r="4"/><circle cx="245" cy="90" r="4"/></g>
+
+    <g font-family="sans-serif" font-size="10" fill="#555">
+      <text x="143" y="188">C0(u)</text>
+      <text x="143" y="24">C1(u)</text>
+      <text x="16" y="82">D0(v)</text>
+      <text x="212" y="82">D1(v)</text>
+    </g>
+
+    <circle cx="130" cy="96" r="26" fill="none" stroke="#b9c4cc" stroke-width="1"/>
+    <path d="M156 96H205" fill="none" stroke="#b9c4cc" stroke-width="1" stroke-dasharray="3 3"/>
+  </g>
+
+  <g>
+    <path d="M420 97.6H384M420 142.6H384" fill="none" stroke="#8e44ad" stroke-width="1.5" marker-end="url(#cnArrow)"/>
+    <path d="M420 97.6V142.6M380 97.6V142.6" fill="none" stroke="#c9d2d8" stroke-width="1" stroke-dasharray="4 3"/>
+    <circle cx="420" cy="97.6" r="5" fill="#7f8c8d"/>
+    <circle cx="380" cy="97.6" r="5" fill="#d35400"/>
+    <circle cx="420" cy="142.6" r="5" fill="#27ae60"/>
+    <circle cx="380" cy="142.6" r="6" fill="#8e44ad"/>
+    <g font-family="sans-serif" font-size="11" fill="#555">
+      <text x="430" y="94">B</text>
+      <text x="366" y="88" fill="#6b3d0c">Su</text>
+      <text x="430" y="147" fill="#14512f">Sv</text>
+      <text x="340" y="163" fill="#4a2060">S(u,v)</text>
+      <text x="332" y="196" font-size="10" fill="#777">the same offset, applied</text>
+      <text x="332" y="209" font-size="10" fill="#777">from Sv instead of from B</text>
+    </g>
+  </g>
+</svg>
+<figcaption>Enlarged: on a real patch those four points sit within a fraction of a cell of
+one another.</figcaption>
+</figure>
+
+A worked example, with three straight edges and only the bottom one curved.
+Corners `P00=(0,0)`, `P10=(10,0)`, `P01=(0,10)`, `P11=(10,10)`, and
+`C0(u) = (10u, -4u(1-u))`. At `u = 0.5`, `v = 0.25`:
+
+```
+C0(0.5)  = (5, -1)     C1(0.5)  = (5, 10)    Sv = 0.75*(5,-1) + 0.25*(5,10) = (5, 1.75)
+D0(0.25) = (0, 2.5)    D1(0.25) = (10, 2.5)  Su = (5, 2.5)
+B = (5, 2.5)
+S = (5, 1.75) + (5, 2.5) - (5, 2.5) = (5, 1.75)
+```
+
+`Su` and `B` are identical here because the left and right edges are straight and
+never leave their own chords: their difference is zero, so only the bottom edge's
+curvature travels into the surface. A dip of 1 unit at the middle of that edge is
+still 0.25 deep a quarter of the way up, fading linearly to nothing at the top.
+
+### What that means here
+
+- **The addon uses the discrete version**, which is the same formula evaluated at
+  grid indices — `u = i / span_u`, `v = j / span_v`. The boundary rows are placed
+  first (that is what the sides, the spans and the matching are all about) and
+  every interior vertex is then one evaluation of `S(u, v)`, in
+  `geometry.coons_patch_grid`. Nothing is solved or iterated.
+- **The parameterisation is uniform in index, not in space.** What makes the
+  cells even is that the sides were resampled by **arc length** beforehand.
+- **Bilinear blending gives only C0 continuity between neighbouring patches** —
+  position, not tangent. Tangent continuity would take cubic Hermite blending
+  functions and the cross derivatives at the corners (twist vectors), which
+  nothing in the import can supply. Here the shape is carried by **reprojecting
+  the interior onto the CAD surface** instead, and the seam between two patches
+  is closed by welding shared vertices rather than by matching tangents.
+
 ## Where the spans come from
 
 The generator is chosen; how many segments it puts along each direction is

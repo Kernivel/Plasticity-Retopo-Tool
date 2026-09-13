@@ -13,10 +13,9 @@ The bridge writes two custom properties on the imported mesh:
   order;
 - `mesh["face_ids"]` — one Plasticity face id per group, in the same order.
 
-That is the whole input contract. The wire protocol carries `vertices, faces,
-normals, groups, face_ids` and nothing else: **there is no edge data at all** —
-no edge ids, no "this segment is a real CAD edge" flag. Everything else on this
-page is derived from those two lists.
+One plasticity face can be selected in Edit Mode by pressing the <kbd>L</kbd> key (by default) from Blender.
+In case you want to see groups and ids, the plugin offers a debug mode that displays them in the viewport.
+
 
 <figure class="diagram" markdown="0">
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 470 230" role="img" aria-label="The same triangles, before and after reading the face ids">
@@ -55,8 +54,7 @@ page is derived from those two lists.
     <text x="366" y="210" fill="#e6473d">B-rep vertex</text>
   </g>
 </svg>
-<figcaption>The triangulation is identical in both. The structure on the right is read back
-from the face id each triangle carries — nothing is inferred from the shape.</figcaption>
+<figcaption> The structure on the right is read back from the two custom properties.</figcaption>
 </figure>
 
 ## From ids to a patch
@@ -75,9 +73,79 @@ Four derivations, in order:
    genuine B-rep vertex — the junction between two CAD edges — and the mesh
    states it outright, at any angle.
 
-Step 3 is also what the [CAD structure overlay](../guide/cad-structure.md) draws:
-a Plasticity edge is the maximal run of boundary segments whose neighbour does
-not change.
+## The border, and the corners on it
+
+The border decides the quad/ngon patch.
+
+A boundary segment is a **half-edge** `(a, b)`: an edge carrying a triangle of
+this patch on one side and nothing of it on the other. Walking those segments
+head to tail closes a loop.
+
+Each half-edge is also a question asked of the rest of the mesh: who owns the
+reversed one, `(b, a)`? There are two answers.
+
+- **Another face id** — the segment runs along a CAD edge, and it names the
+  patch on the other side of it.
+- **Nothing** — the segment is on a free boundary of an open sheet. The model
+  simply stops there.
+
+A **CAD edge** is the maximal run of consecutive segments whose answer does not
+change. The vertex where it *does* change is a **B-rep vertex**: the junction
+between two CAD edges, and a corner of this patch.
+
+<figure class="diagram" markdown="0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 470 215" role="img" aria-label="A patch boundary coloured by the neighbouring face, with a dot where that neighbour changes">
+  <g transform="translate(30,40)">
+    <rect x="0" y="0" width="200" height="110" fill="#f4f6f7"/>
+    <text x="100" y="60" font-family="sans-serif" font-size="11" fill="#888" text-anchor="middle">this patch</text>
+    <path d="M0 0H200V110" fill="none" stroke="#2980b9" stroke-width="3"/>
+    <path d="M200 110H0" fill="none" stroke="#27ae60" stroke-width="3"/>
+    <path d="M0 110V0" fill="none" stroke="#b9c4cc" stroke-width="3" stroke-dasharray="5 4"/>
+    <circle cx="200" cy="0" r="4" fill="#fff" stroke="#7f8c8d" stroke-width="2"/>
+    <g fill="#e6473d">
+      <circle cx="200" cy="110" r="5"/><circle cx="0" cy="110" r="5"/><circle cx="0" cy="0" r="5"/>
+    </g>
+  </g>
+
+  <g font-family="sans-serif" font-size="11">
+    <text x="256" y="52" fill="#2980b9">neighbour = face B</text>
+    <text x="256" y="72" fill="#27ae60">neighbour = face C</text>
+    <text x="256" y="92" fill="#8a949c">no neighbour — free boundary</text>
+    <text x="256" y="120" fill="#e6473d">the neighbour changes here:</text>
+    <text x="256" y="134" fill="#e6473d">a B-rep vertex, i.e. a corner</text>
+    <text x="256" y="162" fill="#7f8c8d">a 90° turn in the middle of one</text>
+    <text x="256" y="176" fill="#7f8c8d">run — the face ids say nothing</text>
+    <text x="256" y="190" fill="#7f8c8d">about it</text>
+  </g>
+</svg>
+<figcaption>Three corners out of four, on a shape whose four corners are equally obvious to
+the eye.</figcaption>
+</figure>
+
+The mesh states the junction outright, and it states it **at any angle**, so two faces meeting almost
+tangentially can still be separated as easily as two 90° edges. 
+
+But read the diagram the other way round and the limit of it is just as plain:
+
+- **A corner the ids do not know about.** The top right of that patch turns 90°
+  and stays with the same neighbour throughout, so no junction is recorded there.
+- **A face bordered by one single neighbour has no corner at all**, however
+  square it looks — a cylinder's seam, a disc sitting inside a ring, a fillet
+  running the length of a part. The answer never changes anywhere.
+- **A free boundary is one single run.** Nothing distinguishes its segments from
+  one another, so the outer edge of an open sheet yields nothing either.
+
+That is why a second, purely geometric corner test runs beside this one, and why
+which of the two is trusted depends on what the patch is about to be filled with.
+[Step 2](generators.md) is where the two are reconciled, the extra candidates a
+tessellated curve throws up are ranked away, and the boundary is finally cut into
+**sides**.
+
+One property of these corners is worth carrying forward, because the commit
+depends on it: a corner found this way is an **exact source vertex** — a vertex
+of the CAD tessellation, not a resample of it. Two patches meeting there can
+therefore be welded by *identity* rather than by proximity, which is what makes
+the corners the one part of a boundary that never moves.
 
 ## Two things the import does that get in the way
 
