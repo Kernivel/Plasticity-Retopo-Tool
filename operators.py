@@ -1,3 +1,4 @@
+import json
 import sys
 
 import bpy
@@ -942,6 +943,40 @@ def _distance_to_segment(
     return (point - (start + segment * t)).length
 
 
+# The corner set itself lives in `sidematch`, a leaf: the overlay reads it on
+# every redraw and must never import this module, which imports it back. Only
+# the hit test stays here, because it needs a region and a viewport.
+def nearest_corner_to_cursor(
+    context: bpy.types.Context, event: bpy.types.Event, max_pixels: float = 30.0
+) -> int:
+    """Flat index of the corner nearest the cursor, or -1.
+
+    Screen space for the same reason `nearest_side_to_cursor` is: the corners
+    lie exactly on the surface, so a ray hits the surface beside one as often
+    as the point itself. A tighter radius than a side's, because the corners of
+    one patch can sit a few pixels apart on a small feature and picking the
+    wrong one is a click the user has to notice and undo.
+    """
+    region, rv3d = viewport_region(context)
+    if region is None or rv3d is None:
+        return -1
+
+    mouse = mathutils.Vector((event.mouse_x - region.x, event.mouse_y - region.y))
+    best_index = -1
+    best_distance = max_pixels
+    for reference in sidematch.active_sides():
+        if not reference.points:
+            continue
+        screen = view3d_utils.location_3d_to_region_2d(region, rv3d, reference.points[0])
+        if screen is None:
+            continue
+        distance = (mouse - screen).length
+        if distance < best_distance:
+            best_distance = distance
+            best_index = reference.index
+    return best_index
+
+
 def set_active_patch(
     context: bpy.types.Context, obj: bpy.types.Object, face_id: int
 ) -> tuple[str | None, int | None, list[str] | None]:
@@ -958,6 +993,13 @@ def set_active_patch(
     state = context.scene.plasticity_retop
     state.side_overrides = ""
     state.hovered_side = -1
+    # The corner set names sides by index too, so it is per patch for exactly
+    # the same reason -- and the editor is closed rather than carried over: it
+    # is a gesture on one patch, not a mode the session sits in.
+    state.corner_overrides = ""
+    state.corner_edit = False
+    state.corner_edit_backup = ""
+    state.hovered_corner = -1
     # Which patch this one copied from, and which way round. Per patch, for the
     # same reason a pin is: carried over, the first click on the *next* patch
     # would come back swapped.
@@ -1382,6 +1424,43 @@ class RETOP_OT_session(bpy.types.Operator):
             tolerance = max(1e-6, new_distance * 2e-3)
         return current_distance <= new_distance + tolerance
 
+    def _modal_corners(
+        self, context: bpy.types.Context, event: bpy.types.Event
+    ) -> set[str] | None:
+        """Mouse handling while the corner editor is open.
+
+        Ahead of the side picker and independent of it: the editor is reached
+        by pointing at a side, but it is not part of matching and must work
+        with the side highlight turned off. It also takes the *plain* click,
+        which is why `corner_toggle` is declared before `pin_neighbour` and
+        `pin_neighbour` polls on the editor being closed -- both halves, so
+        neither is load-bearing on its own.
+        """
+        state = context.scene.plasticity_retop
+
+        if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
+            state.hovered_corner = nearest_corner_to_cursor(context, event)
+            # Neither of these means anything while corners are being chosen,
+            # and leaving them set would paint a side green and outline a
+            # patch in amber for gestures the editor has taken over.
+            state.hovered_side = -1
+            state.copy_hover_face_id = -1
+            return {'RUNNING_MODAL'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            # Dispatched rather than called, so the click stays a real binding
+            # -- and through `_dispatch_bound`, which walks every action on the
+            # event and runs the first whose poll passes. Taking the first
+            # *match* would resolve every left click to `corner_toggle`.
+            if self._dispatch_bound(context, event):
+                return {'RUNNING_MODAL'}
+            # Pointing at no corner: nothing to toggle, and emphatically not
+            # the commit fallback -- committing from inside the editor would
+            # bake a corner set the user was still choosing.
+            return {'RUNNING_MODAL'}
+
+        return None
+
     def _modal_match(
         self, context: bpy.types.Context, event: bpy.types.Event
     ) -> set[str] | None:
@@ -1397,7 +1476,13 @@ class RETOP_OT_session(bpy.types.Operator):
 
         if event.type == 'MOUSEMOVE':
             state.hovered_side = nearest_side_to_cursor(context, event)
-            state.copy_hover_face_id = _copy_source_under_cursor(context, event)
+            # Ctrl+click is split by what is under the cursor -- a side opens
+            # the corner editor, anything else copies a density -- so the
+            # hover has to say which of the two it would be. An amber outline
+            # over a hovered side would promise the copy and give the editor.
+            state.copy_hover_face_id = (
+                -1 if state.hovered_side != -1
+                else _copy_source_under_cursor(context, event))
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
@@ -1754,6 +1839,15 @@ class RETOP_OT_session(bpy.types.Operator):
                 return {'RUNNING_MODAL'}
 
         if state.session_phase == 'ADJUST':
+            # The corner editor owns the mouse and the clicks for as long as it
+            # is open, ahead of the side picker: it is reached through the
+            # picker but is not part of it, and it has to work with the side
+            # highlight off.
+            if state.corner_edit:
+                consumed = self._modal_corners(context, event)
+                if consumed is not None:
+                    return consumed
+
             # Match mode owns the mouse while it is on, so it is handled before
             # anything else in this phase.
             if state.match_mode:
@@ -1930,7 +2024,8 @@ class RETOP_OT_commit_patch(bpy.types.Operator):
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         state = context.scene.plasticity_retop
-        return mesh_build.has_preview() and state.source_object_name in bpy.data.objects
+        return (not state.corner_edit and mesh_build.has_preview()
+                and state.source_object_name in bpy.data.objects)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
@@ -2046,7 +2141,8 @@ class RETOP_OT_delete_patch(bpy.types.Operator):
         state = context.scene.plasticity_retop
         # Only during a re-edit: picking a committed patch is what takes its
         # faces out, and deleting is simply choosing not to put anything back.
-        return state.editing_committed and state.source_object_name in bpy.data.objects
+        return (state.editing_committed and not state.corner_edit
+                and state.source_object_name in bpy.data.objects)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
@@ -2097,6 +2193,7 @@ class RETOP_OT_pin_side(bpy.types.Operator):
     def poll(cls, context: bpy.types.Context) -> bool:
         state = context.scene.plasticity_retop
         return (state.session_active and state.session_phase == 'ADJUST'
+                and not state.corner_edit
                 and state.match_mode and state.hovered_side != -1)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
@@ -2111,6 +2208,142 @@ class RETOP_OT_pin_side(bpy.types.Operator):
             return {'CANCELLED'}
         self.report({'INFO'}, _match_report(state, adopted))
         return {'FINISHED'}
+
+
+class RETOP_OT_edit_corners(bpy.types.Operator):
+    """Open the corner editor on the patch being adjusted.
+
+    Ctrl+click, sharing its binding with `retop.copy_patch_spans` and separated
+    from it by what is under the cursor -- a side of this patch opens the
+    editor, anything else copies a density. The same split the plain click
+    already makes between matching a side and committing, and safe for the same
+    reason: neither branch destroys anything, so a miss by a few pixels costs
+    one re-click.
+    """
+    bl_idname = "retop.edit_corners"
+    bl_label = "Edit Corners"
+    bl_description = ("Choose which of this patch's corners are side boundaries. Turning one off "
+                      "merges the two sides meeting there into one, which is what turns a "
+                      "five-sided face into the quad it usually wants to be")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        state = context.scene.plasticity_retop
+        return (state.session_active and state.session_phase == 'ADJUST'
+                and not state.corner_edit and state.active_face_id != -1
+                and state.hovered_side != -1)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        state = context.scene.plasticity_retop
+        references = sidematch.active_sides()
+        if len(references) < 3:
+            self.report({'WARNING'},
+                        "Nothing to choose: this patch has fewer than three corners")
+            return {'CANCELLED'}
+        # What Esc puts back. The edit is several clicks long, so it owes a way
+        # out that neither commits the patch nor keeps a half-made corner set.
+        state.corner_edit_backup = state.corner_overrides
+        state.corner_edit = True
+        state.hovered_corner = -1
+        self.report({'INFO'}, "Corner editor: click a corner to turn it off, Enter to keep")
+        return {'FINISHED'}
+
+
+class RETOP_OT_toggle_corner(bpy.types.Operator):
+    """Turn the corner under the cursor on or off."""
+    bl_idname = "retop.toggle_corner"
+    bl_label = "Toggle Corner"
+    bl_description = "Turn the corner under the cursor on or off as a side boundary"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        state = context.scene.plasticity_retop
+        return (state.session_active and state.corner_edit
+                and state.hovered_corner != -1)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        state = context.scene.plasticity_retop
+        references = sidematch.active_sides()
+        index = state.hovered_corner
+        demoted = sidematch.demoted_corners(state)
+
+        if index in demoted:
+            demoted.discard(index)
+        else:
+            # A loop below two groups has one closed side, which no generator
+            # accepts -- `find_generator` starts at Wedge 2 -- so the patch
+            # would silently become unpickable. Refused here rather than
+            # reported later, because "later" is after the editor has closed.
+            candidate = demoted | {index}
+            counts = sidematch.loop_group_counts(references, candidate)
+            loop = references[index].loop if 0 <= index < len(references) else 0
+            if counts.get(loop, 0) < 2:
+                self.report({'WARNING'},
+                            "A boundary needs at least two sides: turn another corner back on "
+                            "first")
+                return {'CANCELLED'}
+            demoted = candidate
+
+        sidematch.set_demoted_corners(state, demoted)
+        counts = sidematch.loop_group_counts(references, demoted)
+        self.report({'INFO'}, _corner_report(counts))
+        return {'FINISHED'}
+
+
+def _corner_report(counts: dict[int, int]) -> str:
+    if len(counts) == 1:
+        sides = next(iter(counts.values()))
+        generator = generators.find_generator(sides)
+        name = generator.name if generator is not None else "no generator"
+        return f"{sides} sides -> {name}"
+    return " + ".join(f"loop {loop}: {sides} sides" for loop, sides in sorted(counts.items()))
+
+
+class RETOP_OT_corners_accept(bpy.types.Operator):
+    """Keep the corner set and go back to adjusting the patch."""
+    bl_idname = "retop.corners_accept"
+    bl_label = "Keep Corner Set"
+    bl_description = "Close the corner editor, keeping the corners as they are now"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        state = context.scene.plasticity_retop
+        return state.session_active and state.corner_edit
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        state = context.scene.plasticity_retop
+        _close_corner_editor(state)
+        regenerate_active_preview(context)
+        return {'FINISHED'}
+
+
+class RETOP_OT_corners_cancel(bpy.types.Operator):
+    """Put the corner set back as it was and close the editor."""
+    bl_idname = "retop.corners_cancel"
+    bl_label = "Cancel Corner Edit"
+    bl_description = "Close the corner editor, restoring the corners it was opened with"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        state = context.scene.plasticity_retop
+        return state.session_active and state.corner_edit
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        state = context.scene.plasticity_retop
+        state.corner_overrides = state.corner_edit_backup
+        _close_corner_editor(state)
+        regenerate_active_preview(context)
+        return {'FINISHED'}
+
+
+def _close_corner_editor(state: "state_mod.RetopPatchState") -> None:
+    state.corner_edit = False
+    state.corner_edit_backup = ""
+    state.hovered_corner = -1
 
 
 def _copy_source_under_cursor(
@@ -2238,7 +2471,14 @@ class RETOP_OT_copy_patch_spans(bpy.types.Operator):
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         state = context.scene.plasticity_retop
+        # Ctrl+click is split by what is under the cursor, exactly as the
+        # plain click is: a *side* of the patch being adjusted opens the corner
+        # editor (`retop.edit_corners`, declared first), anything else copies
+        # the density of the patch the ray finds. So this one stands down
+        # whenever a side is hovered -- without which the editor could never be
+        # reached, since both are the same event.
         return (state.session_active and state.session_phase == 'ADJUST'
+                and not state.corner_edit and state.hovered_side == -1
                 and state.active_face_id != -1)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
@@ -2747,9 +2987,22 @@ def _perform_reload() -> None:
 # its next event and catches its own bookkeeping up.
 
 
-def _in_phase(context: bpy.types.Context, *phases: str) -> bool:
+def _in_phase(context: bpy.types.Context, *phases: str,
+              during_corner_edit: bool = False) -> bool:
+    """Whether a session is in one of `phases` -- and not in the corner editor.
+
+    The editor is a sub-state of ADJUST rather than a phase of its own (the
+    patch is still open, so every `session_phase == 'ADJUST'` test in the
+    overlay must stay true), which means the exclusion has to live somewhere
+    the polls share. Here: one line, and every action below is inert for the
+    length of the edit without restating it. `during_corner_edit=True` is for
+    the two that have no reason to be -- the CAD edge and surface flow
+    displays, which are read *while* choosing corners.
+    """
     state = context.scene.plasticity_retop
-    return state.session_active and state.session_phase in phases
+    if not (state.session_active and state.session_phase in phases):
+        return False
+    return during_corner_edit or not state.corner_edit
 
 
 class RETOP_OT_nudge_span(bpy.types.Operator):
@@ -2870,7 +3123,8 @@ class RETOP_OT_toggle_cad_edges(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        return _in_phase(context, 'OBJECT', 'PATCH', 'ADJUST')
+        return _in_phase(context, 'OBJECT', 'PATCH', 'ADJUST',
+                         during_corner_edit=True)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
@@ -2891,7 +3145,8 @@ class RETOP_OT_toggle_surface_flow(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        return _in_phase(context, 'OBJECT', 'PATCH', 'ADJUST')
+        return _in_phase(context, 'OBJECT', 'PATCH', 'ADJUST',
+                         during_corner_edit=True)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
@@ -3270,6 +3525,10 @@ CLASSES = (
     RETOP_OT_clear_preview,
     RETOP_OT_delete_patch,
     RETOP_OT_pin_side,
+    RETOP_OT_edit_corners,
+    RETOP_OT_toggle_corner,
+    RETOP_OT_corners_accept,
+    RETOP_OT_corners_cancel,
     RETOP_OT_copy_patch_spans,
     RETOP_OT_tweak_mesh,
     RETOP_OT_end_tweak,

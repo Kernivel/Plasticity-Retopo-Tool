@@ -147,6 +147,32 @@ TOOLTIP_OFFSET = 18   # from the cursor, so the pointer never covers the text
 # stopping short, or picking up a run that wanders off the shared edge -- and
 # none of that is visible from a coloured line lying on the boundary. Drawn for
 # the side under the cursor and for every side already pinned.
+# The corner editor's own vocabulary, deliberately off the matched/unmatched
+# scale: while it is open the side colours and the copy outline are suppressed,
+# so these mean groups and nothing else. No green and no red among them -- the
+# eye reads those two as "welds" and "cracks" everywhere else in this overlay,
+# and a group is neither.
+CORNER_GROUP_COLORS = (
+    (0.40, 0.66, 1.00, 0.95),   # blue
+    (0.80, 0.55, 1.00, 0.95),   # violet
+    (0.35, 0.85, 0.90, 0.95),   # teal
+    (1.00, 0.78, 0.35, 0.95),   # gold
+    (0.95, 0.55, 0.85, 0.95),   # magenta
+    (0.70, 0.75, 0.82, 0.95),   # slate
+)
+CORNER_GROUP_WIDTH = 5.0
+# A corner still acting as a side boundary, one that has been turned off, and
+# whichever is under the cursor. The off one is drawn small and dark rather
+# than not at all: it is still a vertex of the mesh, and a corner that vanished
+# would read as geometry lost rather than as a boundary given up.
+CORNER_ON_COLOR = (1.00, 1.00, 1.00, 1.0)
+CORNER_OFF_COLOR = (0.30, 0.30, 0.34, 0.9)
+CORNER_HOVER_COLOR = (1.00, 0.85, 0.30, 1.0)
+CORNER_DOT_SIZE = 11.0
+CORNER_OFF_RATIO = 0.55
+CORNER_OUTLINE = (0.05, 0.05, 0.05, 0.9)
+CORNER_OUTLINE_RATIO = 1.45
+
 MATCH_DOT_COLOR = (0.35, 1.0, 0.55, 1.0)         # from a committed neighbour
 MATCH_DOT_OUTLINE = (0.05, 0.05, 0.05, 0.9)
 MATCH_DOT_SIZE = 9.0
@@ -278,6 +304,17 @@ def keybinds_for(
     # a reload when the scene still carries the previous property group.
     commit_label = "Replace patch" if getattr(state, "editing_committed", False) else "Commit"
 
+    # The corner editor has taken the click, Enter and Esc, so the hints have
+    # to say so: leaving the patch's line up while its keys mean something else
+    # is the one thing a hint must never do.
+    if getattr(state, "corner_edit", False):
+        return [
+            ("Click", "Turn corner on / off"),
+            cad_edges,
+            (keymap.describe_all("corners_accept")[0], "Keep corner set"),
+            (key("corners_cancel"), "Cancel"),
+        ]
+
     # N-gon mode has no spans at all, so advertising span keys there would be
     # advertising keys that do nothing.
     # The two span keys are one hint, since they are a pair and the line has no
@@ -309,6 +346,9 @@ def keybinds_for(
     # angle, and there is nothing in the record for the click to take.
     if not getattr(state, "ngon_mode", False):
         binds.append((key("copy_spans"), "Copy a patch's density"))
+    # Same key as the copy, separated by what is under the cursor -- so the
+    # hint names the side, which is the half a user has to aim at.
+    binds.append((key("corners_edit"), "Edit corners (on a side)"))
     # Every way of committing, not just the first: right-click and Enter are
     # both worth knowing (the right-click is the Plasticity-style affordance
     # people arrive expecting), and this is the one action where the second
@@ -379,6 +419,7 @@ def _draw() -> None:
         return
 
     _draw_vertex_dots(context, state, region)
+    _draw_corner_dots(context, state, region)
     _draw_match_points(context, state, region)
     _draw_brep_vertices(context, state, region)
 
@@ -499,6 +540,104 @@ def _draw_side_references(state: "state_mod.RetopPatchState") -> None:
     gpu.state.blend_set('NONE')
 
 
+def _draw_corner_groups(state: "state_mod.RetopPatchState") -> None:
+    """The active patch's sides, coloured by the group each belongs to.
+
+    A group is what a generator will be handed as one side, so this is the
+    whole answer to "what have I made this patch into": five sides in four
+    colours is a quad, and the count is what `find_generator` reads.
+    """
+    references = sidematch.active_sides()
+    if not references:
+        return
+
+    demoted = sidematch.demoted_corners(state)
+    groups = sidematch.corner_groups(references, demoted)
+    by_index = {reference.index: reference for reference in references}
+
+    shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    viewport = gpu.state.viewport_get()
+    shader.bind()
+    shader.uniform_float("viewportSize", (viewport[2], viewport[3]))
+    shader.uniform_float("lineWidth", CORNER_GROUP_WIDTH)
+
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('NONE')  # they lie on the surface; same as the dots
+
+    for position, group in enumerate(groups):
+        shader.uniform_float(
+            "color", CORNER_GROUP_COLORS[position % len(CORNER_GROUP_COLORS)])
+        for index in group:
+            reference = by_index.get(index)
+            if reference is None or len(reference.points) < 2:
+                continue
+            batch_for_shader(
+                shader, 'LINE_STRIP', {"pos": reference.points}).draw(shader)
+
+    gpu.state.blend_set('NONE')
+
+
+def _draw_corner_dots(
+    context: bpy.types.Context,
+    state: "state_mod.RetopPatchState",
+    region: bpy.types.Region,
+) -> None:
+    """POST_PIXEL: one dot per corner, saying which are still side boundaries.
+
+    Screen-space geometry like every other dot here -- `point_size_set` is
+    ignored by the backend whenever program point size is on, which is what
+    made these 1px once before.
+    """
+    if state.session_phase != 'ADJUST' or not getattr(state, "corner_edit", False):
+        return
+
+    references = sidematch.active_sides()
+    if not references:
+        return
+
+    rv3d = context.region_data
+    if rv3d is None:
+        return
+
+    demoted = sidematch.demoted_corners(state)
+    hovered = getattr(state, "hovered_corner", -1)
+
+    # (screen point, colour, half-size), gathered before drawing so the whole
+    # lot goes out as three batches rather than one per corner.
+    on, off, hot = [], [], []
+    for reference in references:
+        if not reference.points:
+            continue
+        screen = view3d_utils.location_3d_to_region_2d(region, rv3d, reference.points[0])
+        if screen is None:
+            continue
+        if reference.index == hovered:
+            hot.append(screen)
+        elif reference.index in demoted:
+            off.append(screen)
+        else:
+            on.append(screen)
+
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.blend_set('ALPHA')
+    shader.bind()
+
+    half = CORNER_DOT_SIZE * max(0.5, getattr(state, "overlay_scale", 1.0)) / 2.0
+    for points, color, size in ((off, CORNER_OFF_COLOR, half * CORNER_OFF_RATIO),
+                                (on, CORNER_ON_COLOR, half),
+                                (hot, CORNER_HOVER_COLOR, half * 1.25)):
+        if not points:
+            continue
+        for outline in (True, False):
+            radius = size * (CORNER_OUTLINE_RATIO if outline else 1.0)
+            shader.uniform_float("color", CORNER_OUTLINE if outline else color)
+            vertices, indices = _discs_around(points, radius)
+            batch_for_shader(shader, 'TRIS', {"pos": vertices},
+                             indices=indices).draw(shader)
+
+    gpu.state.blend_set('NONE')
+
+
 def _side_appearance(
     reference: "sidematch.SideReference", hovered: bool
 ) -> "tuple[tuple[float, float, float, float], float]":
@@ -535,6 +674,8 @@ def _draw_side_tooltip(
     question is asked with the mouse already on the side.
     """
     if state.session_phase != 'ADJUST' or not getattr(state, "match_mode", False):
+        return
+    if getattr(state, "corner_edit", False):
         return
     if cursor_window is None:
         return
@@ -717,7 +858,12 @@ def _draw_points() -> None:
 
     if state.session_phase != 'ADJUST':
         return
-    if getattr(state, "match_mode", False):
+    # One or the other, never both: the corner editor has taken over the same
+    # lines the side picker paints, and two colour schemes on one polyline is
+    # neither of them.
+    if getattr(state, "corner_edit", False):
+        _draw_corner_groups(state)
+    elif getattr(state, "match_mode", False):
         _draw_side_references(state)
 
 
