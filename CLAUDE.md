@@ -127,6 +127,56 @@ tracebacks it produces cite line numbers that don't match the file you're
 reading. Diagnose that mismatch before anything else. It only works if the
 version was bumped, which is the discipline above.
 
+## Writing the docs (`docs/`)
+
+The site is MkDocs on the `readthedocs` theme. `.github/workflows/docs.yml`
+publishes it to GitHub Pages on a push to `main` that touches `docs/`,
+`mkdocs.yml` or `requirements-docs.txt`. A new page must be added to the `nav`
+in `mkdocs.yml` or it ships unreachable.
+
+Check a change before pushing. There is no system Python, so use Blender's:
+
+```bash
+<Blender>/<ver>/python/bin/python.exe -m pip install -r requirements-docs.txt
+<Blender>/<ver>/python/bin/python.exe -m mkdocs build --strict
+```
+
+`--strict` fails on a dead internal link, which is the only thing that keeps the
+site honest as pages are renamed.
+
+**Write short paragraphs.** Three or four lines, one idea each. A ten-line
+paragraph is two or three paragraphs that were never separated.
+
+**Lead with the point.** The first sentence of a paragraph says what is true.
+What follows supports it.
+
+**Cut the clause after the dash.** A sentence that ends with ` — ` and a
+qualification usually ends twice. Most of those asides carry no information the
+reader needs; delete them. If one does matter, it is a sentence of its own.
+
+**A bullet list is for parallel items**, not for one sentence chopped into
+pieces. Three bullets that only make sense read in order should be a paragraph.
+
+**Do not write the docs in this file's voice.** CLAUDE.md is dense on purpose:
+it records why a decision was made, for whoever changes the code next. The docs
+answer what the addon does, for someone using it. Measurements, fixture numbers
+and rejected alternatives belong here, not there.
+
+**Explain a thing once.** The `how-it-works` pages are a numbered pipeline;
+link to the step that owns a subject instead of restating it.
+
+**Diagrams are hand-written inline SVG**, inside
+`<figure class="diagram" markdown="0">`. Match the existing palette: blue and
+purple for the addon's own geometry, green and orange for the two directions of
+a fill, red for a corner or a B-rep vertex, grey for what is inert. Compute the
+coordinates rather than eyeballing them, and open the page before pushing. An
+SVG with a typo renders as nothing at all, and the build will not say so.
+
+**The theme is plain MkDocs plus admonitions.** Tables, fenced code,
+`attr_list`, `def_list` and `md_in_html` are available. Math, Mermaid, content
+tabs and collapsible blocks are not. An unsupported extension builds cleanly and
+reads as broken, so write formulas as inline code.
+
 ## Input data contract
 
 The bridge writes two custom properties on each imported mesh:
