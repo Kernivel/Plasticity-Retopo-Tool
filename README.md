@@ -2,6 +2,7 @@
 
 A Blender addon for patch-based retopology of CAD meshes imported through the
 Plasticity ↔ Blender bridge addon [plasticity-blender-addon](https://github.com/nkallen/plasticity-blender-addon).
+[overview.webm](https://github.com/user-attachments/assets/00b3cc60-ad3b-4466-b679-9fbfd8d9d142)
 
 **📖 [Documentation](https://kernivel.github.io/Plasticty-Retopo-Tool/)** — built from
 `docs/` by `.github/workflows/docs.yml`. Nothing in `docs/` ships with the addon.
@@ -10,9 +11,7 @@ Plasticity ↔ Blender bridge addon [plasticity-blender-addon](https://github.co
 
 A session from picking an object to committed patches.
 
-<video src="https://github.com/Kernivel/Plasticty-Retopo-Tool/raw/main/docs/assets/video/overview.webm" poster="https://github.com/Kernivel/Plasticty-Retopo-Tool/raw/main/docs/assets/img/overview.jpg" controls muted loop playsinline width="100%">
-  <a href="https://github.com/Kernivel/Plasticty-Retopo-Tool/raw/main/docs/assets/video/overview.webm">Watch the overview clip</a>
-</video>
+[grip-overview.webm](https://github.com/user-attachments/assets/637f5781-3d9d-4ee0-8ab5-7074a99d497f)
 
 Retopologizing a pistol grip end to end.
 
