@@ -55,7 +55,7 @@ class SideReference:
     picker offers and one it greys out.
     """
 
-    __slots__ = ("index", "loop", "in_loop", "points", "match_points",
+    __slots__ = ("index", "loop", "in_loop", "group", "points", "match_points",
                  "neighbours", "reason", "strict_points",
                  "match_world", "applied", "applied_points",
                  "outvoted", "tied_points", "tied_key")
@@ -90,6 +90,10 @@ class SideReference:
         # picker's margin, so it never reaches for something merely nearby.
         # `match_points` is the generous answer, for a side you pointed at.
         self.strict_points = strict_points
+        # Which group of its loop this side ends up in, 0-based -- what the
+        # generator counts as one side. Filled in by `build_side_references`
+        # once the numbering is known; `in_loop` when nothing is grouped.
+        self.group = in_loop
         self.index = index      # flat index across every loop, in order
         self.loop = loop        # which boundary loop it belongs to
         self.in_loop = in_loop  # its index within that loop
@@ -242,8 +246,26 @@ def build_side_references(
             ))
             index += 1
 
+    # Which group each side lands in, now that they all exist. Stored on the
+    # reference so `span_key_for` can count groups rather than sides: several
+    # sides gathered into one are one side of the patch as far as the generator
+    # and the span collisions are concerned.
+    assign_groups(references, group_numbers(references, state))
+
     _active_sides = references
     return references
+
+
+def assign_groups(references: list[SideReference], numbers: dict[int, int]) -> None:
+    """Fill in `SideReference.group` -- the 0-based group index within the loop."""
+    position_in_loop: dict[int, int] = {}
+    for run in group_runs(references, numbers):
+        by_index = {reference.index: reference for reference in references}
+        loop = by_index[run[0]].loop
+        position = position_in_loop.get(loop, 0)
+        position_in_loop[loop] = position + 1
+        for index in run:
+            by_index[index].group = position
 
 
 def _recut_arbitrary_loop(
@@ -507,6 +529,37 @@ def set_side_groups(state: "state_mod.RetopPatchState", numbers: dict[int, int])
                          if numbers else "")
 
 
+class SideSlot:
+    """Just enough of a side for the grouping: where it is, and which loop in.
+
+    The grouping has to be known *before* `find_generator` runs -- the group
+    count is what picks the generator -- and the `SideReference`s do not exist
+    that early. These carry the three fields `group_numbers` and its friends
+    actually read, so one implementation serves both moments.
+    """
+
+    __slots__ = ("index", "loop", "in_loop")
+
+    def __init__(self, index: int, loop: int, in_loop: int) -> None:
+        self.index = index
+        self.loop = loop
+        self.in_loop = in_loop
+
+
+def side_slots(prepared: "patchprep.PreparedPatch") -> list[SideSlot]:
+    """One slot per side of `prepared`, flat-indexed the way
+    `build_side_references` indexes its references -- loops in order, sides in
+    order. The two must agree or a stored group number names a different side
+    in each."""
+    slots = []
+    index = 0
+    for loop_i, loop_sides in enumerate(prepared.loops_sides):
+        for side_i in range(len(loop_sides)):
+            slots.append(SideSlot(index, loop_i, side_i))
+            index += 1
+    return slots
+
+
 def side_midpoint(points: list) -> object:
     """The point half way along a side, by arc length.
 
@@ -693,6 +746,13 @@ def span_key_for(generator_name: str, reference: SideReference) -> str:
     An n-gon has no spans at all -- every side carries its own segment count --
     so each gets a key of its own and nothing ever collides.
     """
+    # The *group*, not the raw side: several sides can be gathered into one
+    # side of the patch (see `patchprep.group_side_points`), and it is the
+    # group that a generator counts, spans and collides. With no grouping the
+    # two are the same number.
+    position = getattr(reference, "group", None)
+    if position is None:
+        position = reference.in_loop
     if generator_name in (constants.NGON, constants.NSIDE):
         # Both carry a segment count per side rather than per direction: an
         # n-gon because every side is its own edge run, an N-Side because side
@@ -700,7 +760,7 @@ def span_key_for(generator_name: str, reference: SideReference) -> str:
         # generators/nside.py). Two of an N-Side's *can* still disagree, when
         # they meet at the same spoke -- but that is the allocation's answer to
         # give, not a collision to settle before it is asked.
-        return f"side:{reference.index}"
+        return f"side:{position}"
     if generator_name == constants.RING:
         # A ring's two loops both feed "around", but they are not in
         # competition the way a quad's opposite sides are: the generator runs
@@ -711,7 +771,7 @@ def span_key_for(generator_name: str, reference: SideReference) -> str:
         # neighbour be dropped even when it wanted the very same number.
         return f"span_u@{reference.loop}"
     if generator_name == constants.QUAD:
-        return "span_u" if reference.in_loop % 2 == 0 else "span_v"
+        return "span_u" if position % 2 == 0 else "span_v"
     if generator_name in constants.TWO_SPAN_GENERATORS:
         return "span_u"
     return "span"

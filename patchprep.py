@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import mathutils
 
 from . import generators
+from . import geometry
 from . import patch_data
 from . import sides as sides_mod
 
@@ -144,6 +145,100 @@ def prepare_patch(
 
     return PreparedPatch(patch, loops_sides, loops_corner_ids, num_loops,
                          loops_neighbours, corner_warning, loops_arbitrary)
+
+
+def group_side_points(
+    subsides: "list[list[mathutils.Vector]]",
+    total: int,
+    pinned: dict[int, int] | None = None,
+) -> "list[mathutils.Vector]":
+    """One polyline for a group, carrying exactly `total` segments.
+
+    A group is several of the patch's real sides in a row, and the corner
+    *between* two of them is still a B-rep vertex that a neighbouring patch
+    welds to. Handing the generator the concatenated polyline and letting it
+    resample evenly would slide the grid straight past that corner: our patch
+    would have no vertex where the neighbour has one, which is a T-junction on
+    a shared edge -- the very thing `nside`'s midpoints were taken off the
+    boundary to stop doing.
+
+    So the span is allocated to the sub-sides as integers first, each is
+    resampled to its own share, and the results are concatenated. The corner
+    between two of them is then a grid vertex by construction. The generator
+    changes nothing afterwards: `resample_polyline_by_arclength` hands back the
+    points it was given when the count already matches, which is the same thing
+    that makes a matched side work.
+
+    `pinned` fixes a sub-side's count -- that is a side carrying a committed
+    neighbour's own vertices, which may not be resampled off them.
+    """
+    counts = allocate_group_segments(subsides, total, pinned)
+    points: list = []
+    for sub, count in zip(subsides, counts):
+        resampled = geometry.resample_polyline_by_arclength(sub, count + 1)
+        points.extend(resampled[:-1])
+    points.append(subsides[-1][-1])
+    return points
+
+
+def allocate_group_segments(
+    subsides: "list[list[mathutils.Vector]]",
+    total: int,
+    pinned: dict[int, int] | None = None,
+) -> list[int]:
+    """`total` segments shared out over the sub-sides, by arc length.
+
+    At least one each, because a sub-side with none has lost its end corner,
+    which is the whole reason this exists. The caller floors the span at the
+    sub-side count for the same reason, so the only way this can run short is a
+    pin set that cannot fit -- and then the pins are dropped **whole**, exactly
+    as `ring.allocate_segments` does and for the same reason: half a pin set is
+    half a weld, which is a crack down a boundary that was arranged to close.
+    """
+    count = len(subsides)
+    if count == 0:
+        return []
+    if count == 1:
+        return [max(1, total)]
+
+    pinned = dict(pinned or {})
+    if pinned:
+        fixed = sum(pinned.values())
+        if fixed > total - (count - len(pinned)) or any(value < 1 for value in pinned.values()):
+            pinned = {}
+
+    lengths = [max(1e-9, sum((b - a).length for a, b in zip(sub, sub[1:])))
+               for sub in subsides]
+    free = [i for i in range(count) if i not in pinned]
+    remaining = max(len(free), total - sum(pinned.values()))
+    free_length = sum(lengths[i] for i in free) or 1.0
+
+    counts = [0] * count
+    for index, value in pinned.items():
+        counts[index] = value
+
+    # Largest remainder: floor each share, then hand the leftover segments to
+    # whichever sub-sides were cut shortest by the flooring. Anything else
+    # gives the last one in the list every rounding error.
+    shares = {i: remaining * lengths[i] / free_length for i in free}
+    for i in free:
+        counts[i] = max(1, int(shares[i]))
+    leftover = remaining - sum(counts[i] for i in free)
+    order = sorted(free, key=lambda i: shares[i] - int(shares[i]), reverse=True)
+    position = 0
+    while leftover > 0 and order:
+        counts[order[position % len(order)]] += 1
+        leftover -= 1
+        position += 1
+    while leftover < 0:
+        # Over-allocated by the floor of 1: take back from the longest that can
+        # spare a segment, never from one that is down to its last.
+        spare = [i for i in order if counts[i] > 1]
+        if not spare:
+            break
+        counts[max(spare, key=lambda i: counts[i])] -= 1
+        leftover += 1
+    return counts
 
 
 def side_neighbours(

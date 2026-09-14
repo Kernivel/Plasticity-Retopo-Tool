@@ -337,6 +337,79 @@ def ngon_blocker(
     return ""
 
 
+def _joined(subsides: "list[list[mathutils.Vector]]") -> "list[mathutils.Vector]":
+    """Several consecutive sides as one polyline, the shared endpoints dropped.
+
+    The end of one side and the start of the next are the same vertex; kept
+    twice, every generator would see a zero-length segment there and
+    `resample_polyline_by_arclength` would divide by it.
+    """
+    points: "list[mathutils.Vector]" = []
+    for sub in subsides:
+        points.extend(sub[:-1])
+    points.append(subsides[-1][-1])
+    return points
+
+
+def _span_for_group(spans: dict[str, int], generator_name: str, position: int) -> int:
+    """How many segments group `position` carries, read off the resolved spans
+    through the same key the matching uses -- two ideas of which span drives a
+    side is how a grid comes out with its two directions swapped."""
+    key = sidematch.span_key_for(
+        generator_name, sidematch.SideSlot(position, 0, position))
+    return max(1, spans.get(key, spans.get(sidematch.span_base(key), 1)))
+
+
+def _side_groups_for(
+    state: "state_mod.RetopPatchState",
+    prepared: "patchprep.PreparedPatch",
+    ngon: bool,
+) -> "list[list[int]] | None":
+    """The user's grouping as runs of side indices, or None to use the sides.
+
+    None whenever the grouping would change nothing or cannot be built: an
+    n-gon or a ring (neither reaches `find_generator` by side count), a
+    numbering that leaves every side on its own, and a numbering
+    `sidematch.group_problems` has something to say about -- an unusable
+    grouping is *kept* and reported rather than refused, so the generator has
+    to go on building the patch the old way in the meantime.
+    """
+    if ngon or prepared.is_ring:
+        return None
+    slots = sidematch.side_slots(prepared)
+    if not slots:
+        return None
+    numbers = sidematch.group_numbers(slots, state)
+    at_fault, _message = sidematch.group_problems(slots, numbers)
+    if at_fault:
+        return None
+    runs = sidematch.group_runs(slots, numbers)
+    if len(runs) >= len(slots):
+        return None  # nothing merged: the sides are already the groups
+    return runs
+
+
+def _matches_outside_groups(
+    winners: dict, groups: "list[list[int]]"
+) -> "tuple[dict, list]":
+    """(the winners that survive, the ones dropped for being inside a group).
+
+    See the call site: a sub-side of a merged group carries only part of its
+    group's span, so a match on it cannot be honoured yet.
+    """
+    merged = {index for run in groups if len(run) > 1 for index in run}
+    if not merged:
+        return winners, []
+    kept, dropped = {}, []
+    for key, entry in winners.items():
+        if entry[0].index in merged:
+            entry[0].outvoted = True
+            dropped.append(entry[0])
+        else:
+            kept[key] = entry
+    return kept, dropped
+
+
 def _generate_for_face(
     context: bpy.types.Context,
     obj: bpy.types.Object,
@@ -406,6 +479,20 @@ def _generate_for_face(
 
     corner_source_ids = prepared.corner_source_ids
 
+    # Several of the patch's sides gathered into one, if the user has said so.
+    # This is what turns a five-sided face into the quad it usually wants to
+    # be, and it has to be settled here because the group *count* is what picks
+    # the generator.
+    #
+    # Single-loop span patches only, which is the case it exists for. A ring is
+    # chosen by having two loops and pairs them itself, so a group count would
+    # not reach `find_generator` at all; an n-gon follows its boundary whatever
+    # the sides are called, so grouping it changes nothing. Neither is refused
+    # -- the numbering is simply not read for them.
+    groups = _side_groups_for(state, prepared, ngon)
+    if groups:
+        corner_source_ids = [prepared.loops_corner_ids[0][run[0]] for run in groups]
+
     # Which generator runs is settled before anything is substituted, and can
     # be: substitution swaps a side's *points*, never how many sides there are.
     # It has to be, because a grid has one span per direction, so resolving two
@@ -415,7 +502,8 @@ def _generate_for_face(
     elif prepared.is_ring:
         generator = generators.RING
     else:
-        generator = generators.find_generator(len(prepared.sides))
+        generator = generators.find_generator(len(groups) if groups
+                                              else len(prepared.sides))
         if generator is None:
             return None
 
@@ -425,6 +513,19 @@ def _generate_for_face(
     # rewritten. The references have to exist first -- they are what holds the
     # neighbour's vertices.
     winners, outvoted = sidematch.collect_side_matches(context, generator.name)
+    if groups:
+        # **Matching does not yet reach inside a merged group.** A grid has one
+        # count per direction, so a match normally *is* that count -- but a
+        # sub-side of a group carries only part of it, and `_honours` would
+        # compare the part against the whole and drop it anyway, or worse keep
+        # it and resample the rest off the neighbour's vertices.
+        #
+        # Dropped out loud rather than quietly: the side goes back to wanting a
+        # match it is not getting, which is what the overlay paints red and the
+        # panel counts. That edge may genuinely crack, and saying so is the
+        # honest state of this until the allocation learns to pin a sub-side.
+        winners, dropped = _matches_outside_groups(winners, groups)
+        outvoted = list(outvoted) + dropped
     state.match_conflicts = len(outvoted)
 
     if ngon:
@@ -458,6 +559,16 @@ def _generate_for_face(
         # whole loop, so nothing is pulled in from neighbours here (it is still
         # pushed out to them on commit).
         propagated = []
+    elif groups:
+        # Concatenated without resampling for now: `default_spans` reads edge
+        # lengths off the whole side, which the joined polyline already is. The
+        # allocation that puts a grid vertex on each internal corner needs the
+        # resolved span, so it runs further down.
+        generation_input = [_joined([prepared.sides[i] for i in run]) for run in groups]
+        num_sides = len(generation_input)
+        defaults = state_mod.scale_default_spans(
+            state, generator.default_spans(generation_input))
+        defaults, propagated = _propagated_defaults(obj, generator, corner_source_ids, defaults)
     else:
         generation_input = prepared.sides
         num_sides = len(generation_input)
@@ -520,6 +631,21 @@ def _generate_for_face(
         else:
             span = count
 
+    if groups:
+        # A group of `n` sub-sides needs at least `n` segments, or one of them
+        # gets none and its end corner -- a B-rep vertex a neighbour welds to
+        # -- is no longer on our grid. Floored per span rather than globally,
+        # so a quad whose U side is merged does not also inflate V.
+        floors: dict[str, int] = {}
+        for position, run in enumerate(groups):
+            key = sidematch.span_base(
+                sidematch.span_key_for(generator.name, sidematch.SideSlot(
+                    position, 0, position)))
+            floors[key] = max(floors.get(key, 1), len(run))
+        span_u = max(span_u, floors.get("span_u", 1))
+        span_v = max(span_v, floors.get("span_v", 1))
+        span = max(span, floors.get("span", 1))
+
     spans = {"span_u": span_u, "span_v": span_v, "span": span}
     nside_spokes = None
     if generator.name == constants.NSIDE:
@@ -536,6 +662,17 @@ def _generate_for_face(
                       for index, count in enumerate(segments_of)})
 
     sidematch.apply_side_matches(context, obj, prepared, generator.name, spans, winners=winners)
+
+    if groups:
+        # Now that the spans are final, each group is rebuilt with its share of
+        # them allocated to its sub-sides as integers -- which is what puts a
+        # grid vertex exactly on every corner *inside* the group. Built after
+        # the substitution, so a single-side group that was matched still hands
+        # its neighbour's own vertices through untouched.
+        generation_input = [
+            patchprep.group_side_points([prepared.sides[i] for i in run],
+                                        _span_for_group(spans, generator.name, position))
+            for position, run in enumerate(groups)]
 
     bvh = (geometry.build_bvh_for_polygons(mesh, prepared.patch.poly_indices)
            if state.reproject else None)

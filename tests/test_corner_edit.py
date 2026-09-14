@@ -342,18 +342,106 @@ check("a warning survives the editor closing on it",
 bpy.ops.retop.edit_corners()
 bpy.ops.retop.corners_cancel()
 
-# ---------------------------------------------------------------------------
-#  What is *not* wired up yet
-# ---------------------------------------------------------------------------
-# Said out loud so a green suite is not read as "five-sided patches are filled
-# as quads now". The grouping is chosen, checked and drawn; `_generate_for_face`
-# still hands the generator the ungrouped sides.
-source = open(os.path.join(_ADDON_DIR, "operators.py"), encoding="utf-8").read()
-check("the generators do not read the grouping yet -- next step",
-      "group_runs" not in source.split("def _generate_for_face", 1)[-1][:4000])
+# ===========================================================================
+#  End to end: the grouping reaches the generator
+#
+#  A regular pentagon: every corner bends 72 degrees, well past the threshold,
+#  and the ranking finds no cliff among five equal corners -- so it really is
+#  five-sided and really does go to the N-Side fan. Merging two of its sides
+#  has to turn it into a Quad, and the corner *between* them has to survive as
+#  a vertex of the grid: a neighbouring patch welds to it.
+# ===========================================================================
+import math
 
 sidematch._active_sides = []
 state.session_active = False
+state.side_groups = ""
+
+RADIUS = 2.0
+rim = [mathutils.Vector((RADIUS * math.cos(math.pi / 2 + n * 2 * math.pi / 5),
+                         RADIUS * math.sin(math.pi / 2 + n * 2 * math.pi / 5),
+                         0.0)) for n in range(5)]
+verts = [(0.0, 0.0, 0.0)] + [tuple(point) for point in rim]
+tris = [(0, 1 + n, 1 + (n + 1) % 5) for n in range(5)]
+
+mesh = bpy.data.meshes.new("PentaMesh")
+mesh.from_pydata(verts, [], tris)
+mesh.update()
+mesh["groups"] = [0, len(tris) * 3]
+mesh["face_ids"] = [7]
+
+obj = bpy.data.objects.new("PentaObj", mesh)
+bpy.context.collection.objects.link(obj)
+bpy.context.view_layer.objects.active = obj
+
+pr.operators.enter_session_object(bpy.context, obj)
+state.ngon_mode = False
+
+pr.operators.set_active_patch(bpy.context, obj, 7)
+check("ungrouped, five sides go to the N-Side fan -- or this proves nothing",
+      state.generator_name == "N-Side" and state.num_sides == 5,
+      f"{state.generator_name} / {state.num_sides}")
+
+references = sidematch.active_sides()
+check("and the editor is offered five bubbles", len(references) == 5, len(references))
+
+# The corner between the two sides about to be merged. It is a real source
+# vertex, so it must still be there once they are one side.
+numbers = sidematch.group_numbers(references, state)
+merged_at = references[1].points[0].copy()
+
+sidematch.set_side_groups(state, {1: numbers[0]})
+pr.operators.regenerate_active_preview(bpy.context)
+
+check("merged into four groups, the same face is a Quad",
+      state.generator_name == "Quad" and state.num_sides == 4,
+      f"{state.generator_name} / {state.num_sides}")
+
+preview = bpy.data.objects.get(pr.mesh_build.PREVIEW_OBJ_NAME)
+check("and the preview was rebuilt", preview is not None and len(preview.data.vertices) > 0,
+      preview and len(preview.data.vertices))
+
+# The whole reason the span is allocated per sub-side rather than handed to the
+# generator as one number: without it the grid resamples straight past this
+# corner, our patch has no vertex where the neighbour has one, and that is a
+# T-junction on a shared edge.
+world = [preview.matrix_world @ vertex.co for vertex in preview.data.vertices]
+closest = min((point - merged_at).length for point in world)
+check("the corner inside the merged side is still a vertex of the grid",
+      closest < 1e-4, closest)
+
+# A grouping that cannot be built must not reach the generator at all: it is
+# kept and reported, so the patch goes on being made the old way meanwhile.
+sidematch.set_side_groups(state, {2: numbers[0]})   # group 1 in two places
+pr.operators.regenerate_active_preview(bpy.context)
+check("an unusable grouping leaves the generator on the ungrouped sides",
+      state.generator_name == "N-Side" and state.num_sides == 5,
+      f"{state.generator_name} / {state.num_sides}")
+
+sidematch.set_side_groups(state, {})
+pr.operators.regenerate_active_preview(bpy.context)
+check("and clearing it puts the fan back",
+      state.generator_name == "N-Side" and state.num_sides == 5,
+      f"{state.generator_name} / {state.num_sides}")
+
+# Three sides in one group: the two corners inside it both have to survive, and
+# the span is floored so neither sub-side is left with no segments at all.
+sidematch.set_side_groups(state, {1: numbers[0], 2: numbers[0]})
+state.span_u = 1
+state.span_v = 1
+pr.operators.regenerate_active_preview(bpy.context)
+check("three sides in one group make a triangle",
+      state.num_sides == 3, f"{state.generator_name} / {state.num_sides}")
+
+preview = bpy.data.objects.get(pr.mesh_build.PREVIEW_OBJ_NAME)
+world = [preview.matrix_world @ vertex.co for vertex in preview.data.vertices]
+for position in (1, 2):
+    corner = references[position].points[0]
+    closest = min((point - corner).length for point in world)
+    check(f"corner {position} survives a span too small to hold it",
+          closest < 1e-4, closest)
+
+pr.operators.end_session(bpy.context)
 
 print()
 if FAILURES:

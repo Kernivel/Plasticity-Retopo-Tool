@@ -185,11 +185,11 @@ GROUP_BUBBLE_HOVER_RING_RATIO = 1.34
 # the three that is about a choice the user can take back in a click.
 GROUP_BUBBLE_FAULT_RING = (0.95, 0.25, 0.22, 1.0)
 GROUP_BUBBLE_FAULT_RATIO = 1.40
-# A dot is 12 segments and reads as round at 9 pixels. A bubble is nearly three
-# times that across, where 12 reads as the dodecagon it is -- so it gets its
-# own count, a multiple of four like every other, so the disc still measures
-# exactly the size asked for.
-GROUP_BUBBLE_SEGMENTS = 40
+# A dot is 12 segments and reads as round at 9 pixels; a bubble is nearly three
+# times that across, where 12 reads as the dodecagon it is. The count alone was
+# not enough, though -- see `_feathered_disc` for why a jagged circle is not a
+# facet problem.
+GROUP_BUBBLE_SEGMENTS = 48
 GROUP_WARNING_TEXT = (1.0, 0.72, 0.68, 1.0)
 GROUP_WARNING_BACKDROP = (0.10, 0.04, 0.04, 0.88)
 
@@ -600,6 +600,51 @@ def _draw_corner_groups(state: "state_mod.RetopPatchState") -> None:
     gpu.state.blend_set('NONE')
 
 
+def _feathered_disc(
+    centre: "mathutils.Vector", radius: float,
+    colour: tuple[float, float, float, float], feather: float = 1.25,
+    segments: int = 48,
+) -> "tuple[list[tuple[float, float]], list[tuple[float, float, float, float]], list[tuple[int, int, int]]]":
+    """A disc whose last pixel fades to nothing, as (vertices, colours, indices).
+
+    Raising the segment count does not fix a jagged circle and it was the
+    obvious thing to try: the facets were never the problem, the *edge* was.
+    There is no multisampling on these draws, so a `TRIS` disc has a hard
+    boundary and every step of it shows. So the rim is a second ring of the
+    same geometry, one pixel out and at zero alpha, drawn through
+    `SMOOTH_COLOR` -- the interpolation across that ring is the antialiasing,
+    computed by the rasteriser rather than asked for.
+
+    A fringe rather than a wider disc: the opaque part still measures exactly
+    the radius asked for, so nothing that lines up with a bubble moves.
+    """
+    x, y = centre[0], centre[1]
+    clear = (colour[0], colour[1], colour[2], 0.0)
+    vertices = [(x, y)]
+    colours = [colour]
+    inner = radius - feather * 0.5
+    outer = radius + feather * 0.5
+    for step in range(segments):
+        angle = 2.0 * math.pi * step / segments
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        vertices.append((x + inner * cos_a, y + inner * sin_a))
+        colours.append(colour)
+    for step in range(segments):
+        angle = 2.0 * math.pi * step / segments
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        vertices.append((x + outer * cos_a, y + outer * sin_a))
+        colours.append(clear)
+
+    indices = []
+    for step in range(segments):
+        nxt = (step + 1) % segments
+        indices.append((0, 1 + step, 1 + nxt))
+        # The fringe, as a quad per segment split into two triangles.
+        indices.append((1 + step, 1 + segments + step, 1 + segments + nxt))
+        indices.append((1 + step, 1 + segments + nxt, 1 + nxt))
+    return vertices, colours, indices
+
+
 def _draw_group_bubbles(
     context: bpy.types.Context,
     state: "state_mod.RetopPatchState",
@@ -654,7 +699,9 @@ def _draw_group_bubbles(
         return
     bubbles.sort(key=lambda entry: entry[3])
 
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    # SMOOTH_COLOR rather than UNIFORM_COLOR: the fringe of each disc carries
+    # its own alpha, and that per-vertex interpolation is what smooths the rim.
+    shader = gpu.shader.from_builtin('SMOOTH_COLOR')
     gpu.state.blend_set('ALPHA')
     shader.bind()
 
@@ -676,10 +723,9 @@ def _draw_group_bubbles(
         # than the hover ring -- and sorting is the only thing that keeps both
         # visible on a bubble that is both.
         for ring_colour, ring_radius in sorted(rings, key=lambda ring: -ring[1]):
-            shader.uniform_float("color", ring_colour)
-            vertices, indices = _discs_around([screen], ring_radius,
-                                              GROUP_BUBBLE_SEGMENTS)
-            batch_for_shader(shader, 'TRIS', {"pos": vertices},
+            vertices, colours, indices = _feathered_disc(
+                screen, ring_radius, ring_colour, segments=GROUP_BUBBLE_SEGMENTS)
+            batch_for_shader(shader, 'TRIS', {"pos": vertices, "color": colours},
                              indices=indices).draw(shader)
 
     gpu.state.blend_set('NONE')

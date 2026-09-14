@@ -1182,8 +1182,15 @@ runs carrying the same number come out the same colour: "group 2 is in two
 places" is then visible as a colour appearing twice rather than only as a line
 of text. The hovered bubble is *lifted*, never recoloured — its colour is its
 group, and replacing it would hide the one thing it exists to say. Bubbles get
-their own `GROUP_BUBBLE_SEGMENTS`: a dot reads as round at 9 pixels with
-twelve, a bubble is three times that across and reads as the dodecagon it is.
+their own `GROUP_BUBBLE_SEGMENTS` — a dot reads as round at 9 pixels with
+twelve, a bubble is three times that across — but the count was never the whole
+problem, and raising it was the obvious thing that did not work. There is no
+multisampling on these draws, so a `TRIS` disc has a hard edge and every step
+of it shows. `_feathered_disc` gives each one a rim of the same geometry a
+pixel further out at zero alpha, drawn through `SMOOTH_COLOR`: the
+interpolation across that rim *is* the antialiasing, computed by the rasteriser
+rather than asked for. A fringe rather than a wider disc, so the opaque part
+still measures exactly the radius asked for.
 
 `sidematch.group_numbers` fills in the default — one group per side, numbered
 from 1 **within each loop**, since a ring's two rims are separate boundaries —
@@ -1201,19 +1208,41 @@ about one grouping is how they come to disagree. Refusing to close on a fault
 would be the modal nobody can get out of, the same reason the mirror's axis
 prompt cancels on anything that is not an axis.
 
-**Not wired into the generators yet.** The grouping is chosen, checked and
-drawn; `_generate_for_face` still hands the ungrouped sides over, so a pentagon
-is still filled by the fan. The test says so out loud so a green suite is not
-read as "five-sided patches are handled". What the next step needs, and why it
-is the only real work here: the corner inside a merged group must stay a **mesh
-vertex**, because neighbours weld to it, and `resample_polyline_by_arclength`
-over a merged side would slide off it — so the group's span has to be allocated
-per sub-side as integers, the way `nside.spoke_allocation` allocates spokes.
-Matching stays per *real* side throughout (`side_neighbours` and `_match_pool`
-must keep seeing five), and what is given up is that corner's
-`retop_source_vid`: it welds by proximity instead of identity, and span
-propagation out of it stops — the same trade `sidematch._recut_arbitrary_loop`
-already accepts. `tests/test_corner_edit.py`.
+**The group count is what picks the generator**, so the grouping is settled in
+`_generate_for_face` before `find_generator` — `operators._side_groups_for`.
+Single-loop span patches only, and that is not a restriction so much as where
+the question arises: a ring is chosen by having two loops and pairs them
+itself, an n-gon follows its boundary whatever its sides are called. Neither is
+refused; the numbering is simply not read for them.
+
+**The corner inside a merged group must stay a mesh vertex**, because a
+neighbouring patch welds to it. Handing the generator the concatenated polyline
+and letting `resample_polyline_by_arclength` divide it evenly slides the grid
+straight past that corner: our patch then has no vertex where the neighbour has
+one, which is a T-junction on a shared edge — the very thing `nside`'s
+midpoints were taken off the boundary to stop doing. So the span is allocated
+to the sub-sides as integers first (`patchprep.allocate_group_segments`, by arc
+length, largest-remainder, at least one each), each is resampled to its own
+share, and the results are concatenated: the internal corner is a grid vertex
+by construction and the generator changes nothing afterwards, since the count
+already matches. The span driving a group is **floored at its sub-side count**
+for the same reason — per span, not globally, so a quad whose U side is merged
+does not also inflate V.
+
+**Matching does not yet reach inside a merged group.** A grid has one count per
+direction, so a match normally *is* that count — but a sub-side of a group
+carries only part of it, and `_honours` would compare the part against the
+whole. Those matches are dropped **out loud** (`_matches_outside_groups` marks
+them outvoted), so the side draws red and the panel counts it: that edge may
+genuinely crack, and saying so is the honest state of this until the allocation
+learns to pin a sub-side the way `ring.allocate_segments` does. Single-side
+groups match exactly as before.
+
+`tests/test_corner_edit.py` builds a regular pentagon — five corners bending 72
+degrees, no cliff for the ranking to cut at — asserts it really does go to the
+N-Side fan first, then that merging two sides makes it a Quad with the corner
+between them still on the grid to 1e-7, and that an unusable grouping leaves
+the generator on the ungrouped sides rather than reaching it.
 
 **A neighbour covering part of a side is completed, not refused — and only
 when you point at it.** A bore's rim is one long cornerless side and the patch
@@ -2077,6 +2106,13 @@ axis, with an Apply that keeps re-editing safe); every key as a real
 `KeyMapItem`, edited in Blender's own rows on the addon preferences page; and a
 per-mesh cache under all of it, without which none of the above is affordable
 on every hover.
+
+Also implemented: **grouping a patch's sides**, so a five-sided face left by a
+chamfer or a boolean can be built as the quad it wants to be -- each side
+carries a numbered bubble in the viewport, the numbering is free and what
+cannot be built is reported rather than prevented, and the span is allocated
+per sub-side so the corner inside a merged group stays a vertex neighbours can
+weld to. Matching does not yet reach inside a merged group.
 
 Not implemented yet: **N-gon on a face with several holes** (the pipeline
 truncates past two loops, so only one bridge pair is ever possible),
