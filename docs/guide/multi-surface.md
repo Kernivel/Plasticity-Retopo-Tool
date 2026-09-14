@@ -50,6 +50,10 @@ band, stretched across the gap between them.
 A patch covering several surfaces carries a **Split Into Surfaces** button in
 the panel while it is open. Its surfaces become patches again.
 
+Deleting it (<kbd>X</kbd> while re-editing it) takes it apart too. Its
+retopology goes and its surfaces become patches of their own again, which is
+what deleting a patch means everywhere else.
+
 A patch that has been committed refuses to split, and says so. The retopology
 names that patch, and those faces would be left pointing at something that no
 longer exists — nothing would ever clean them up. Delete the patch first

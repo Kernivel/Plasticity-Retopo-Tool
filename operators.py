@@ -1363,6 +1363,23 @@ def split_composite(
     return True, f"Split back into {len(surfaces)} patches"
 
 
+def dissolve_composite(obj: bpy.types.Object, composite_id: int) -> int:
+    """Take a composite off the mesh unconditionally. Returns how many surfaces
+    it covered, or 0 if it was not one.
+
+    `split_composite` is the version with the rules on it -- it refuses while
+    the patch is committed or open in a re-edit, because its faces would be
+    left naming a patch that no longer exists. This is for the one caller that
+    has just made sure there are no such faces.
+    """
+    composites = patch_data.read_composites(obj.data)
+    surfaces = composites.pop(composite_id, None)
+    if surfaces is None:
+        return 0
+    patch_data.write_composites(obj.data, composites)
+    return len(surfaces)
+
+
 def composite_surfaces(obj: bpy.types.Object | None, face_id: int) -> list[int]:
     """The Plasticity surfaces `face_id` is built from, or [] when it is a
     single one. What the panel reads to say how many a patch covers."""
@@ -2647,6 +2664,14 @@ class RETOP_OT_delete_patch(bpy.types.Operator):
         keep_reedit_removal(context)
         mesh_build.clear_preview_object()
         mesh_build.forget_patch_settings(source_obj, face_id)
+        # A patch built from several surfaces is *also* undone here, and it has
+        # to be: nothing carries its id any more, and leaving the composite on
+        # the mesh leaves an area that is still one patch with nothing in it --
+        # which cannot be taken apart either, since Split Into Surfaces polls
+        # on that patch being *open* and deleting it is what closed it. The
+        # surfaces come back as patches of their own, which is what deleting a
+        # patch means everywhere else.
+        surfaces = dissolve_composite(source_obj, face_id)
         update_committed_count(context, source_obj)
 
         # Creases are a property of the border *between* patches, so losing one
@@ -2662,7 +2687,9 @@ class RETOP_OT_delete_patch(bpy.types.Operator):
         # Same reasoning as commit: one step per change to the result mesh, and
         # the snapshot keep_reedit_removal freed has to belong to one.
         push_undo(f"Retop: delete patch {face_id}")
-        self.report({'INFO'}, f"Deleted patch {face_id} ({removed} face(s))")
+        self.report({'INFO'},
+                    f"Deleted patch {face_id} ({removed} face(s))"
+                    + (f" — back to {surfaces} surfaces" if surfaces else ""))
         return {'FINISHED'}
 
 
@@ -4016,7 +4043,13 @@ class RETOP_OT_back(bpy.types.Operator):
             # half-typed span rather than throw the patch away.
             if surface_selection(state):
                 discard_pending_composite(context)
-                bpy.ops.retop.clear_preview()
+                # Guarded like the ADJUST branch above, and for the same reason:
+                # the preview may be empty already -- the pick had one surface,
+                # or the surfaces could not be built over -- and an operator
+                # whose poll fails *raises* out of the modal, which stops the
+                # session on the one key that exists to back out of things.
+                if bpy.ops.retop.clear_preview.poll():
+                    bpy.ops.retop.clear_preview()
                 return {'FINISHED'}
             exit_session_object(context)
             return {'FINISHED'}

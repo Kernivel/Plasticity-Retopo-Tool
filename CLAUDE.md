@@ -1143,6 +1143,24 @@ compares the hover against -- clicking the patch locks it in, clicking anything
 else abandons it. The way back from a patch already opened is
 `retop.split_patch`, a panel button on it.
 
+**Deleting such a patch takes it apart as well as emptying it.**
+`RETOP_OT_delete_patch` ends with `dissolve_composite`, and that is not tidying
+up: nothing carries the id once the faces go, and a composite left on the mesh
+is an area that is still one patch with nothing in it -- which cannot be split
+either, since Split Into Surfaces polls on that patch being *open* and deleting
+it is what closed it, and cannot be deleted again either, since `delete_patch`
+polls on `editing_committed` and it is no longer committed. A patch you can
+neither rebuild as its surfaces nor get rid of. `dissolve_composite` is
+`split_composite` without the rules, for the one caller that has just made sure
+there are no faces left naming it.
+
+**And `retop.back` has to poll `clear_preview` before calling it.** An operator
+whose poll fails *raises*, out of the modal, which catches it and stops the
+session -- on the one key that exists to back out of things. The preview is
+empty in exactly the cases a pick leaves it empty (one surface picked, or a set
+nothing can be built over), so the unguarded call was not a rare path.
+`tests/test_patch_surfaces.py` pins both ends of it.
+
 **Deleting a patch** (`X`, `RETOP_OT_delete_patch`) falls straight out of the
 re-edit model: picking a committed patch already took its faces out and
 snapshotted the result mesh, so deleting is `keep_reedit_removal` — dropping

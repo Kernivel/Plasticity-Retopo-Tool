@@ -372,6 +372,56 @@ check("and takes its faces back out", state.reedit_removed_faces > 0,
 done, message = operators.split_composite(bpy.context, obj, composite_id)
 check("a committed patch refuses to split", not done, message)
 
+
+# ---------------------------------------------------------------------------
+# 8. Deleting it takes the patch apart as well as emptying it
+#
+# Nothing carries the id after the faces go, and leaving the composite behind
+# leaves an area that is still one patch with nothing in it -- which cannot be
+# taken apart either, since Split Into Surfaces polls on that patch being
+# *open* and deleting it is what closed it. That is a patch you can neither
+# rebuild as its surfaces nor get rid of.
+# ---------------------------------------------------------------------------
+bpy.ops.retop.delete_patch()
+check("the patch's faces are gone",
+      len(result.data.polygons) == 0, len(result.data.polygons))
+check("and so is the patch itself", patch_data.read_composites(mesh) == {},
+      patch_data.read_composites(mesh))
+check("its surfaces are patches of their own again",
+      sorted(patch_data.analyse(mesh).patches) == [10, 11, 12, 20],
+      sorted(patch_data.analyse(mesh).patches))
+check("which is what makes them selectable one by one",
+      operators.set_active_patch(bpy.context, obj, 10)[0] is not None)
+bpy.ops.retop.clear_preview()
+state.active_face_id = -1
+
+
+# ---------------------------------------------------------------------------
+# 9. Esc during a pick backs out of it without taking the session with it
+#
+# `retop.back` used to clear the preview unguarded, and an operator whose poll
+# fails *raises* -- out of the modal, which stops the session on the one key
+# that exists to back out of things. The preview is empty in exactly the cases
+# a pick leaves it empty: one surface picked, or a set nothing can be built
+# over.
+# ---------------------------------------------------------------------------
+state.session_phase = 'PATCH'
+state.session_active = True
+operators.toggle_patch_surface(bpy.context, obj, 10)
+check("a pick with one surface leaves no preview",
+      not pr.mesh_build.has_preview())
+check("and Esc still backs out of it", bpy.ops.retop.back() == {'FINISHED'})
+check("with the pick dropped", operators.surface_selection(state) == [])
+
+operators.toggle_patch_surface(bpy.context, obj, 10)
+operators.toggle_patch_surface(bpy.context, obj, 11)
+check("two surfaces do build a preview", pr.mesh_build.has_preview())
+check("and Esc backs out of that too", bpy.ops.retop.back() == {'FINISHED'})
+check("taking the patch off the mesh with it",
+      patch_data.read_composites(mesh) == {}
+      and state.pending_composite_id == -1)
+check("and leaving the session running", state.session_active)
+
 pr.operators.end_session(bpy.context)
 
 
