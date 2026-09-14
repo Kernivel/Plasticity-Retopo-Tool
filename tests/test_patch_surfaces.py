@@ -168,40 +168,101 @@ check("the property is gone rather than left empty",
 
 
 # ---------------------------------------------------------------------------
-# 5. Contiguity, checked as the selection is built
+# 5. Picking surfaces: contiguity, and the patch that grows as you pick
 #
 # A patch whose surfaces only meet at a point has a pinched boundary; one whose
 # surfaces do not meet at all comes back with two outer loops, which the loop
 # count reads as a band and the Ring generator then stretches across the gap.
+#
+# From the second pick on the composite is **live on the mesh**, which is what
+# lets the preview show the patch rather than one of its surfaces. That is also
+# what makes the two halves below worth asserting together: the selection stays
+# in the mesh's own surface ids while `analyse` no longer has them, so anything
+# reading the merged analysis to answer a question about the *selection* is
+# asking the wrong table.
 #
 # There is no ceiling on how many: the check below takes all three of the
 # strip, which is every surface it has.
 # ---------------------------------------------------------------------------
 operators = pr.operators
 state = bpy.context.scene.plasticity_retop
-state.surface_selection = ""
+state.session_object_name = obj.name
+operators.discard_pending_composite(bpy.context)
 
 ok, message = operators.toggle_patch_surface(bpy.context, obj, 10)
 check("the first surface is always takeable", ok, message)
 check("and it is in the selection", operators.surface_selection(state) == [10])
+check("one surface builds nothing -- it is already a patch",
+      state.pending_composite_id == -1)
 
 ok, message = operators.toggle_patch_surface(bpy.context, obj, 20)
 check("a detached surface is refused", not ok, message)
 ok, message = operators.toggle_patch_surface(bpy.context, obj, 12)
 check("so is one that only touches through a surface not picked", not ok, message)
+
 ok, _message = operators.toggle_patch_surface(bpy.context, obj, 11)
 check("a neighbour is taken", ok)
+pending = state.pending_composite_id
+check("and the two of them are a patch on the mesh already", pending != -1, pending)
+check("which is what the preview can be built from",
+      pending in patch_data.analyse(mesh).patches)
+check("the surfaces themselves are gone from that analysis",
+      10 not in patch_data.analyse(mesh).patches)
+check("but not from the one describing the model",
+      10 in patch_data.analyse_surfaces(mesh).patches)
+
 ok, _message = operators.toggle_patch_surface(bpy.context, obj, 12)
 check("and now the third one is contiguous too -- three is not a special case", ok)
 check("all three picked", operators.surface_selection(state) == [10, 11, 12])
+check("the patch was rebuilt over all three",
+      len(patch_data.analyse(mesh).patches[state.pending_composite_id].poly_indices) == 6,
+      patch_data.read_composites(mesh))
 
 ok, _message = operators.toggle_patch_surface(bpy.context, obj, 12)
 check("clicking a picked surface drops it again",
       ok and operators.surface_selection(state) == [10, 11])
+check("and the patch shrinks back with it",
+      len(patch_data.analyse(mesh).patches[state.pending_composite_id].poly_indices) == 4)
+
+# Every way out that is not "open it" has to put the mesh back: a composite
+# left behind comes back as a patch nobody built.
+operators.discard_pending_composite(bpy.context)
+check("abandoning the pick leaves nothing on the mesh",
+      patch_data.read_composites(mesh) == {} and state.pending_composite_id == -1,
+      patch_data.read_composites(mesh))
+check("and the surfaces are patches again",
+      sorted(patch_data.analyse(mesh).patches) == [10, 11, 12, 20])
 
 
 # ---------------------------------------------------------------------------
-# 5b. The overlay draws the selection, and says how to build one
+# 5b. The CAD structure still describes the model
+#
+# The B-rep edges between the picked surfaces do not stop existing because a
+# patch was laid across them -- and an overlay that says they did is reporting
+# the addon's decision as if it were the model's. This is the half that reads
+# `analyse_surfaces`.
+# ---------------------------------------------------------------------------
+edges_before = len(pr.cad_display.edge_segments(mesh))
+verts_before = len(pr.cad_display.brep_vertices(mesh))
+check("the model has edges to draw", edges_before > 0, edges_before)
+
+operators.toggle_patch_surface(bpy.context, obj, 10)
+operators.toggle_patch_surface(bpy.context, obj, 11)
+check("a patch over two surfaces keeps every CAD edge",
+      len(pr.cad_display.edge_segments(mesh)) == edges_before,
+      f"{len(pr.cad_display.edge_segments(mesh))} vs {edges_before}")
+check("and every B-rep vertex",
+      len(pr.cad_display.brep_vertices(mesh)) == verts_before,
+      f"{len(pr.cad_display.brep_vertices(mesh))} vs {verts_before}")
+# Asked about one patch it describes that patch, which is the opposite answer
+# and the right one: the border between the two surfaces is not its boundary.
+check("while the patch's own outline is the outline of the pair",
+      len(pr.cad_display.edge_segments(mesh, state.pending_composite_id))
+      < edges_before)
+
+
+# ---------------------------------------------------------------------------
+# 5c. The overlay draws the patch being picked
 #
 # The draw handlers are the one code Blender alone invokes, so nothing else
 # notices when they break -- and a highlight is only ever seen by running it.
@@ -210,16 +271,14 @@ check("clicking a picked surface drops it again",
 # before that.
 # ---------------------------------------------------------------------------
 overlay = pr.overlay
-triangles = pr.cad_display.patch_triangles(mesh, 10)
-check("a surface's fill is its own polygons, fanned", len(triangles) == 6,
+triangles = pr.cad_display.patch_triangles(mesh, state.pending_composite_id)
+check("the fill is every polygon of the patch, fanned", len(triangles) == 12,
       f"got {len(triangles)}")
 check("and it is cached on the mesh like everything a draw handler reads",
-      pr.cad_display.patch_triangles(mesh, 10) is triangles)
+      pr.cad_display.patch_triangles(mesh, state.pending_composite_id) is triangles)
 
 state.session_active = True
 state.session_phase = 'PATCH'
-state.session_object_name = obj.name
-operators.set_surface_selection(state, [10, 11])
 
 overlay.enable()
 try:
@@ -236,7 +295,7 @@ overlay.disable()
 hints = dict(overlay.keybinds_for(state))
 check("the viewport says how many are picked",
       any("2 surfaces" in action for action in hints.values()), hints)
-operators.set_surface_selection(state, [])
+operators.discard_pending_composite(bpy.context)
 hints = dict(overlay.keybinds_for(state))
 check("and names the gesture before anything is picked -- it is behind a "
       "modifier, which nobody finds on their own",
@@ -266,7 +325,7 @@ check("the new id is not one that was just freed", second_id != new_id)
 done, message = operators.split_composite(bpy.context, obj, second_id)
 check("and it splits back", done and patch_data.read_composites(mesh) == {}, message)
 
-state.surface_selection = ""
+operators.discard_pending_composite(bpy.context)
 
 
 # ---------------------------------------------------------------------------

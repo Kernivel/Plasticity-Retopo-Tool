@@ -931,23 +931,37 @@ def mesh_fingerprint(mesh: "bpy.types.Mesh") -> Fingerprint:
     the parse it guards (a KD-tree over the same vertices, and a Python loop
     over every triangle corner).
     """
+    # The composites are part of what `analyse` produces, so they are part of
+    # what invalidates it: joining two surfaces moves no vertex, and without
+    # this the cached analysis would keep handing back the patches from before.
+    composites = str(mesh.get(COMPOSITE_PROP) or "")
+    return geometry_fingerprint(mesh) + (zlib.crc32(composites.encode("utf-8")),)
+
+
+def geometry_fingerprint(mesh: "bpy.types.Mesh") -> "tuple[int, int, int, int, int]":
+    """The same, minus the composites -- what the mesh's own surfaces depend on.
+
+    Kept apart so that building a composite does not invalidate everything that
+    describes the *model*: the B-rep edges and vertices `cad_display` draws are
+    the same curves before and after, and rebuilding them on every Shift+click
+    would be a full re-parse for a picture that did not change.
+    """
     count = len(mesh.vertices)
     coords = array.array("f", bytes(4 * 3 * count))
     if count:
         mesh.vertices.foreach_get("co", coords)
-    # The composites are part of what the parse produces, so they are part of
-    # what invalidates it: joining two faces moves no vertex, and without this
-    # the cached analysis would keep handing back the patches from before.
-    composites = str(mesh.get(COMPOSITE_PROP) or "")
     return (count, len(mesh.polygons), len(mesh.loops),
-            len(mesh.get("face_ids") or ()), zlib.crc32(coords.tobytes()),
-            zlib.crc32(composites.encode("utf-8")))
+            len(mesh.get("face_ids") or ()), zlib.crc32(coords.tobytes()))
 
 
 # mesh name -> (fingerprint, MeshPatches). Keyed by name rather than by the
 # datablock so a dead mesh can never keep itself alive through this dict; a
 # stale entry under a reused name is caught by the fingerprint anyway.
 _cache: dict[str, tuple[Fingerprint, "MeshPatches"]] = {}
+# The same, with no composite applied -- see `analyse_surfaces`. A second slot
+# rather than a second dict keyed differently, so `invalidate` has one place to
+# clear and the limit still counts meshes rather than parses.
+_surface_cache: dict[str, tuple["tuple[int, ...]", "MeshPatches"]] = {}
 _CACHE_LIMIT = 8  # a session works on one object; a few neighbours is plenty
 
 
@@ -960,8 +974,10 @@ def invalidate(mesh: "bpy.types.Mesh | None" = None) -> None:
     """
     if mesh is None:
         _cache.clear()
+        _surface_cache.clear()
     else:
         _cache.pop(mesh.name, None)
+        _surface_cache.pop(mesh.name, None)
 
 
 def analyse(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> MeshPatches:
@@ -981,6 +997,54 @@ def analyse(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> MeshPatches:
     # that walks every polygon, and all this needs is the list the bridge wrote.
     composites, dropped_composites = applicable_composites(
         mesh, mesh.get("face_ids") or ())
+    analysis = _parse(mesh, weld_epsilon, composites, dropped_composites)
+
+    if len(_cache) >= _CACHE_LIMIT:
+        _cache.pop(next(iter(_cache)))
+    _cache[mesh.name] = (fingerprint, analysis)
+    return analysis
+
+
+def analyse_surfaces(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> MeshPatches:
+    """The same parse with **no composite applied**: one patch per Plasticity
+    surface, as the bridge wrote them.
+
+    What describes the *model* rather than the work reads this -- the B-rep
+    edges and vertices `cad_display` draws, and the surface picker, which has
+    to name the individual surface under the cursor even when it is already
+    part of a patch. A composite is this addon's decision; the edges the model
+    was built from do not stop existing because a patch was laid across them,
+    and an overlay that says they did is reporting the wrong thing.
+
+    On a mesh with no composite it hands back `analyse`'s own result, so
+    nothing pays for a second parse until someone builds one.
+    """
+    composites, _dropped = applicable_composites(mesh, mesh.get("face_ids") or ())
+    if not composites:
+        return analyse(mesh, weld_epsilon)
+
+    fingerprint = geometry_fingerprint(mesh)
+    cached = _surface_cache.get(mesh.name)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+
+    analysis = _parse(mesh, weld_epsilon, {}, [])
+
+    if len(_surface_cache) >= _CACHE_LIMIT:
+        _surface_cache.pop(next(iter(_surface_cache)))
+    _surface_cache[mesh.name] = (fingerprint, analysis)
+    return analysis
+
+
+def _parse(
+    mesh: "bpy.types.Mesh",
+    weld_epsilon: float,
+    composites: dict[int, list[int]],
+    dropped_composites: list[int],
+) -> MeshPatches:
+    """One full parse. Shared by `analyse` and `analyse_surfaces`, which differ
+    only in whether the composites are folded in -- everything below is the
+    same work either way, and two copies of it would drift."""
     patches, face_id_of_poly, face_ids = build_patches(mesh, composites)
     weld_map = build_weld_map(mesh, weld_epsilon)
     directed_owners = build_directed_owners(mesh, face_id_of_poly, weld_map)
@@ -992,7 +1056,7 @@ def analyse(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> MeshPatches:
     # another patch's segment, so it needs all of them to exist first.
     resolve_neighbours_by_geometry(patches, positions)
 
-    analysis = MeshPatches(
+    return MeshPatches(
         patches=patches,
         face_id_of_poly=face_id_of_poly,
         face_ids=face_ids,
@@ -1002,11 +1066,6 @@ def analyse(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> MeshPatches:
         composites=composites,
         dropped_composites=dropped_composites,
     )
-
-    if len(_cache) >= _CACHE_LIMIT:
-        _cache.pop(next(iter(_cache)))
-    _cache[mesh.name] = (fingerprint, analysis)
-    return analysis
 
 
 def get_patches_with_boundaries(

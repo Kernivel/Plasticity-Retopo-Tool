@@ -389,6 +389,22 @@ Two boundary loops does **not** by itself mean Ring: see the band invariant.
   stop applying one day: `applicable_composites` hands those back as
   `dropped_composites` and the panel says so, because one that quietly stops
   applying looks exactly like an addon that forgot it.
+  **A composite is what the addon decided, and the model's own edges are not
+  it.** `cad_display`'s B-rep edges and vertices read `analyse_surfaces` -- the
+  same parse with no composite folded in -- whenever they describe the *whole
+  mesh*, and `analyse` when they are asked about one face id, because that id
+  may be a composite and then its outline is the answer. Drawing patch borders
+  where the overlay promises CAD edges reports a decision as if it were the
+  part: the borders between a patch's surfaces simply vanished from `E`, which
+  is "le select multiple détruit les edges originales". `analyse_surfaces`
+  hands back `analyse`'s own result when the mesh carries no composite, so
+  nothing pays for a second parse until one exists, and it is keyed on
+  `geometry_fingerprint` -- the fingerprint without the composites -- so
+  writing one does not throw away a picture of the model that did not change.
+  The surface picker reads it too (`_raycast_patch_ray(surfaces=True)`): once
+  two surfaces are one patch every polygon of both answers with the patch, and
+  Shift+click could no longer take one of them back out. So does the
+  contiguity test, since the selection is kept in surface ids.
   `tests/test_patch_surfaces.py` pins every one of these, each against the
   single-surface behaviour as well -- "the combined rectangle has four sides"
   passes just as well on a build where gathering surfaces does nothing.
@@ -1103,9 +1119,29 @@ row **before anything is picked** -- it sits behind a modifier on a click,
 which is the one kind of gesture nobody finds on their own -- and carries the
 count once something is.
 
-`Esc` drops a pending selection before it leaves the object, the same step-out
-rule that makes the first `Esc` in `ADJUST` clear a half-typed span. The way
-back from a built patch is `retop.split_patch`, a panel button on the open one.
+**The selection is not a list waiting to become a patch -- from the second
+pick on it *is* one, on the mesh.** `refresh_pending_composite` rebuilds the
+composite on every Shift+click and previews it, because `analyse` reads the
+mesh and nothing else, so there is no such thing as an ad-hoc one. Without it
+the viewport showed whichever single surface the cursor had last crossed, which
+is the one thing the gesture is not about: the question being asked is what the
+surfaces make *together*, and a grid over one of them answers it wrongly rather
+than not at all. `_set_hover` therefore stops regenerating while a pick is open
+-- it still records the hovered id, which the click reads, and leaves the
+geometry alone -- and the overlay outlines the composite rather than the
+surfaces, whose ids no longer resolve.
+
+Written to the mesh means **every way out has to take it back off**:
+`discard_pending_composite`, called by `Esc`, by clicking another surface, by
+`exit_session_object` and by `end_session` -- in both of those *before* the
+state is cleared, since that is what still names the object. One left behind
+comes back as a patch nobody built the next time the object is entered. Undo is
+the exception that needs no work: the step has already put the mesh back, so
+`_on_undo_redo` drops only the scene's record of it, which is all a handler may
+write. `state.pending_composite_id` is that record, and it is what the click
+compares the hover against -- clicking the patch locks it in, clicking anything
+else abandons it. The way back from a patch already opened is
+`retop.split_patch`, a panel button on it.
 
 **Deleting a patch** (`X`, `RETOP_OT_delete_patch`) falls straight out of the
 re-edit model: picking a committed patch already took its faces out and

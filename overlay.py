@@ -1178,9 +1178,18 @@ def _draw_surface_selection(
     if obj is None or obj.type != 'MESH':
         return
 
+    # From the second surface on, the picked ones *are* a patch on the mesh, so
+    # what gets drawn is that patch: one outline growing rather than a set of
+    # borders sitting next to each other. Its own ids no longer resolve --
+    # their polygons answer with the patch now -- so this is not a preference
+    # between two drawings, it is which one there is.
+    pending = getattr(state, "pending_composite_id", -1)
+    face_ids = ([pending] if pending != -1
+                else patch_data.parse_surface_selection(raw))
+
     outline = []
     fill = []
-    for face_id in patch_data.parse_surface_selection(raw):
+    for face_id in face_ids:
         outline.extend(cad_display.edge_segments(obj.data, face_id))
         fill.extend(cad_display.patch_triangles(obj.data, face_id))
     if not outline and not fill:

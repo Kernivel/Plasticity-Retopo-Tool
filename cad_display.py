@@ -58,8 +58,19 @@ def invalidate(mesh: "bpy.types.Mesh | None" = None) -> None:
         _selected_cache.pop(mesh.name, None)
 
 
-def _cached(mesh: "bpy.types.Mesh", key: str, build: Callable[[], _T]) -> _T:
-    fingerprint = patch_data.mesh_fingerprint(mesh)
+def _cached(
+    mesh: "bpy.types.Mesh", key: str, build: Callable[[], _T],
+    surfaces: bool = False,
+) -> _T:
+    """`build()`'s result, kept until the mesh changes under it.
+
+    `surfaces=True` for anything derived from the mesh's own Plasticity
+    surfaces rather than from the patches laid over them: it keys on the
+    geometry alone, so building a composite -- which moves no vertex -- does
+    not throw away a picture of the model that did not change.
+    """
+    fingerprint = (patch_data.geometry_fingerprint(mesh) if surfaces
+                   else patch_data.mesh_fingerprint(mesh))
     entries = _cache.get(mesh.name)
     if entries is None:
         if len(_cache) >= _CACHE_LIMIT:
@@ -73,6 +84,19 @@ def _cached(mesh: "bpy.types.Mesh", key: str, build: Callable[[], _T]) -> _T:
     value = build()
     entries[key] = (fingerprint, value)
     return value
+
+
+def _structure(mesh: "bpy.types.Mesh", face_id: int | None) -> "patch_data.MeshPatches":
+    """The analysis the CAD structure display should read.
+
+    With no face id it describes the **model**, so it reads the mesh's own
+    surfaces: a composite is this addon's decision about how to retopologize,
+    and the edges the part was built from do not stop existing because a patch
+    was laid across them. Asked about one face id it describes a **patch**, and
+    then the composites are exactly what it has to honour -- that id may be one.
+    """
+    return (patch_data.analyse(mesh) if face_id is not None
+            else patch_data.analyse_surfaces(mesh))
 
 
 # --- B-rep edges and vertices ----------------------------------------------
@@ -125,7 +149,7 @@ def edge_polylines(
     around than one comparison.
     """
     def build() -> list[list["mathutils.Vector"]]:
-        analysis = patch_data.analyse(mesh)
+        analysis = _structure(mesh, face_id)
         # Boundary loops are in welded index space, and a welded id is itself a
         # vertex index -- build_weld_map elects one of the coincident vertices
         # rather than inventing a new id -- so `positions` indexes directly.
@@ -144,7 +168,9 @@ def edge_polylines(
                     polylines.append([positions[loop[i]] for i in run])
         return polylines
 
-    return _cached(mesh, f"edges:{face_id}", build)
+    # Keyed on the geometry alone when it describes the whole model, so a
+    # composite written mid-pick does not rebuild a picture that did not change.
+    return _cached(mesh, f"edges:{face_id}", build, surfaces=face_id is None)
 
 
 def shared_edges(
@@ -195,7 +221,9 @@ def edge_segments(
                 segments.append(b)
         return segments
 
-    return _cached(mesh, f"edge_segments:{face_id}", build)
+    # Keyed on the geometry alone when it describes the whole model, so a
+    # composite written mid-pick does not rebuild a picture that did not change.
+    return _cached(mesh, f"edge_segments:{face_id}", build, surfaces=face_id is None)
 
 
 def patch_triangles(
@@ -237,7 +265,7 @@ def brep_vertices(
     boundary vertex is the mesher's.
     """
     def build() -> list["mathutils.Vector"]:
-        analysis = patch_data.analyse(mesh)
+        analysis = _structure(mesh, face_id)
         positions = analysis.positions
         seen = set()
         points = []
@@ -252,7 +280,9 @@ def brep_vertices(
                         points.append(positions[vertex])
         return points
 
-    return _cached(mesh, f"brep_vertices:{face_id}", build)
+    # Keyed on the geometry alone when it describes the whole model, so a
+    # composite written mid-pick does not rebuild a picture that did not change.
+    return _cached(mesh, f"brep_vertices:{face_id}", build, surfaces=face_id is None)
 
 
 # --- surface flow -----------------------------------------------------------

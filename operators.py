@@ -838,11 +838,17 @@ def _raycast_patch_ray(
     ray_origin: mathutils.Vector,
     ray_direction: mathutils.Vector,
     space: bpy.types.SpaceView3D | None = None,
+    surfaces: bool = False,
 ) -> tuple[bpy.types.Object | None, int | None, float | None]:
     """Cast `ray_origin`/`ray_direction` through the scene and return
     (hit_object, face_id, distance) for the first Plasticity mesh that is
     actually visible in this viewport, or (None, None, None). `distance` is
     measured in world units from `ray_origin`.
+
+    `surfaces=True` names the mesh's own Plasticity surface rather than the
+    patch covering it. That is what the surface picker needs: once two
+    surfaces are one patch, every polygon of both answers with the patch, and
+    Shift+click could no longer take one of them back out.
 
     Two classes of hit are skipped by re-casting from just past them rather
     than aborting the whole cast:
@@ -886,7 +892,9 @@ def _raycast_patch_ray(
             origin = location + ray_direction * max(1e-6, distance * 1e-5)
             continue
 
-        face_id_of_poly = patch_data.analyse(hit_obj.data).face_id_of_poly
+        analysis = (patch_data.analyse_surfaces(hit_obj.data) if surfaces
+                    else patch_data.analyse(hit_obj.data))
+        face_id_of_poly = analysis.face_id_of_poly
         if index < 0 or index >= len(face_id_of_poly):
             return None, None, None
         return hit_obj, face_id_of_poly[index], distance
@@ -1179,8 +1187,18 @@ def toggle_patch_surface(
     if face_id in selection:
         selection.remove(face_id)
         set_surface_selection(state, selection)
+        refresh_pending_composite(context, obj)
         return True, (f"Dropped surface {face_id} — {len(selection)} selected"
                       if selection else "Surface selection cleared")
+
+    # Already inside a patch somebody else built. Absorbing it would mean
+    # taking that patch apart, which is a decision with a button of its own --
+    # and the alternative, two composites naming one surface, is the overlap
+    # `applicable_composites` throws both of them out for.
+    for other, surfaces in patch_data.read_composites(obj.data).items():
+        if other != state.pending_composite_id and face_id in surfaces:
+            return False, (f"surface {face_id} is already part of another patch — "
+                           "split that one apart first")
 
     # A committed patch's faces carry *its* id, and the composite would carry a
     # new one: nothing would ever delete them again, so they would sit under
@@ -1190,7 +1208,12 @@ def toggle_patch_surface(
         return False, (f"surface {face_id} is already retopologized — delete its "
                        "patch first (X while re-editing it)")
 
-    analysis = patch_data.analyse(obj.data)
+    # The mesh's own surfaces, not the patches over them: the selection is kept
+    # in surface ids, and from the second pick on the ones already in it have
+    # been folded into the pending composite -- so a merged analysis would
+    # report the *patch* as the candidate's neighbour and the contiguity test
+    # below would never match anything again.
+    analysis = patch_data.analyse_surfaces(obj.data)
     patch = analysis.patches.get(face_id)
     if patch is None or not patch.boundary_loops:
         return False, f"surface {face_id} has no usable boundary"
@@ -1208,7 +1231,77 @@ def toggle_patch_surface(
 
     selection.append(face_id)
     set_surface_selection(state, selection)
+    refresh_pending_composite(context, obj)
     return True, f"{len(selection)} surfaces selected"
+
+
+def refresh_pending_composite(
+    context: bpy.types.Context, obj: bpy.types.Object
+) -> int:
+    """Rebuild the patch the picked surfaces make, and preview it. Returns its
+    id, or -1 when fewer than two are picked.
+
+    The selection is not a list of surfaces waiting to become a patch -- it
+    *is* a patch, from the second Shift+click on, and this is what makes the
+    preview say so. Without it the viewport showed whichever single surface the
+    cursor had last passed over, which is the one thing the gesture is not
+    about: the whole question being answered is what the surfaces make
+    *together*, and a grid over one of them answers it wrongly rather than not
+    at all.
+    The composite really is written to the mesh, because that is the only thing
+    `analyse` reads -- so every way out of the pick has to take it back apart,
+    which is `discard_pending_composite`.
+    """
+    state = context.scene.plasticity_retop
+    # Taken apart first, every time: the selection is kept in the mesh's own
+    # surface ids, so the ones from the click before have to be surfaces again
+    # before they can be gathered with the new one.
+    _drop_pending_composite(context, obj)
+
+    selection = surface_selection(state)
+    if len(selection) < 2:
+        mesh_build.clear_preview_object()
+        return -1
+
+    composite_id, _message = build_composite(context, obj, selection)
+    if composite_id is None:
+        return -1
+
+    state.pending_composite_id = composite_id
+    if _generate_for_face(context, obj, composite_id) is None:
+        # Nothing can be built over them -- a closed shell with no boundary
+        # left, or surfaces that only meet at a point. The selection stays, so
+        # it can be adjusted; the preview says so by being empty.
+        mesh_build.clear_preview_object()
+    return composite_id
+
+
+def _drop_pending_composite(
+    context: bpy.types.Context, obj: bpy.types.Object | None
+) -> None:
+    """Take the pending composite off the mesh, if there is one."""
+    state = context.scene.plasticity_retop
+    composite_id = state.pending_composite_id
+    state.pending_composite_id = -1
+    if composite_id == -1 or obj is None or obj.type != 'MESH':
+        return
+    composites = patch_data.read_composites(obj.data)
+    if composites.pop(composite_id, None) is not None:
+        patch_data.write_composites(obj.data, composites)
+
+
+def discard_pending_composite(context: bpy.types.Context) -> None:
+    """Drop the picked surfaces and everything built from them.
+
+    Called by every exit that is not "open it": Esc, clicking another surface,
+    leaving the object, ending the session. Nothing was committed and no ID was
+    created, so there is no undo step to push -- only a mesh property to put
+    back the way it was.
+    """
+    state = context.scene.plasticity_retop
+    obj = bpy.data.objects.get(state.session_object_name)
+    _drop_pending_composite(context, obj)
+    state.surface_selection = ""
 
 
 def build_composite(
@@ -1402,6 +1495,11 @@ def end_session(context: bpy.types.Context, push: bool = True) -> None:
     # An in-flight re-edit is rolled back, never silently dropped: its patch was
     # removed from the result mesh on pick and was never re-committed.
     restore_reedit_removal(context)
+    # And so is a pick that never happened. It *did* write a composite to the
+    # mesh, so this is not only state to drop -- one left behind comes back as
+    # a patch nobody built the next time the object is entered. Before the
+    # state is cleared, since that is what still names the object.
+    discard_pending_composite(context)
 
     # Clear the state *before* refreshing: the look of every result mesh is
     # derived from session state, so refreshing first would just re-apply the
@@ -1413,9 +1511,6 @@ def end_session(context: bpy.types.Context, push: bool = True) -> None:
     state.generator_name = ""
     state.num_sides = 0
     state.editing_committed = False
-    # Gathered surfaces describe a pick that never happened; nothing was written
-    # to the mesh, so there is nothing to undo, only state to drop.
-    state.surface_selection = ""
     _clear_match_state(state)
 
     mesh_build.refresh_result_appearance(context)
@@ -1516,6 +1611,10 @@ def exit_session_object(context: bpy.types.Context) -> None:
     state = context.scene.plasticity_retop
     mesh_build.clear_preview_object()
     restore_reedit_removal(context)  # same rule as end_session
+    # Same rule again, and for the same reason it comes first: the surfaces
+    # picked on this object mean nothing on the next one, and the composite
+    # they built has to come off the mesh with them.
+    discard_pending_composite(context)
 
     # Same ordering rule as end_session: state first, then refresh.
     state.session_object_name = ""
@@ -1523,8 +1622,6 @@ def exit_session_object(context: bpy.types.Context) -> None:
     state.active_face_id = -1
     state.generator_name = ""
     state.num_sides = 0
-    # Surfaces of the object being left: they mean nothing on the next one.
-    state.surface_selection = ""
     _clear_match_state(state)
 
     mesh_build.refresh_result_appearance(context)
@@ -1677,6 +1774,14 @@ class RETOP_OT_session(bpy.types.Operator):
     def _set_hover(
         self, context: bpy.types.Context, obj: bpy.types.Object, face_id: int
     ) -> bool:
+        # While surfaces are being picked the preview belongs to the patch they
+        # make, and a hover must not overwrite it with a grid over whichever
+        # one the cursor is crossing. The hovered id is still recorded, because
+        # the click reads it -- only the geometry is left alone.
+        if context.scene.plasticity_retop.pending_composite_id != -1:
+            self._hover_obj = obj
+            self._hover_face_id = face_id
+            return True
         preview = _generate_for_face(context, obj, face_id)
         if preview is None:
             return False
@@ -1692,43 +1797,43 @@ class RETOP_OT_session(bpy.types.Operator):
         overlay.hover_committed = preview.committed
         return True
 
-    def _open_composite(
-        self, context: bpy.types.Context, selection: "list[int]"
-    ) -> bool:
-        """Write the pending selection to the mesh as one patch and open it.
+    def _open_composite(self, context: bpy.types.Context, composite_id: int) -> bool:
+        """Lock in the patch the picked surfaces already make.
 
-        A composite that cannot then be generated is **taken back apart**: a
-        patch nothing can open is worse than a refusal, and the mesh would be
-        left carrying one with no way to reach it -- the only route back is the
-        Split button on a patch that never opened.
+        It is on the mesh and on screen before this runs -- `set_active_patch`
+        is what turns a preview into the patch the session is adjusting, and
+        nothing is written that was not written already.
+
+        A patch that cannot be generated is **taken back apart**: one nothing
+        can open is worse than a refusal, and the mesh would be left carrying a
+        composite with no way to reach it. That path is reachable because the
+        preview is allowed to stay empty while surfaces are still being picked.
         """
         state = context.scene.plasticity_retop
         obj = bpy.data.objects.get(state.session_object_name)
         if obj is None:
             return False
 
-        composite_id, message = build_composite(context, obj, selection)
-        if composite_id is None:
-            self.report({'WARNING'}, f"Can't build one patch: {message}")
-            return False
-
-        # The hover preview is one surface's grid; the whole patch replaces it.
-        # Cleared first, since set_active_patch regenerates.
-        self._clear_hover(context)
+        surfaces = len(surface_selection(state))
         generator, _sides, _propagated = set_active_patch(context, obj, composite_id)
         if generator is None:
-            split_composite(context, obj, composite_id)
+            discard_pending_composite(context)
+            self._clear_hover(context)
             self.report({'WARNING'},
                         "Those surfaces have no usable boundary together — undone")
             return False
 
+        # Kept, not dropped: the composite is the patch now. Only the record of
+        # it being *pending* goes, so no exit takes it apart any more.
+        state.pending_composite_id = -1
+        set_surface_selection(state, [])
         state.session_phase = 'ADJUST'
         self._set_typed("")
         self._apply_phase_ui(context)
         # A datablock changed, so it gets its own step: Ctrl+Z takes the patch
         # back apart rather than rolling the session up to the one before.
         push_undo("Retop: one patch from several surfaces")
-        self.report({'INFO'}, f"{message} — {generator}")
+        self.report({'INFO'}, f"One patch over {surfaces} surfaces — {generator}")
         return True
 
     def _clear_hover(self, context: bpy.types.Context) -> None:
@@ -2287,15 +2392,24 @@ class RETOP_OT_session(bpy.types.Operator):
             # confirm it would make the first click mean nothing on its own.
             # Clicking outside it opens that surface instead and drops the
             # selection, which is what abandoning it looks like.
-            selection = surface_selection(state)
-            if selection:
-                if len(selection) > 1 and self._hover_face_id in selection:
-                    # The selection is only dropped once the patch has opened:
-                    # a refusal leaves it on screen to be adjusted, rather than
-                    # making the user pick all of it again.
-                    if self._open_composite(context, selection):
-                        set_surface_selection(state, [])
+            pending = state.pending_composite_id
+            if pending != -1:
+                # The patch is already built and already on screen: clicking it
+                # only locks it in. Clicking anything else abandons it -- and
+                # then the hover has to be rebuilt, since it was deliberately
+                # not regenerating while the pick was open.
+                if self._hover_face_id == pending:
+                    self._open_composite(context, pending)
                     return {'RUNNING_MODAL'}
+                discard_pending_composite(context)
+                if (self._hover_obj is None or self._hover_face_id is None
+                        or not self._set_hover(context, self._hover_obj,
+                                               self._hover_face_id)):
+                    self._clear_hover(context)
+                    return {'RUNNING_MODAL'}
+            elif surface_selection(state):
+                # One surface picked and something else clicked: the same
+                # abandonment, with nothing written to the mesh to undo.
                 set_surface_selection(state, [])
 
             state.active_face_id = self._hover_face_id
@@ -2962,8 +3076,11 @@ class RETOP_OT_toggle_surface(bpy.types.Operator):
             self.report({'WARNING'}, "Cursor is not over the viewport")
             return {'CANCELLED'}
 
+        # The mesh's own surface, not the patch over it: once two surfaces are
+        # one patch every polygon of both answers with the patch, and this
+        # click could no longer take one of them back out.
         hit_obj, face_id, _distance = _raycast_patch_ray(
-            context, origin, direction, space=context.space_data)
+            context, origin, direction, space=context.space_data, surfaces=True)
         if face_id is None or hit_obj != obj:
             self.report({'WARNING'}, "No surface of this object under the cursor")
             return {'CANCELLED'}
@@ -3898,7 +4015,8 @@ class RETOP_OT_back(bpy.types.Operator):
             # the same rule that makes the first Esc in ADJUST clear a
             # half-typed span rather than throw the patch away.
             if surface_selection(state):
-                set_surface_selection(state, [])
+                discard_pending_composite(context)
+                bpy.ops.retop.clear_preview()
                 return {'FINISHED'}
             exit_session_object(context)
             return {'FINISHED'}
@@ -3986,6 +4104,12 @@ def _on_undo_redo(
     # mesh state that is gone. The modal picks this up on its next event.
     _undo_needs_reconcile = True
 
+    # A pick in progress described a composite this handler may not take off
+    # the mesh -- but the step has already put the mesh back to whatever it was
+    # holding, so there is nothing left to take off. Only the scene's record of
+    # it goes, which is the one thing here is allowed to write.
+    state.pending_composite_id = -1
+    state.surface_selection = ""
     state.active_face_id = -1
     state.generator_name = ""
     state.num_sides = 0

@@ -89,6 +89,11 @@ class RetopPatchState(bpy.types.PropertyGroup):
     # the overlay draws it.
     surface_selection: bpy.props.StringProperty(
         name="Surface Selection", default="", update=_redraw_update)
+    # The composite written to the mesh while those surfaces are being picked,
+    # so the preview can show the patch they make as it grows -- and so every
+    # way out of the pick can take it back apart again. -1 when there is none.
+    pending_composite_id: bpy.props.IntProperty(
+        name="Pending Composite", default=-1)
     generator_name: bpy.props.StringProperty(name="Generator", default="")
     num_sides: bpy.props.IntProperty(name="Num Sides", default=0)
     # Whether N-gon mode can run on the active patch at all: it needs a flat

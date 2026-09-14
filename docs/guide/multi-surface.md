@@ -23,6 +23,11 @@ to take it back out.
 There is no limit on how many. The hint line along the bottom of the viewport
 carries the key, and the count once anything is picked.
 
+From the second surface on, the preview shows the patch they make — the grid
+across the whole area, rebuilt on every pick. That is the question the gesture
+asks, so it is what the viewport answers; hovering other surfaces while picking
+no longer replaces it.
+
 Click any picked surface to open them all as one patch. What opens is a normal
 patch: it chooses a generator from its own outline, takes spans, matches its
 neighbours, and commits like any other.
@@ -49,6 +54,15 @@ A patch that has been committed refuses to split, and says so. The retopology
 names that patch, and those faces would be left pointing at something that no
 longer exists — nothing would ever clean them up. Delete the patch first
 (<kbd>X</kbd> while re-editing it), then split.
+
+## The CAD edges stay
+
+The borders between the picked surfaces stop being patch boundaries, but they
+are still edges of the model. The Plasticity edge overlay (<kbd>E</kbd>) and
+the B-rep vertices keep showing them, and splitting the patch brings them back
+as patch boundaries too.
+
+What changes is what the *retopology* crosses, not what the model is.
 
 ## What this does not do
 
