@@ -1902,10 +1902,18 @@ knife, a loop cut, a transform or Blender's own selection without taking
 anything from them, and it checks the toggle on every event rather than trusting
 whoever turned it off. A module global and not a scene property: a property
 written on every mouse move marks the file as modified, and looking at a mesh
-must not. `operators.sync_patch_hover` starts it — from the property update, and
-from `load_post`, since a modal does not survive a file load but the property
-asking for one does, and a display frozen on the last thing the cursor touched
-before the load looks exactly like one that has stopped working. Starting is
+must not. `operators.sync_patch_hover` starts it — from the property update, from
+`load_post`, since a modal does not survive a file load but the property
+asking for one does (and a display frozen on the last thing the cursor touched
+before the load looks exactly like one that has stopped working), **and from
+`register`, which is where it must not read the scene**. Blender registers an
+addon under a `_RestrictContext` that has no `scene` attribute at all, no file
+being loaded yet, so `_patch_hover_wanted` reaches for it through a `getattr`:
+reaching straight raised `'_RestrictContext' object has no attribute 'scene'`
+and took the whole registration down, i.e. enabling the addon — or deploying
+and re-enabling it — failed outright while the identical code was fine once
+running. Nothing is wanted at that moment anyway; the scene the toggle lives on
+arrives with `load_post`, which asks again. Starting is
 deferred through a timer: an update callback has a restricted context and
 `INVOKE_DEFAULT` needs a window and a VIEW_3D area to register a handler on.
 The hover is also **not culled by facing** — the cursor is on it, so it is in

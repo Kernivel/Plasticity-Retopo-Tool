@@ -3157,7 +3157,20 @@ class RETOP_OT_toggle_surface_flow(bpy.types.Operator):
 
 
 def _patch_hover_wanted(context: bpy.types.Context) -> bool:
-    state = getattr(context.scene, "plasticity_retop", None)
+    """Whether the patch data display wants the hover modal running.
+
+    `context.scene` through a getattr, not straight: `register` calls this by
+    way of `sync_patch_hover`, and Blender registers an addon under a
+    **restricted** context -- a `_RestrictContext` with no `scene` on it at
+    all, because no file is loaded yet. Reaching for it there raised
+    `'_RestrictContext' object has no attribute 'scene'` and took the whole
+    registration with it, so enabling the addon (or deploying and re-enabling
+    it) failed outright while the very same code was fine once running. There
+    is nothing to want at that moment anyway: the scene the toggle lives on
+    arrives with `load_post`, which calls this again.
+    """
+    scene = getattr(context, "scene", None)
+    state = getattr(scene, "plasticity_retop", None)
     return bool(state is not None
                 and getattr(state, "debug_patch_ids", False)
                 and getattr(state, "debug_patch_scope", 'HOVER') == 'HOVER')
