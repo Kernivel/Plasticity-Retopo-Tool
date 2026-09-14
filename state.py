@@ -541,14 +541,21 @@ class RetopPatchState(bpy.types.PropertyGroup):
     # patch. Those two choices per side already express every valid grouping,
     # `1,1,2,2,3,4` on a hexagon included; the number is only how it reads.
     hovered_bubble: bpy.props.IntProperty(name="Hovered Group Bubble", default=-1)
-    # The demoted ones, as a JSON list of those same indices. Per patch:
-    # cleared by `set_active_patch` with the pins, since both name a side by an
-    # index that means nothing on the next patch.
-    corner_overrides: bpy.props.StringProperty(name="Corner Overrides", default="")
+    # {side index: group number} as JSON, for the sides whose number the user
+    # has actually set. Per patch: cleared by `set_active_patch` with the pins,
+    # since both name a side by an index that means nothing on the next patch.
+    # Only the changes are stored, not the whole numbering -- the default is
+    # one group per side and `sidematch.group_numbers` fills it in.
+    side_groups: bpy.props.StringProperty(name="Side Groups", default="")
+    # What is wrong with the current grouping, or "". A number used in two
+    # separate places, or a boundary left with one group -- reported rather
+    # than made unreachable, because a click whose outcome cannot be predicted
+    # from what is on screen is worse than one that can be undone.
+    group_warning: bpy.props.StringProperty(name="Group Warning", default="")
     # What to put back on Esc. The edit is a session in miniature -- several
     # clicks, then accept or cancel -- so it owes the user a way out that does
     # not commit the patch.
-    corner_edit_backup: bpy.props.StringProperty(name="Corner Backup", default="")
+    side_groups_backup: bpy.props.StringProperty(name="Group Backup", default="")
 
     # --- retop session (see operators.RETOP_OT_session) ---
     session_active: bpy.props.BoolProperty(name="Session Active", default=False)

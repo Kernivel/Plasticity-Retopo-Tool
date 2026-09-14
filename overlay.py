@@ -179,6 +179,19 @@ GROUP_BUBBLE_FONT = 15.0
 GROUP_BUBBLE_HOVER_RATIO = 1.18
 GROUP_BUBBLE_HOVER_RING = (1.00, 1.00, 1.00, 1.0)
 GROUP_BUBBLE_HOVER_RING_RATIO = 1.34
+# A bubble the grouping cannot use: a number that appears in two separate
+# places, or a boundary left with one group. Red, like a side that will crack
+# and like a cracked border -- three places, one meaning, and the only one of
+# the three that is about a choice the user can take back in a click.
+GROUP_BUBBLE_FAULT_RING = (0.95, 0.25, 0.22, 1.0)
+GROUP_BUBBLE_FAULT_RATIO = 1.40
+# A dot is 12 segments and reads as round at 9 pixels. A bubble is nearly three
+# times that across, where 12 reads as the dodecagon it is -- so it gets its
+# own count, a multiple of four like every other, so the disc still measures
+# exactly the size asked for.
+GROUP_BUBBLE_SEGMENTS = 40
+GROUP_WARNING_TEXT = (1.0, 0.72, 0.68, 1.0)
+GROUP_WARNING_BACKDROP = (0.10, 0.04, 0.04, 0.88)
 
 MATCH_DOT_COLOR = (0.35, 1.0, 0.55, 1.0)         # from a committed neighbour
 MATCH_DOT_OUTLINE = (0.05, 0.05, 0.05, 0.9)
@@ -427,6 +440,7 @@ def _draw() -> None:
 
     _draw_vertex_dots(context, state, region)
     _draw_group_bubbles(context, state, region)
+    _draw_group_warning(context, state, region)
     _draw_match_points(context, state, region)
     _draw_brep_vertices(context, state, region)
 
@@ -558,8 +572,7 @@ def _draw_corner_groups(state: "state_mod.RetopPatchState") -> None:
     if not references:
         return
 
-    demoted = sidematch.demoted_corners(state)
-    groups = sidematch.corner_groups(references, demoted)
+    numbers = sidematch.group_numbers(references, state)
     by_index = {reference.index: reference for reference in references}
 
     shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
@@ -571,15 +584,18 @@ def _draw_corner_groups(state: "state_mod.RetopPatchState") -> None:
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('NONE')  # they lie on the surface; same as the dots
 
-    for position, group in enumerate(groups):
+    # Coloured by the *number*, not by position in the walk: two runs carrying
+    # the same number come out the same colour, which is what makes "group 2 is
+    # in two places" visible as a colour appearing twice rather than only as a
+    # line of text.
+    for index, reference in by_index.items():
+        if len(reference.points) < 2:
+            continue
+        number = numbers.get(index, 1)
         shader.uniform_float(
-            "color", CORNER_GROUP_COLORS[position % len(CORNER_GROUP_COLORS)])
-        for index in group:
-            reference = by_index.get(index)
-            if reference is None or len(reference.points) < 2:
-                continue
-            batch_for_shader(
-                shader, 'LINE_STRIP', {"pos": reference.points}).draw(shader)
+            "color", CORNER_GROUP_COLORS[(number - 1) % len(CORNER_GROUP_COLORS)])
+        batch_for_shader(
+            shader, 'LINE_STRIP', {"pos": reference.points}).draw(shader)
 
     gpu.state.blend_set('NONE')
 
@@ -612,8 +628,8 @@ def _draw_group_bubbles(
     if rv3d is None:
         return
 
-    demoted = sidematch.demoted_corners(state)
-    numbers = sidematch.group_numbers(references, demoted)
+    numbers = sidematch.group_numbers(references, state)
+    at_fault, _message = sidematch.group_problems(references, numbers)
     hovered = getattr(state, "hovered_bubble", -1)
 
     scale = max(0.5, getattr(state, "overlay_scale", 1.0))
@@ -632,7 +648,8 @@ def _draw_group_bubbles(
             continue
         number = numbers.get(reference.index, 1)
         colour = CORNER_GROUP_COLORS[(number - 1) % len(CORNER_GROUP_COLORS)]
-        bubbles.append((screen, number, colour, reference.index == hovered))
+        bubbles.append((screen, number, colour, reference.index == hovered,
+                        reference.index in at_fault))
     if not bubbles:
         return
     bubbles.sort(key=lambda entry: entry[3])
@@ -641,16 +658,27 @@ def _draw_group_bubbles(
     gpu.state.blend_set('ALPHA')
     shader.bind()
 
-    for screen, _number, colour, is_hovered in bubbles:
+    for screen, _number, colour, is_hovered, is_at_fault in bubbles:
         radius = half * (GROUP_BUBBLE_HOVER_RATIO if is_hovered else 1.0)
+        # Outermost first: each disc is drawn whole, so a later one covers the
+        # middle of the one before and what is left of it is a ring.
         rings = [(GROUP_BUBBLE_OUTLINE, radius * GROUP_BUBBLE_OUTLINE_RATIO),
                  (colour, radius)]
+        if is_at_fault:
+            rings.insert(0, (GROUP_BUBBLE_FAULT_RING,
+                             radius * GROUP_BUBBLE_FAULT_RATIO))
         if is_hovered:
             rings.insert(0, (GROUP_BUBBLE_HOVER_RING,
                              radius * GROUP_BUBBLE_HOVER_RING_RATIO))
-        for ring_colour, ring_radius in rings:
+        # Largest first, whatever order they were added in: each disc is drawn
+        # whole, so a smaller one lands on top and what is left of the one
+        # under it is a ring. Added out of order -- the fault ring is wider
+        # than the hover ring -- and sorting is the only thing that keeps both
+        # visible on a bubble that is both.
+        for ring_colour, ring_radius in sorted(rings, key=lambda ring: -ring[1]):
             shader.uniform_float("color", ring_colour)
-            vertices, indices = _discs_around([screen], ring_radius)
+            vertices, indices = _discs_around([screen], ring_radius,
+                                              GROUP_BUBBLE_SEGMENTS)
             batch_for_shader(shader, 'TRIS', {"pos": vertices},
                              indices=indices).draw(shader)
 
@@ -659,11 +687,65 @@ def _draw_group_bubbles(
     font_id = 0
     _set_font_size(font_id, GROUP_BUBBLE_FONT * scale)
     blf.color(font_id, *GROUP_BUBBLE_TEXT)
-    for screen, number, _colour, _is_hovered in bubbles:
+    for screen, number, _colour, _is_hovered, _is_at_fault in bubbles:
         label = str(number)
         width, height = blf.dimensions(font_id, label)
         blf.position(font_id, screen.x - width * 0.5, screen.y - height * 0.5, 0)
         blf.draw(font_id, label)
+
+
+def _draw_group_warning(
+    context: bpy.types.Context,
+    state: "state_mod.RetopPatchState",
+    region: bpy.types.Region,
+) -> None:
+    """POST_PIXEL: what is wrong with the grouping, while the editor is open.
+
+    The red rings say *which* bubbles; this says what the rule is and what to
+    do about it. Both halves are needed -- a rule with no bubbles named cannot
+    be acted on, and ringed bubbles with no rule are a colour nobody can
+    interpret.
+
+    Read off `state.group_warning` rather than recomputed: the panel shows the
+    same string, and two draws reaching their own conclusion about one grouping
+    is how they come to disagree.
+    """
+    if region is None:
+        return
+    if state.session_phase != 'ADJUST' or not getattr(state, "corner_edit", False):
+        return
+    message = getattr(state, "group_warning", "")
+    if not message:
+        return
+
+    scale = max(0.5, getattr(state, "overlay_scale", 1.0))
+    font_id = 0
+    _set_font_size(font_id, FONT_SIZE * scale)
+    width, height = blf.dimensions(font_id, message)
+
+    pad = 10.0 * scale
+    x = max(pad, (region.width - width) * 0.5)
+    y = region.height - height - pad * 4.0
+
+    _fill_rect(x - pad, y - pad * 0.6, min(width, region.width) + pad * 2,
+               height + pad * 1.2, GROUP_WARNING_BACKDROP)
+    blf.color(font_id, *GROUP_WARNING_TEXT)
+    blf.position(font_id, x, y, 0)
+    blf.draw(font_id, message)
+
+
+def _fill_rect(
+    x: float, y: float, width: float, height: float,
+    colour: tuple[float, float, float, float],
+) -> None:
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.blend_set('ALPHA')
+    shader.bind()
+    shader.uniform_float("color", colour)
+    corners = [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
+    batch_for_shader(shader, 'TRIS', {"pos": corners},
+                     indices=[(0, 1, 2), (0, 2, 3)]).draw(shader)
+    gpu.state.blend_set('NONE')
 
 
 def _side_appearance(

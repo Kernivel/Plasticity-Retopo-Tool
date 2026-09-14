@@ -83,8 +83,13 @@ ACTIONS: tuple[tuple[str, str, str, str, dict[str, object], list[dict[str, objec
     # below poll on it being off. Both halves are written out -- these come
     # first *and* the others exclude it -- because "it works by an order
     # nothing states" is what sent `Tab` to `object.editmode_toggle`.
-    ("corner_toggle", "Turn corner on / off", SESSION, "retop.toggle_corner", {},
+    # Two items on one operator, differing only by `delta` -- the same shape as
+    # the span wheel's pair, and the reason `_registered` keys on the action
+    # rather than the idname.
+    ("corner_toggle", "Group +", SESSION, "retop.toggle_corner", {"delta": 1},
      [_b('LEFTMOUSE')]),
+    ("corner_toggle_back", "Group -", SESSION, "retop.toggle_corner", {"delta": -1},
+     [_b('LEFTMOUSE', ctrl=True)]),
     ("corners_accept", "Keep corner set", SESSION, "retop.corners_accept", {},
      [_b('RET'), _b('NUMPAD_ENTER'), _b('RIGHTMOUSE')]),
     ("corners_cancel", "Cancel corner edit", SESSION, "retop.corners_cancel", {},

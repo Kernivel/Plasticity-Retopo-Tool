@@ -180,8 +180,8 @@ ctrl = pr.keymap.session_actions_for(FakeEvent('LEFTMOUSE', ctrl=True))
 # editor closed, which is every case this file is about.
 check("a plain left click offers the side picker, under the corner editor",
       plain == ["corner_toggle", "pin_neighbour"], plain)
-check("and Ctrl+click offers the density copy, under the corner editor",
-      ctrl == ["corners_edit", "copy_spans"], ctrl)
+check("and Ctrl+click offers the density copy, under the group editor's two",
+      ctrl == ["corner_toggle_back", "corners_edit", "copy_spans"], ctrl)
 check("with the editor closed the corner actions poll false, so the click is the copy's",
       not state.corner_edit and not bpy.ops.retop.toggle_corner.poll()
       and not bpy.ops.retop.corners_accept.poll())

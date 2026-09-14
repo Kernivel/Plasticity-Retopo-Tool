@@ -1003,9 +1003,10 @@ def set_active_patch(
     # The corner set names sides by index too, so it is per patch for exactly
     # the same reason -- and the editor is closed rather than carried over: it
     # is a gesture on one patch, not a mode the session sits in.
-    state.corner_overrides = ""
+    state.side_groups = ""
+    state.group_warning = ""
     state.corner_edit = False
-    state.corner_edit_backup = ""
+    state.side_groups_backup = ""
     state.hovered_bubble = -1
     # Which patch this one copied from, and which way round. Per patch, for the
     # same reason a pin is: carried over, the first click on the *next* patch
@@ -2250,37 +2251,40 @@ class RETOP_OT_edit_corners(bpy.types.Operator):
             return {'CANCELLED'}
         # What Esc puts back. The edit is several clicks long, so it owes a way
         # out that neither commits the patch nor keeps a half-made corner set.
-        state.corner_edit_backup = state.corner_overrides
+        state.side_groups_backup = state.side_groups
         state.corner_edit = True
         state.hovered_bubble = -1
+        refresh_group_warning(context)
         self.report({'INFO'},
-                    "Group editor: click a side's number to merge it into the one before, "
-                    "Enter to keep")
+                    "Group editor: click a side's number to step it, Ctrl+click to step it "
+                    "back, Enter to keep")
         return {'FINISHED'}
 
 
 class RETOP_OT_toggle_corner(bpy.types.Operator):
-    """Merge the side under the cursor into the group before it, or split it out.
+    """Step the group number of the side under the cursor.
 
-    **Binary, not a 1-2-3-4 cycle**, and that is a fact about the geometry
-    rather than a simplification: a group becomes one side of a Coons patch, so
-    it has to be a *contiguous arc* of the boundary. A free numbering could
-    write "side 1 in group 1, side 2 in group 2, side 3 in group 1 again",
-    which is not a patch, and it would then have to be either refused or
-    silently repaired. Each side has only ever two honest choices -- join the
-    group before it, or open a new one -- and those two express every valid
-    grouping, `1,1,2,2,3,4` on a hexagon included. The number is how it reads,
-    not what is chosen.
+    **Free, and checked rather than constrained.** This used to merge the side
+    into the group before it or split it back out -- always valid by
+    construction, and unpredictable to use: nothing on screen said whether the
+    next click would open a new group or join an existing one, so the one thing
+    a bubble is for (reading the state before acting on it) did not extend to
+    the click. Now the number is simply stepped, every value is reachable, and
+    a grouping that cannot work is reported by `sidematch.group_problems` with
+    the offending bubbles ringed.
 
-    A corner is named by the side it starts, so side `i`'s bubble is corner
-    `i`: one index space for the drawing, the hit test and the override.
+    Wraps rather than clamping, and the ceiling is the loop's own side count:
+    more groups than sides is not something a boundary can be cut into, and a
+    click that does nothing at the end of the range reads as a broken control.
     """
     bl_idname = "retop.toggle_corner"
     bl_label = "Change Side Group"
-    bl_description = ("Merge the side under the cursor into the group before it, or split it "
-                      "back out. A group becomes one side of the patch, so it is always a "
-                      "connected run of the boundary")
+    bl_description = ("Step the group number of the side under the cursor. A group becomes one "
+                      "side of the patch, so it has to be a connected run of the boundary -- "
+                      "the viewport says so when it is not")
     bl_options = {'REGISTER'}
+
+    delta: bpy.props.IntProperty(name="Step", default=1)
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -2292,29 +2296,39 @@ class RETOP_OT_toggle_corner(bpy.types.Operator):
         state = context.scene.plasticity_retop
         references = sidematch.active_sides()
         index = state.hovered_bubble
-        demoted = sidematch.demoted_corners(state)
+        if not (0 <= index < len(references)):
+            return {'CANCELLED'}
 
-        if index in demoted:
-            demoted.discard(index)
-        else:
-            # A loop below two groups has one closed side, which no generator
-            # accepts -- `find_generator` starts at Wedge 2 -- so the patch
-            # would silently become unpickable. Refused here rather than
-            # reported later, because "later" is after the editor has closed.
-            candidate = demoted | {index}
-            counts = sidematch.loop_group_counts(references, candidate)
-            loop = references[index].loop if 0 <= index < len(references) else 0
-            if counts.get(loop, 0) < 2:
-                self.report({'WARNING'},
-                            "A boundary needs at least two groups: split another side out "
-                            "first")
-                return {'CANCELLED'}
-            demoted = candidate
+        numbers = sidematch.group_numbers(references, state)
+        ceiling = max(1, sidematch.group_count_for(references, references[index].loop))
+        stepped = (numbers.get(index, 1) - 1 + (self.delta or 1)) % ceiling + 1
 
-        sidematch.set_demoted_corners(state, demoted)
-        counts = sidematch.loop_group_counts(references, demoted)
-        self.report({'INFO'}, _corner_report(counts))
+        stored = sidematch.side_groups(state)
+        stored[index] = stepped
+        sidematch.set_side_groups(state, stored)
+
+        refresh_group_warning(context)
+        counts = sidematch.loop_group_counts(
+            references, sidematch.group_numbers(references, state))
+        self.report({'INFO'}, state.group_warning or _corner_report(counts))
         return {'FINISHED'}
+
+
+def refresh_group_warning(context: bpy.types.Context) -> None:
+    """Re-read what is wrong with the grouping, for the panel and the overlay.
+
+    Written to the scene rather than recomputed at draw time: a draw handler
+    runs on every redraw, and the panel and the viewport have to agree about
+    one grouping rather than each reaching their own conclusion.
+    """
+    state = context.scene.plasticity_retop
+    references = sidematch.active_sides()
+    if not references:
+        state.group_warning = ""
+        return
+    _at_fault, message = sidematch.group_problems(
+        references, sidematch.group_numbers(references, state))
+    state.group_warning = message
 
 
 def _corner_report(counts: dict[int, int]) -> str:
@@ -2347,8 +2361,13 @@ class RETOP_OT_corners_accept(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
+        # The warning outlives the editor on purpose: an invalid grouping is
+        # kept rather than refused, so the panel has to go on saying it cannot
+        # be built. Refusing to close would be the modal nobody can get out of.
         _close_corner_editor(state)
         regenerate_active_preview(context)
+        if state.group_warning:
+            self.report({'WARNING'}, state.group_warning)
         return {'FINISHED'}
 
 
@@ -2366,15 +2385,16 @@ class RETOP_OT_corners_cancel(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
-        state.corner_overrides = state.corner_edit_backup
+        state.side_groups = state.side_groups_backup
         _close_corner_editor(state)
+        refresh_group_warning(context)
         regenerate_active_preview(context)
         return {'FINISHED'}
 
 
 def _close_corner_editor(state: "state_mod.RetopPatchState") -> None:
     state.corner_edit = False
-    state.corner_edit_backup = ""
+    state.side_groups_backup = ""
     state.hovered_bubble = -1
 
 

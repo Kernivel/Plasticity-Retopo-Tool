@@ -117,7 +117,9 @@ for corners in (False, True):
 state.corner_edit = True
 pr.sidematch._active_sides = [
     pr.sidematch.SideReference(n, 0, n, [], None, None) for n in range(5)]
-pr.sidematch.set_demoted_corners(state, {2})
+# Group 1 in two separate places -- the invalid state the fault rings and
+# the banner exist for, so both run here rather than only the happy path.
+pr.sidematch.set_side_groups(state, {2: 1})
 # With sides actually present the group drawing runs past its early exits and
 # reaches the GPU, which headless Blender has none of -- so the assertion is
 # that *that* is the only thing it hits. A missing name would raise here first,
@@ -134,8 +136,13 @@ check("the corner groups draw down to the GPU call and no further",
 check("_draw_group_bubbles survives with no region",
       call(lambda: overlay._draw_group_bubbles(bpy.context, state, None),
            "_draw_group_bubbles"))
+state.group_warning = "Group 1 is in 2 separate places."
+check("_draw_group_warning survives with no region",
+      call(lambda: overlay._draw_group_warning(bpy.context, state, None),
+           "_draw_group_warning"))
+state.group_warning = ""
 pr.sidematch._active_sides = []
-pr.sidematch.set_demoted_corners(state, set())
+pr.sidematch.set_side_groups(state, {})
 state.corner_edit = False
 state.hovered_bubble = -1
 

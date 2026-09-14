@@ -1146,90 +1146,74 @@ happens to be two sides in a row. Turning that junction off — keeping the
 vertex, dropping its status as a side boundary — merges the two sides meeting
 there, and four groups is what `find_generator` should then be handed.
 
-**A corner is named by the side it starts**, so side `i`'s bubble drives corner
-`i` and one flat index serves the overlay, the hit test and the stored
-override. That naming is also what makes the gesture unambiguous: "turn side 2
-off" would have to say whether 2 joins 1 or 3, while "merge side 2 into the
-group before it" leaves nothing to choose. `sidematch.corner_groups` / `loop_group_counts` are the
-grouping, in `sidematch` because the **overlay** reads them on every redraw and
-a draw handler may never import `operators`; only `nearest_corner_to_cursor`
-stays there, since it needs a region.
-
-**A sub-state of `ADJUST`, never a phase of its own.** `session_phase ==
-'ADJUST'` is tested at some twenty places — eight in `overlay` alone — and the
-patch is still open, still has spans, still has a preview, so every one of them
-must stay true. An enum value would have turned them all off in silence.
-`state.corner_edit` is the flag and `operators._in_phase` is where the
-exclusion lives once, so every action polling through it is inert for the
-length of the edit without restating it; the two CAD displays opt back in with
-`during_corner_edit=True`, because the structure is read *while* choosing
-corners. `commit`, `back`, `pin_neighbour`, `copy_spans` and `delete_patch`
-spell their own polls and exclude it by hand.
-
-**One key, two meanings, resolved by poll — and both halves written out.** The
-editor takes the plain click, `Enter`/right-click and `Esc`; it wins by being
-declared **first** in `ACTIONS` *and* by the patch's own actions polling on it
-being closed. Either alone would work today, and "it works by an order nothing
-states" is exactly what sent `Tab` to `object.editmode_toggle`. `Ctrl`+click is
-split the way the plain click already is — by what is under the cursor: a
-**side** of this patch opens the editor, anything else copies a density. So
-`copy_spans` now polls `hovered_side == -1`, and `_modal_match` stops writing
-`copy_hover_face_id` while a side is hovered — an amber outline promising a
-copy and delivering a mode is the failure the hover exists to prevent. Neither
-branch destroys anything, which is what makes a few pixels of ambiguity
-affordable; `X` falling through to `object.delete` is what it looks like when
-that is not true.
-
-**A loop is never taken below two sides.** One closed side is what
-`sides.synthesise_corners` exists to undo, and `find_generator` starts at
-Wedge 2 — so demoting the last corner of a loop would leave the patch silently
-unpickable. Refused at the click, while the editor is still open to undo it.
-Esc restores the set the editor was opened with (`corner_edit_backup`): the
-edit is several clicks long, so it owes a way out that neither commits the
-patch nor keeps a half-made corner set.
-
 **Each side carries a numbered bubble, and that bubble is the control.**
 Colour alone says "these two sides are together" only if two hues can be told
 apart at a glance across a part, and it cannot say *which* group without a
-legend; a bubble carrying `2` says it outright. It is anchored at
-`sidematch.side_midpoint` — shared with the hit test
-(`operators.side_bubble_under_cursor`) rather than implemented twice, because
-two versions of "the middle of this side" drift apart on a curved boundary and
-a bubble you cannot click where you see it is worse than no bubble. The hovered
-one is *lifted*, never recoloured: its colour is its group, and replacing it
-would hide the one thing it exists to say. `sidematch.group_numbers` derives
-the numbers and nothing stores them — merging one side renumbers every group
-after it, so a stored copy could only disagree, the same reason
-`state.side_overrides` keeps a pin's kind rather than its count. Numbered per
-loop, so a ring's two rims both start at 1.
+legend; a bubble carrying `2` says it outright. Click steps the number,
+`Ctrl`+click steps it back (two `KeyMapItem`s on one operator differing by
+`delta`, the same shape as the span wheel's pair). It wraps rather than
+clamping, with the loop's own side count as the ceiling — more groups than
+sides is not something a boundary can be cut into, and a click that does
+nothing at the end of a range reads as a broken control.
 
-**The click is binary, and a 1-2-3-4 cycle would be wrong.** A group becomes
-one side of a Coons patch, so it has to be a **contiguous arc** of the
-boundary: a free numbering can write "side 1 in group 1, side 2 in group 2,
-side 3 in group 1 again", which is not a patch, and it would then have to be
-refused or silently repaired. Each side has two honest choices — join the group
-before it, or open a new one — and those two express every valid grouping,
-`1,1,2,2,3,4` on a hexagon included. The number is how the state *reads*, not
-what is chosen.
+**Free, and checked rather than constrained.** The first version stored the
+demoted *corners* and let a click only merge a side into the one before it or
+split it back out — always valid by construction, and unpredictable to use:
+nothing on screen said whether the next click would open a new group or join an
+existing one, so the one thing a bubble is for, reading the state before acting
+on it, did not extend to the click. Any number is reachable now, and a grouping
+that cannot work is **reported** rather than made unreachable. That is the
+judgement `sides.corners_are_uniform` and the crack report already make: say
+what is wrong, do not guess.
 
-The sides are painted **by group** too, in colours that are neither green nor
-red — those two mean "welds" and "cracks" everywhere else here, and a group is
-neither — with the side picker's own colours and tooltip suppressed for the
-duration. `tests/test_corner_edit.py`.
+`sidematch.group_problems` is that report, and there are exactly two faults.
+**A number in two separate places** — a group becomes one side of a Coons
+patch, so it has to be a contiguous arc of the boundary, and `1,2,1` is not a
+patch. **A loop left with one group** — one closed side, which no generator
+accepts (`find_generator` starts at Wedge 2). A *gap* is deliberately not a
+fault: `1,1,3,4` is three connected runs and a perfectly good three-sided
+patch, and complaining would be nagging about nothing. It returns the offending
+sides as well as the wording, because a side has no name on screen beyond the
+bubble sitting on it — the viewport rings those bubbles in red, the banner
+states the rule, and neither half works alone.
 
-**Not wired into the generators yet.** The grouping is chosen, stored and
+The sides are painted by group **number**, not by position in the walk, so two
+runs carrying the same number come out the same colour: "group 2 is in two
+places" is then visible as a colour appearing twice rather than only as a line
+of text. The hovered bubble is *lifted*, never recoloured — its colour is its
+group, and replacing it would hide the one thing it exists to say. Bubbles get
+their own `GROUP_BUBBLE_SEGMENTS`: a dot reads as round at 9 pixels with
+twelve, a bubble is three times that across and reads as the dodecagon it is.
+
+`sidematch.group_numbers` fills in the default — one group per side, numbered
+from 1 **within each loop**, since a ring's two rims are separate boundaries —
+and only the sides actually changed are stored (`state.side_groups`). The
+anchor is `sidematch.side_midpoint`, shared with the hit test
+(`operators.side_bubble_under_cursor`) rather than implemented twice: two
+versions of "the middle of this side" drift apart on a curved boundary, and a
+bubble you cannot click where you see it is worse than no bubble. By arc length
+rather than by index, or a densely tessellated end pulls the bubble into it.
+
+**An unusable grouping is kept, so the warning outlives the editor.**
+`state.group_warning` is written by `operators.refresh_group_warning` and read
+by both the panel and the overlay — two draws reaching their own conclusion
+about one grouping is how they come to disagree. Refusing to close on a fault
+would be the modal nobody can get out of, the same reason the mirror's axis
+prompt cancels on anything that is not an axis.
+
+**Not wired into the generators yet.** The grouping is chosen, checked and
 drawn; `_generate_for_face` still hands the ungrouped sides over, so a pentagon
 is still filled by the fan. The test says so out loud so a green suite is not
 read as "five-sided patches are handled". What the next step needs, and why it
-is the only real work here: the demoted corner must stay a **mesh vertex**,
-because neighbours weld to it, and `resample_polyline_by_arclength` over a
-merged side would slide off it — so the group's span has to be allocated per
-sub-side as integers, the way `nside.spoke_allocation` allocates spokes.
+is the only real work here: the corner inside a merged group must stay a **mesh
+vertex**, because neighbours weld to it, and `resample_polyline_by_arclength`
+over a merged side would slide off it — so the group's span has to be allocated
+per sub-side as integers, the way `nside.spoke_allocation` allocates spokes.
 Matching stays per *real* side throughout (`side_neighbours` and `_match_pool`
 must keep seeing five), and what is given up is that corner's
 `retop_source_vid`: it welds by proximity instead of identity, and span
 propagation out of it stops — the same trade `sidematch._recut_arbitrary_loop`
-already accepts.
+already accepts. `tests/test_corner_edit.py`.
 
 **A neighbour covering part of a side is completed, not refused — and only
 when you point at it.** A bore's rim is one long cornerless side and the patch

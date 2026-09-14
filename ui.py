@@ -1,3 +1,4 @@
+import textwrap
 from typing import TYPE_CHECKING
 
 import bpy
@@ -183,6 +184,16 @@ def _draw_warnings(
     warn.label(text="Re-import it through the bridge.")
 
 
+def _wrapped(text: str, width: int = 46) -> list[str]:
+    """`text` broken into panel-width lines.
+
+    A `label` does not wrap and the N-panel is narrow, so a sentence handed to
+    one whole is a sentence read up to the edge and no further -- which for an
+    explanation of what to change is the same as not showing it.
+    """
+    return textwrap.wrap(text, width) or [text]
+
+
 def _draw_group_integrity(
     layout: bpy.types.UILayout, obj: bpy.types.Object
 ) -> None:
@@ -238,6 +249,16 @@ def _draw_active_patch(
         warn.alert = True
         warn.label(text="Corner detection is unsure here", icon='ERROR')
         warn.label(text=state.corner_warning)
+
+    # The group editor keeps an unusable grouping rather than refusing it, so
+    # the complaint has to outlive the editor: shown here whether or not it is
+    # open, in the same block as the other standing warnings.
+    if state.group_warning:
+        warn = box.column(align=True)
+        warn.alert = True
+        warn.label(text="Side groups can't be built", icon='ERROR')
+        for line in _wrapped(state.group_warning):
+            warn.label(text=line)
 
     if state.num_loops > 2:
         # More than one hole: the band generator handles two loops, not three,
