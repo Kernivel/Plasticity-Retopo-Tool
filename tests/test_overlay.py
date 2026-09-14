@@ -109,7 +109,7 @@ for ngon in (False, True):
 # fired between two patches sees.
 for corners in (False, True):
     state.corner_edit = corners
-    state.hovered_corner = 1 if corners else -1
+    state.hovered_bubble = 1 if corners else -1
     check(f"_draw_points survives corner_edit={corners}",
           call(overlay._draw_points, "_draw_points"))
     check(f"_draw survives corner_edit={corners}", call(overlay._draw, "_draw"))
@@ -131,13 +131,13 @@ except Exception as exc:  # noqa: BLE001
     reached = repr(exc)
 check("the corner groups draw down to the GPU call and no further",
       reached in ("gpu", "no error"), reached)
-check("_draw_corner_dots survives with no region",
-      call(lambda: overlay._draw_corner_dots(bpy.context, state, None),
-           "_draw_corner_dots"))
+check("_draw_group_bubbles survives with no region",
+      call(lambda: overlay._draw_group_bubbles(bpy.context, state, None),
+           "_draw_group_bubbles"))
 pr.sidematch._active_sides = []
 pr.sidematch.set_demoted_corners(state, set())
 state.corner_edit = False
-state.hovered_corner = -1
+state.hovered_bubble = -1
 
 check("with no preview there are no vertex coords",
       overlay._preview_vertex_coords() is None)

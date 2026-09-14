@@ -1146,11 +1146,11 @@ happens to be two sides in a row. Turning that junction off — keeping the
 vertex, dropping its status as a side boundary — merges the two sides meeting
 there, and four groups is what `find_generator` should then be handed.
 
-**A corner, not a side, and that is the whole of the gesture.** "Turn side 2
-off" has to say whether 2 joins 1 or 3; "turn this corner off" merges the two
-sides that meet at it and there is nothing left to choose. A corner is named by
-the side it *starts*, so one flat index serves the overlay, the hit test and
-the stored override. `sidematch.corner_groups` / `loop_group_counts` are the
+**A corner is named by the side it starts**, so side `i`'s bubble drives corner
+`i` and one flat index serves the overlay, the hit test and the stored
+override. That naming is also what makes the gesture unambiguous: "turn side 2
+off" would have to say whether 2 joins 1 or 3, while "merge side 2 into the
+group before it" leaves nothing to choose. `sidematch.corner_groups` / `loop_group_counts` are the
 grouping, in `sidematch` because the **overlay** reads them on every redraw and
 a draw handler may never import `operators`; only `nearest_corner_to_cursor`
 stays there, since it needs a region.
@@ -1188,12 +1188,34 @@ Esc restores the set the editor was opened with (`corner_edit_backup`): the
 edit is several clicks long, so it owes a way out that neither commits the
 patch nor keeps a half-made corner set.
 
-The overlay paints the sides **by group** while it is open, in colours that are
-neither green nor red — those two mean "welds" and "cracks" everywhere else
-here, and a group is neither — with the side picker's own colours and tooltip
-suppressed for the duration. A demoted corner is drawn small and dark rather
-than not at all: it is still a vertex of the mesh, and one that vanished would
-read as geometry lost. `tests/test_corner_edit.py`.
+**Each side carries a numbered bubble, and that bubble is the control.**
+Colour alone says "these two sides are together" only if two hues can be told
+apart at a glance across a part, and it cannot say *which* group without a
+legend; a bubble carrying `2` says it outright. It is anchored at
+`sidematch.side_midpoint` — shared with the hit test
+(`operators.side_bubble_under_cursor`) rather than implemented twice, because
+two versions of "the middle of this side" drift apart on a curved boundary and
+a bubble you cannot click where you see it is worse than no bubble. The hovered
+one is *lifted*, never recoloured: its colour is its group, and replacing it
+would hide the one thing it exists to say. `sidematch.group_numbers` derives
+the numbers and nothing stores them — merging one side renumbers every group
+after it, so a stored copy could only disagree, the same reason
+`state.side_overrides` keeps a pin's kind rather than its count. Numbered per
+loop, so a ring's two rims both start at 1.
+
+**The click is binary, and a 1-2-3-4 cycle would be wrong.** A group becomes
+one side of a Coons patch, so it has to be a **contiguous arc** of the
+boundary: a free numbering can write "side 1 in group 1, side 2 in group 2,
+side 3 in group 1 again", which is not a patch, and it would then have to be
+refused or silently repaired. Each side has two honest choices — join the group
+before it, or open a new one — and those two express every valid grouping,
+`1,1,2,2,3,4` on a hexagon included. The number is how the state *reads*, not
+what is chosen.
+
+The sides are painted **by group** too, in colours that are neither green nor
+red — those two mean "welds" and "cracks" everywhere else here, and a group is
+neither — with the side picker's own colours and tooltip suppressed for the
+duration. `tests/test_corner_edit.py`.
 
 **Not wired into the generators yet.** The grouping is chosen, stored and
 drawn; `_generate_for_face` still hands the ungrouped sides over, so a pentagon

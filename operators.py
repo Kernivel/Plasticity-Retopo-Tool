@@ -946,28 +946,35 @@ def _distance_to_segment(
 # The corner set itself lives in `sidematch`, a leaf: the overlay reads it on
 # every redraw and must never import this module, which imports it back. Only
 # the hit test stays here, because it needs a region and a viewport.
-def nearest_corner_to_cursor(
-    context: bpy.types.Context, event: bpy.types.Event, max_pixels: float = 30.0
-) -> int:
-    """Flat index of the corner nearest the cursor, or -1.
+def side_bubble_under_cursor(context: bpy.types.Context, event: bpy.types.Event) -> int:
+    """Flat index of the side whose group bubble the cursor is on, or -1.
 
-    Screen space for the same reason `nearest_side_to_cursor` is: the corners
-    lie exactly on the surface, so a ray hits the surface beside one as often
-    as the point itself. A tighter radius than a side's, because the corners of
-    one patch can sit a few pixels apart on a small feature and picking the
-    wrong one is a click the user has to notice and undo.
+    The bubbles are screen-space discs, so this is a point-in-disc test rather
+    than a distance to a polyline -- what the user is aiming at is the bubble,
+    not the edge under it. Both the anchor and the radius come from the same
+    places the drawing takes them (`sidematch.side_midpoint`,
+    `overlay.GROUP_BUBBLE_SIZE`): a bubble that is not clickable where it is
+    drawn is worse than no bubble at all.
+
+    Nearest wins when two overlap, which they do on a short side of a dense
+    part -- a click then takes the one whose centre is closer, which is the
+    one the pointer is visibly on.
     """
     region, rv3d = viewport_region(context)
     if region is None or rv3d is None:
         return -1
 
+    state = context.scene.plasticity_retop
+    radius = overlay.GROUP_BUBBLE_SIZE * max(0.5, state.overlay_scale) / 2.0
     mouse = mathutils.Vector((event.mouse_x - region.x, event.mouse_y - region.y))
+
     best_index = -1
-    best_distance = max_pixels
+    best_distance = radius
     for reference in sidematch.active_sides():
-        if not reference.points:
+        anchor = sidematch.side_midpoint(reference.points)
+        if anchor is None:
             continue
-        screen = view3d_utils.location_3d_to_region_2d(region, rv3d, reference.points[0])
+        screen = view3d_utils.location_3d_to_region_2d(region, rv3d, anchor)
         if screen is None:
             continue
         distance = (mouse - screen).length
@@ -999,7 +1006,7 @@ def set_active_patch(
     state.corner_overrides = ""
     state.corner_edit = False
     state.corner_edit_backup = ""
-    state.hovered_corner = -1
+    state.hovered_bubble = -1
     # Which patch this one copied from, and which way round. Per patch, for the
     # same reason a pin is: carried over, the first click on the *next* patch
     # would come back swapped.
@@ -1439,7 +1446,7 @@ class RETOP_OT_session(bpy.types.Operator):
         state = context.scene.plasticity_retop
 
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
-            state.hovered_corner = nearest_corner_to_cursor(context, event)
+            state.hovered_bubble = side_bubble_under_cursor(context, event)
             # Neither of these means anything while corners are being chosen,
             # and leaving them set would paint a side green and outline a
             # patch in amber for gestures the editor has taken over.
@@ -2245,28 +2252,46 @@ class RETOP_OT_edit_corners(bpy.types.Operator):
         # out that neither commits the patch nor keeps a half-made corner set.
         state.corner_edit_backup = state.corner_overrides
         state.corner_edit = True
-        state.hovered_corner = -1
-        self.report({'INFO'}, "Corner editor: click a corner to turn it off, Enter to keep")
+        state.hovered_bubble = -1
+        self.report({'INFO'},
+                    "Group editor: click a side's number to merge it into the one before, "
+                    "Enter to keep")
         return {'FINISHED'}
 
 
 class RETOP_OT_toggle_corner(bpy.types.Operator):
-    """Turn the corner under the cursor on or off."""
+    """Merge the side under the cursor into the group before it, or split it out.
+
+    **Binary, not a 1-2-3-4 cycle**, and that is a fact about the geometry
+    rather than a simplification: a group becomes one side of a Coons patch, so
+    it has to be a *contiguous arc* of the boundary. A free numbering could
+    write "side 1 in group 1, side 2 in group 2, side 3 in group 1 again",
+    which is not a patch, and it would then have to be either refused or
+    silently repaired. Each side has only ever two honest choices -- join the
+    group before it, or open a new one -- and those two express every valid
+    grouping, `1,1,2,2,3,4` on a hexagon included. The number is how it reads,
+    not what is chosen.
+
+    A corner is named by the side it starts, so side `i`'s bubble is corner
+    `i`: one index space for the drawing, the hit test and the override.
+    """
     bl_idname = "retop.toggle_corner"
-    bl_label = "Toggle Corner"
-    bl_description = "Turn the corner under the cursor on or off as a side boundary"
+    bl_label = "Change Side Group"
+    bl_description = ("Merge the side under the cursor into the group before it, or split it "
+                      "back out. A group becomes one side of the patch, so it is always a "
+                      "connected run of the boundary")
     bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         state = context.scene.plasticity_retop
         return (state.session_active and state.corner_edit
-                and state.hovered_corner != -1)
+                and state.hovered_bubble != -1)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
         references = sidematch.active_sides()
-        index = state.hovered_corner
+        index = state.hovered_bubble
         demoted = sidematch.demoted_corners(state)
 
         if index in demoted:
@@ -2281,7 +2306,7 @@ class RETOP_OT_toggle_corner(bpy.types.Operator):
             loop = references[index].loop if 0 <= index < len(references) else 0
             if counts.get(loop, 0) < 2:
                 self.report({'WARNING'},
-                            "A boundary needs at least two sides: turn another corner back on "
+                            "A boundary needs at least two groups: split another side out "
                             "first")
                 return {'CANCELLED'}
             demoted = candidate
@@ -2293,12 +2318,19 @@ class RETOP_OT_toggle_corner(bpy.types.Operator):
 
 
 def _corner_report(counts: dict[int, int]) -> str:
+    """What the grouping now amounts to -- the generator it would pick.
+
+    The count is the whole point of the gesture: it is what `find_generator`
+    reads, so saying "4 groups" without saying "Quad" would report the input
+    and withhold the answer.
+    """
     if len(counts) == 1:
-        sides = next(iter(counts.values()))
-        generator = generators.find_generator(sides)
+        groups = next(iter(counts.values()))
+        generator = generators.find_generator(groups)
         name = generator.name if generator is not None else "no generator"
-        return f"{sides} sides -> {name}"
-    return " + ".join(f"loop {loop}: {sides} sides" for loop, sides in sorted(counts.items()))
+        return f"{groups} groups -> {name}"
+    return " + ".join(f"loop {loop}: {groups} groups"
+                      for loop, groups in sorted(counts.items()))
 
 
 class RETOP_OT_corners_accept(bpy.types.Operator):
@@ -2343,7 +2375,7 @@ class RETOP_OT_corners_cancel(bpy.types.Operator):
 def _close_corner_editor(state: "state_mod.RetopPatchState") -> None:
     state.corner_edit = False
     state.corner_edit_backup = ""
-    state.hovered_corner = -1
+    state.hovered_bubble = -1
 
 
 def _copy_source_under_cursor(

@@ -165,13 +165,20 @@ CORNER_GROUP_WIDTH = 5.0
 # whichever is under the cursor. The off one is drawn small and dark rather
 # than not at all: it is still a vertex of the mesh, and a corner that vanished
 # would read as geometry lost rather than as a boundary given up.
-CORNER_ON_COLOR = (1.00, 1.00, 1.00, 1.0)
-CORNER_OFF_COLOR = (0.30, 0.30, 0.34, 0.9)
-CORNER_HOVER_COLOR = (1.00, 0.85, 0.30, 1.0)
-CORNER_DOT_SIZE = 11.0
-CORNER_OFF_RATIO = 0.55
-CORNER_OUTLINE = (0.05, 0.05, 0.05, 0.9)
-CORNER_OUTLINE_RATIO = 1.45
+# One bubble per side, carrying its group number -- what you click to change
+# which group the side is in. Screen-space geometry like every other dot here:
+# `gpu.state.point_size_set` is ignored whenever program point size is on,
+# which is what made these 1px once before.
+GROUP_BUBBLE_SIZE = 26.0
+GROUP_BUBBLE_OUTLINE = (0.05, 0.05, 0.05, 0.95)
+GROUP_BUBBLE_OUTLINE_RATIO = 1.16
+GROUP_BUBBLE_TEXT = (0.06, 0.06, 0.08, 1.0)
+GROUP_BUBBLE_FONT = 15.0
+# The hovered bubble is lifted rather than recoloured: its colour *is* its
+# group, and replacing it would hide the one thing the bubble is there to say.
+GROUP_BUBBLE_HOVER_RATIO = 1.18
+GROUP_BUBBLE_HOVER_RING = (1.00, 1.00, 1.00, 1.0)
+GROUP_BUBBLE_HOVER_RING_RATIO = 1.34
 
 MATCH_DOT_COLOR = (0.35, 1.0, 0.55, 1.0)         # from a committed neighbour
 MATCH_DOT_OUTLINE = (0.05, 0.05, 0.05, 0.9)
@@ -309,7 +316,7 @@ def keybinds_for(
     # is the one thing a hint must never do.
     if getattr(state, "corner_edit", False):
         return [
-            ("Click", "Turn corner on / off"),
+            ("Click", "Merge side into the group before it"),
             cad_edges,
             (keymap.describe_all("corners_accept")[0], "Keep corner set"),
             (key("corners_cancel"), "Cancel"),
@@ -419,7 +426,7 @@ def _draw() -> None:
         return
 
     _draw_vertex_dots(context, state, region)
-    _draw_corner_dots(context, state, region)
+    _draw_group_bubbles(context, state, region)
     _draw_match_points(context, state, region)
     _draw_brep_vertices(context, state, region)
 
@@ -577,16 +584,22 @@ def _draw_corner_groups(state: "state_mod.RetopPatchState") -> None:
     gpu.state.blend_set('NONE')
 
 
-def _draw_corner_dots(
+def _draw_group_bubbles(
     context: bpy.types.Context,
     state: "state_mod.RetopPatchState",
     region: bpy.types.Region,
 ) -> None:
-    """POST_PIXEL: one dot per corner, saying which are still side boundaries.
+    """POST_PIXEL: one numbered bubble per side, saying which group it is in.
 
-    Screen-space geometry like every other dot here -- `point_size_set` is
-    ignored by the backend whenever program point size is on, which is what
-    made these 1px once before.
+    The number is the whole interface: colour alone says "these two sides are
+    together" only if you can tell two hues apart at a glance across a part,
+    and it cannot say *which* group without a legend. A bubble carrying `2`
+    says it outright, and it is the thing you click.
+
+    Anchored through `sidematch.side_midpoint`, the same helper the hit test
+    uses -- two implementations of "the middle of this side" would drift apart
+    on a curved boundary, and a bubble you cannot click where you see it is
+    worse than no bubble.
     """
     if state.session_phase != 'ADJUST' or not getattr(state, "corner_edit", False):
         return
@@ -600,42 +613,57 @@ def _draw_corner_dots(
         return
 
     demoted = sidematch.demoted_corners(state)
-    hovered = getattr(state, "hovered_corner", -1)
+    numbers = sidematch.group_numbers(references, demoted)
+    hovered = getattr(state, "hovered_bubble", -1)
 
-    # (screen point, colour, half-size), gathered before drawing so the whole
-    # lot goes out as three batches rather than one per corner.
-    on, off, hot = [], [], []
+    scale = max(0.5, getattr(state, "overlay_scale", 1.0))
+    half = GROUP_BUBBLE_SIZE * scale / 2.0
+
+    # Gathered first so the discs go out as a few batches rather than one per
+    # bubble, and so the hovered one draws last -- over its neighbours, which
+    # is what it means for it to be under the pointer.
+    bubbles = []
     for reference in references:
-        if not reference.points:
+        anchor = sidematch.side_midpoint(reference.points)
+        if anchor is None:
             continue
-        screen = view3d_utils.location_3d_to_region_2d(region, rv3d, reference.points[0])
+        screen = view3d_utils.location_3d_to_region_2d(region, rv3d, anchor)
         if screen is None:
             continue
-        if reference.index == hovered:
-            hot.append(screen)
-        elif reference.index in demoted:
-            off.append(screen)
-        else:
-            on.append(screen)
+        number = numbers.get(reference.index, 1)
+        colour = CORNER_GROUP_COLORS[(number - 1) % len(CORNER_GROUP_COLORS)]
+        bubbles.append((screen, number, colour, reference.index == hovered))
+    if not bubbles:
+        return
+    bubbles.sort(key=lambda entry: entry[3])
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
     gpu.state.blend_set('ALPHA')
     shader.bind()
 
-    half = CORNER_DOT_SIZE * max(0.5, getattr(state, "overlay_scale", 1.0)) / 2.0
-    for points, color, size in ((off, CORNER_OFF_COLOR, half * CORNER_OFF_RATIO),
-                                (on, CORNER_ON_COLOR, half),
-                                (hot, CORNER_HOVER_COLOR, half * 1.25)):
-        if not points:
-            continue
-        for outline in (True, False):
-            radius = size * (CORNER_OUTLINE_RATIO if outline else 1.0)
-            shader.uniform_float("color", CORNER_OUTLINE if outline else color)
-            vertices, indices = _discs_around(points, radius)
+    for screen, _number, colour, is_hovered in bubbles:
+        radius = half * (GROUP_BUBBLE_HOVER_RATIO if is_hovered else 1.0)
+        rings = [(GROUP_BUBBLE_OUTLINE, radius * GROUP_BUBBLE_OUTLINE_RATIO),
+                 (colour, radius)]
+        if is_hovered:
+            rings.insert(0, (GROUP_BUBBLE_HOVER_RING,
+                             radius * GROUP_BUBBLE_HOVER_RING_RATIO))
+        for ring_colour, ring_radius in rings:
+            shader.uniform_float("color", ring_colour)
+            vertices, indices = _discs_around([screen], ring_radius)
             batch_for_shader(shader, 'TRIS', {"pos": vertices},
                              indices=indices).draw(shader)
 
     gpu.state.blend_set('NONE')
+
+    font_id = 0
+    _set_font_size(font_id, GROUP_BUBBLE_FONT * scale)
+    blf.color(font_id, *GROUP_BUBBLE_TEXT)
+    for screen, number, _colour, _is_hovered in bubbles:
+        label = str(number)
+        width, height = blf.dimensions(font_id, label)
+        blf.position(font_id, screen.x - width * 0.5, screen.y - height * 0.5, 0)
+        blf.draw(font_id, label)
 
 
 def _side_appearance(

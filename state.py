@@ -532,10 +532,15 @@ class RetopPatchState(bpy.types.PropertyGroup):
     # mouse and the commit keys for the length of the edit -- see
     # `operators._in_phase`, which is where the exclusion lives once.
     corner_edit: bpy.props.BoolProperty(name="Editing Corners", default=False)
-    # Corner nearest the cursor while that is on, by flat side index -- a
-    # corner is named by the side it *starts*, which is what makes "merge into
-    # the previous side" the one unambiguous reading of a click.
-    hovered_corner: bpy.props.IntProperty(name="Hovered Corner", default=-1)
+    # The side whose group bubble is under the cursor, by flat index. A corner
+    # is named by the side it *starts*, so side `i`'s bubble drives corner `i`
+    # and the two share one index space. Clicking it merges the side into the
+    # group before it, or splits it back out -- **binary, not a 1-2-3-4 cycle**,
+    # because a group has to be a contiguous arc of the boundary (it becomes one
+    # side of a Coons patch) and a free numbering can say things that are not a
+    # patch. Those two choices per side already express every valid grouping,
+    # `1,1,2,2,3,4` on a hexagon included; the number is only how it reads.
+    hovered_bubble: bpy.props.IntProperty(name="Hovered Group Bubble", default=-1)
     # The demoted ones, as a JSON list of those same indices. Per patch:
     # cleared by `set_active_patch` with the pins, since both name a side by an
     # index that means nothing on the next patch.

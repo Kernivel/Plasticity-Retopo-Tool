@@ -525,6 +525,55 @@ def corner_groups(
     return groups
 
 
+def side_midpoint(points: list) -> object:
+    """The point half way along a side, by arc length.
+
+    Where the group bubble is anchored, and it lives here rather than in the
+    overlay because the *hit test* has to agree with the drawing to the pixel:
+    two implementations of "the middle of this side" would drift apart on a
+    curved boundary, and a bubble you cannot click where you see it is worse
+    than no bubble. World space, so it is projected once per side rather than
+    derived from a projected polyline -- and vector-agnostic, since `sidematch`
+    imports no Blender at runtime.
+    """
+    if not points:
+        return None
+    if len(points) == 1:
+        return points[0]
+    spans = [(b - a).length for a, b in zip(points, points[1:])]
+    total = sum(spans)
+    if total <= 0.0:
+        return points[0]
+    walked = 0.0
+    for (a, b), span in zip(zip(points, points[1:]), spans):
+        if walked + span >= total * 0.5:
+            t = 0.0 if span <= 0.0 else (total * 0.5 - walked) / span
+            return a + (b - a) * t
+        walked += span
+    return points[-1]
+
+
+def group_numbers(
+    references: "list[SideReference]", demoted: "set[int]"
+) -> dict[int, int]:
+    """{flat side index: group number}, numbered from 1 within each loop.
+
+    What the viewport bubbles show. The number is *derived* and never stored:
+    merging one side renumbers every group after it, and a stored copy could
+    only disagree with the grouping it claims to describe -- the same reason
+    `state.side_overrides` keeps a pin's kind rather than its count.
+    """
+    numbers: dict[int, int] = {}
+    loop_of = {reference.index: reference.loop for reference in references}
+    counters: dict[int, int] = {}
+    for group in corner_groups(references, demoted):
+        loop = loop_of.get(group[0], 0)
+        counters[loop] = counters.get(loop, 0) + 1
+        for index in group:
+            numbers[index] = counters[loop]
+    return numbers
+
+
 def loop_group_counts(
     references: "list[SideReference]", demoted: "set[int]"
 ) -> dict[int, int]:

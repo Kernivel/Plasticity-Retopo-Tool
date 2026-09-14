@@ -95,6 +95,49 @@ check("a loop with nothing left reports one group",
       sidematch.loop_group_counts(five, {0, 1, 2, 3, 4}) == {0: 1},
       sidematch.loop_group_counts(five, {0, 1, 2, 3, 4}))
 
+# ---------------------------------------------------------------------------
+#  The numbers the bubbles show
+# ---------------------------------------------------------------------------
+# Derived, never stored: merging one side renumbers every group after it, so a
+# stored copy could only disagree with the grouping it claims to describe.
+check("every side on its own is numbered 1..n",
+      sidematch.group_numbers(five, set()) == {0: 1, 1: 2, 2: 3, 3: 4, 4: 5},
+      sidematch.group_numbers(five, set()))
+check("a merged side takes the number of the one before it, and the rest shift down",
+      sidematch.group_numbers(five, {1}) == {0: 1, 1: 1, 2: 2, 3: 3, 4: 4},
+      sidematch.group_numbers(five, {1}))
+# The wrapped group is still one number, whichever side of the arbitrary start
+# each of its sides fell on.
+check("a group wrapping the loop start carries one number",
+      sidematch.group_numbers(five, {0}) == {1: 1, 2: 2, 3: 3, 4: 4, 0: 4},
+      sidematch.group_numbers(five, {0}))
+# Per loop, so a ring's two rims both start at 1 -- they are separate
+# boundaries and numbering them 1..7 across both would imply an order they
+# have no reason to share.
+check("each loop numbers its own groups from 1",
+      sidematch.group_numbers(band, set()) ==
+      {0: 1, 1: 2, 2: 3, 3: 4, 4: 1, 5: 2, 6: 3},
+      sidematch.group_numbers(band, set()))
+
+# The bubble's anchor. Shared with the hit test on purpose: two versions of
+# "the middle of this side" would drift apart on a curved boundary, and a
+# bubble you cannot click where it is drawn is worse than no bubble.
+import mathutils
+
+straight = [mathutils.Vector((0.0, 0.0, 0.0)), mathutils.Vector((4.0, 0.0, 0.0))]
+check("the anchor is half way along a straight side",
+      sidematch.side_midpoint(straight) == mathutils.Vector((2.0, 0.0, 0.0)),
+      sidematch.side_midpoint(straight))
+# By arc length, not by index: a side tessellated densely at one end would
+# otherwise put its bubble in that end.
+lopsided = [mathutils.Vector((0.0, 0.0, 0.0)), mathutils.Vector((0.1, 0.0, 0.0)),
+            mathutils.Vector((0.2, 0.0, 0.0)), mathutils.Vector((4.0, 0.0, 0.0))]
+check("and by arc length rather than by index",
+      abs(sidematch.side_midpoint(lopsided).x - 2.0) < 1e-6,
+      sidematch.side_midpoint(lopsided))
+check("an empty side has no anchor rather than raising",
+      sidematch.side_midpoint([]) is None)
+
 sidematch.set_demoted_corners(state, {3, 1})
 check("the stored form round trips", sidematch.demoted_corners(state) == {1, 3},
       state.corner_overrides)
@@ -146,7 +189,7 @@ check("pointing at no side, Ctrl+click is the density copy again",
       "copy" in live() and "edit_corners" not in live(), sorted(live()))
 
 state.corner_edit = True
-state.hovered_corner = 2
+state.hovered_bubble = 2
 during = live()
 check("open, it owns Enter, Esc and the click",
       not {"commit", "back", "pin", "copy", "delete"} & during, sorted(during))
@@ -157,7 +200,7 @@ check("its own three are live",
 check("the CAD structure displays stay available",
       {"cad_edges", "surface_flow"} <= during, sorted(during))
 
-state.hovered_corner = -1
+state.hovered_bubble = -1
 check("with no corner under the cursor there is nothing to toggle",
       not bpy.ops.retop.toggle_corner.poll())
 
@@ -180,13 +223,13 @@ class Event:
 for key, expected in (('LEFTMOUSE', "corner_toggle"), ('RET', "corners_accept"),
                       ('ESC', "corners_cancel")):
     state.corner_edit = True
-    state.hovered_corner = 2
+    state.hovered_bubble = 2
     bound = keymap.session_action_for(Event(key))
     check(f"{key} is the editor's while it is open", bound == expected, bound)
 
 state.corner_edit = False
 state.hovered_side = 2
-state.hovered_corner = -1
+state.hovered_bubble = -1
 check("closed, the left click is the side picker's again",
       keymap.session_action_for(Event('LEFTMOUSE')) == "pin_neighbour",
       keymap.session_action_for(Event('LEFTMOUSE')))
@@ -201,7 +244,7 @@ state.corner_overrides = ""
 bpy.ops.retop.edit_corners()
 check("the editor opens", state.corner_edit)
 
-state.hovered_corner = 1
+state.hovered_bubble = 1
 bpy.ops.retop.toggle_corner()
 check("a click turns the corner off", sidematch.demoted_corners(state) == {1},
       state.corner_overrides)
@@ -216,7 +259,7 @@ check("and puts back the corner set it was opened with",
       sidematch.demoted_corners(state) == set(), state.corner_overrides)
 
 bpy.ops.retop.edit_corners()
-state.hovered_corner = 3
+state.hovered_bubble = 3
 bpy.ops.retop.toggle_corner()
 bpy.ops.retop.corners_accept()
 check("Enter closes it keeping the change",
@@ -227,7 +270,7 @@ check("Enter closes it keeping the change",
 # it is refused at the click, while the editor is still open to undo it.
 bpy.ops.retop.edit_corners()
 for corner in (0, 1, 2, 4):
-    state.hovered_corner = corner
+    state.hovered_bubble = corner
     bpy.ops.retop.toggle_corner()
 check("a loop is never taken below two sides",
       sidematch.loop_group_counts(five, sidematch.demoted_corners(state))[0] >= 2,
