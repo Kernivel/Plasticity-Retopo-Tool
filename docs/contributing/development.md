@@ -4,12 +4,77 @@ The plugin was developed using Claude Code.
 I am not claiming to be a Blender plugin expert, nor do I have experience with the mathematics and algorithms involved.
 My input in this is guiding the user experience towards something comfortable and intuitive.
 
+## Installation
+
+
+## Working from a checkout
+
+```bash
+git clone https://github.com/Kernivel/Plasticty-Retopo-Tool.git
+cd Plasticty-Retopo-Tool
+python scripts/deploy.py
+```
+
+`deploy.py` finds Blender's addons folder and copies the package into it, leaving
+out the tests, the scripts and this documentation. Then enable **Plasticity
+Retop** in `Preferences > Add-ons`.
+
+To pick a specific Blender:
+
+```bash
+python scripts/deploy.py --list          # show the config dirs it found
+python scripts/deploy.py --dest "<addons dir>"
+```
+
+**No system Python?** You can still use Blender's own interpreter to run it:
+
+```bash
+"C:/MyBlenderInstallFolder/Blender <version>/python/bin/python.exe" scripts/deploy.py
+```
+
+For instance:
+```bash
+"C:/Program Files/Blender Foundation/Blender 5.0/5.0/python/bin/python.exe" scripts/deploy.py
+```
+
+## Confirming it landed
+
+Open the **Retop** tab 3D view's **N-panel**,*and look at the **version number**.
+
+After deploying, use the panel's **Reload Addon**
+
+**Both buttons, and the red stale-code warning, are behind Developer Mode** —
+`Preferences > Add-ons > Plasticity Retop > Developer Mode`, off by default.
+
+## Updating a checkout
+
+```bash
+git pull
+python scripts/deploy.py
+```
+
+Then **Reload Addon Only**, and check the version string. Your settings survive a
+reload — Blender stores them on the scene, keyed by name.
+
+## Building a release zip
+
+```bash
+python scripts/build_zip.py          # dist/<name>-<version>.zip
+python scripts/build_zip.py --check  # verify only, write nothing
+```
+
+The zip holds one top-level folder with the addon inside — the shape Blender's
+installer expects — and excludes exactly what `deploy.py` excludes. It refuses to
+build when `bl_info["version"]` and `version.py` disagree, because those are the
+two numbers Blender's add-on list and the N-panel each show.
+
+Pushing a `v<version>` tag runs `.github/workflows/release.yml`, which builds the
+same zip and attaches it to the GitHub release.
+
 ## Commands
 
 ```bash
 python scripts/run_tests.py     # headless test suite (needs Blender only)
-python scripts/deploy.py        # copy into Blender's addons folder
-python scripts/deploy.py --list # show detected Blender config dirs
 ```
 
 Plasticity is **not** needed to develop or test: the tests build synthetic meshes
@@ -62,31 +127,7 @@ mkdocs serve        # live reload on http://127.0.0.1:8000
 mkdocs build --strict
 ```
 
-`--strict` is what CI runs: a dead internal link fails the build. That is the
-only thing that keeps a docs site honest as pages get renamed.
+`--strict` is what CI runs: a dead internal link fails the build.
 
 Nothing in `docs/` ships with the addon — `scripts/deploy.py` skips it, along
 with `mkdocs.yml`, `site/` and `requirements-docs.txt`.
-
-!!! tip "Prefer prose that says *why*"
-
-    The addon's own comments and CLAUDE.md are written that way, and the docs
-    should match: a setting's default is discoverable from the panel, but the
-    failure it exists to prevent is not.
-
-### One-time GitHub setup
-
-`Settings > Pages > Build and deployment > Source` must be set to **GitHub
-Actions**. No `gh-pages` branch is involved.
-
-### A custom domain later
-
-Buy the domain, point a `CNAME` record at `kernivel.github.io`, and set it under
-`Settings > Pages`. Then update `site_url` in `mkdocs.yml`. Nothing else changes
-— that is all `machin3.io` is doing.
-
-### Versioned docs later
-
-The site is single-version today. If users start sitting on old releases,
-[mike](https://github.com/jimporter/mike) adds `/latest/`, `/1.2/` and a version
-switcher on top of Material without restructuring anything.
