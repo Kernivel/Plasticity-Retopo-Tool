@@ -29,8 +29,6 @@ The two cases are separated on how **even** the gap between the loops is, and ho
 far apart the two perimeters are. Both tests are deliberately generous — calling
 a band a plate costs more than the reverse.
 
-A non-band that is flat is filled as an [n-gon](ngon.md) instead (outer boundary
-plus hole, bridged with two edges), and the panel says why.
 
 !!! note "A committed patch is never rerouted"
 
@@ -71,9 +69,7 @@ which rim counted as first was decided by extent, which on a tube is a coin flip
 ## What is not handled
 
 - **More than one hole in a single face.** A band runs between two loops and
-  there is no band between three. A flat face like that is filled as an
-  [n-gon](ngon.md) instead, which takes any number of holes; one that is not
-  flat gets its outer boundary alone, and the panel says so.
+  there is no band between three.
 - **Corner matching between the two loops.** They are paired by arc length, so a
   hole shaped very differently from the outer boundary distorts the band.
 - **Spans propagating *into* a ring.** "Around" is one number for the whole loop.

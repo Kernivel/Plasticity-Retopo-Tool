@@ -181,7 +181,7 @@ the decisions shows:
    annulus too, and a Ring has to give both loops the same point count. So the
    gap between the loops is checked for evenness; a non-band that is flat is
    filled as an n-gon instead, and the panel says why. See
-   [Faces with a hole](../guide/rings.md).
+   [Faces with a hole](../how-it-works/rings.md).
 5. **Otherwise the side count decides.**
 
 More than two loops is not handled: only the outer loop is used, and the panel
