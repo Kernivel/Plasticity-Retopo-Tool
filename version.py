@@ -9,8 +9,8 @@ import os
 import re
 import time
 
-ADDON_VERSION = "0.69.1"
-BUILD_ID = "2026-09-14-a"
+ADDON_VERSION = "0.69.2"
+BUILD_ID = "2026-09-14-b"
 
 _VERSION_RE = re.compile(
     r'^(ADDON_VERSION|BUILD_ID)\s*=\s*"([^"]*)"', re.MULTILINE)

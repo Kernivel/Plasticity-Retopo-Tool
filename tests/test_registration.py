@@ -185,6 +185,55 @@ for _filename, tree in SOURCES:
 check("every function carries a return type and argument types",
       annotated == total, f"{annotated}/{total}")
 
+# ===========================================================================
+# A registration that fails leaves nothing behind
+#
+# Blender marks an addon disabled the moment its `register` raises, so nothing
+# ever calls `unregister` on the half that did take -- the classes stay
+# registered in the running process with no way to reach them, and the next
+# attempt to enable it dies on "register_class(...): already registered as a
+# subclass 'RetopPatchState'". A different error about a different thing, and
+# the only cure is restarting Blender.
+#
+# That is what one failed registration used to cost. It must cost a failed
+# registration and nothing more.
+# ===========================================================================
+pr.unregister()
+
+_real_register = pr.ui.register
+
+
+def _explode() -> None:
+    raise RuntimeError("deliberate failure, three modules in")
+
+
+# `ui` is last, so `state`, `operators` and `prefs` have all taken when it goes.
+pr.ui.register = _explode
+try:
+    pr.register()
+    raised = ""
+except RuntimeError as exc:
+    raised = str(exc)
+finally:
+    pr.ui.register = _real_register
+
+check("the failure is re-raised, not swallowed -- it says why", 
+      raised == "deliberate failure, three modules in", raised)
+# The tell, and the whole point: the property group is what the repeat attempt
+# used to trip over.
+check("and the scene property it had already attached is gone again",
+      not hasattr(bpy.types.Scene, "plasticity_retop"))
+
+# The one that matters: enabling it again has to work, with no restart.
+try:
+    pr.register()
+    ok, detail = True, ""
+except Exception as exc:  # noqa: BLE001
+    ok, detail = False, repr(exc)
+check("so registering again succeeds rather than reporting a stale class",
+      ok, detail)
+check("and the addon is whole", hasattr(bpy.types.Scene, "plasticity_retop"))
+
 print()
 if FAILURES:
     print(f"=== {len(FAILURES)} FAILURE(S): {FAILURES}")

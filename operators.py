@@ -3655,4 +3655,10 @@ def unregister() -> None:
     _unregister_keymaps()
     _unregister_handlers()
     for cls in reversed(CLASSES):
-        bpy.utils.unregister_class(cls)
+        # Tolerant for the same reason `state._drop` is: `__init__.register`
+        # unwinds a failed registration through here, and the classes after the
+        # one that raised were never registered at all.
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass

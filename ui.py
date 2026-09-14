@@ -923,6 +923,17 @@ def register() -> None:
         bpy.utils.register_class(cls)
 
 
+# Teardown has to survive a partial registration. `__init__.register` unwinds
+# the modules that took when a later one fails, so this can be handed classes
+# that never registered -- and an exception here would replace the one saying
+# why registration failed with one about the cleanup.
+def _drop(cls) -> None:
+    try:
+        bpy.utils.unregister_class(cls)
+    except Exception:
+        pass
+
+
 def unregister() -> None:
     for cls in reversed(CLASSES):
-        bpy.utils.unregister_class(cls)
+        _drop(cls)

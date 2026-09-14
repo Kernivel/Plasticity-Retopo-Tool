@@ -789,7 +789,21 @@ def register() -> None:
     bpy.types.Scene.plasticity_retop = bpy.props.PointerProperty(type=RetopPatchState)
 
 
-def unregister() -> None:
-    del bpy.types.Scene.plasticity_retop
-    for cls in reversed(CLASSES):
+# Teardown has to survive a partial registration. `__init__.register` unwinds
+# the modules that took when a later one fails, so this can be handed classes
+# that never registered -- and an exception here would replace the one saying
+# why registration failed with one about the cleanup.
+def _drop(cls) -> None:
+    try:
         bpy.utils.unregister_class(cls)
+    except Exception:
+        pass
+
+
+def unregister() -> None:
+    # The property may never have been attached (a registration that failed
+    # between the classes and this line), so it is dropped rather than deleted.
+    if hasattr(bpy.types.Scene, "plasticity_retop"):
+        del bpy.types.Scene.plasticity_retop
+    for cls in reversed(CLASSES):
+        _drop(cls)

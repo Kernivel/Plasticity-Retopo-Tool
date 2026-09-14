@@ -778,6 +778,22 @@ Two boundary loops does **not** by itself mean Ring: see the band invariant.
   and `cad_display` stay free of Blender imports, and `overlay` must not widen
   what a draw handler pulls in. `tests/test_registration.py` pins all of it,
   including that every function still carries its types.
+- **A registration that fails must leave nothing behind.** Blender marks an
+  addon *disabled* the moment its `register` raises, so nothing ever calls
+  `unregister` on the half that did take: those classes stay registered in the
+  running process with no way to reach them, and the next attempt to enable it
+  dies on `register_class(...): already registered as a subclass
+  'RetopPatchState'` — a different error about a different thing, whose only
+  cure is restarting Blender. So `__init__.register` walks `_MODULES`, and on
+  any failure unwinds the ones that took before **re-raising the original**:
+  the first failure has to cost a failed registration and nothing more. The
+  teardown paths are tolerant to match (`state._drop`, `ui._drop`, the loop in
+  `operators.unregister`), since an unwind hands them classes that never
+  registered — and `state.unregister` drops the scene property rather than
+  `del`-ing it, because a registration can fail between the classes and that
+  line. `tests/test_registration.py` breaks `ui.register` on purpose and
+  asserts the *second* registration succeeds; without the unwind it fails with
+  the exact "already registered" message above.
 - **Never unregister an operator class from inside its own `execute()`** —
   that crashes Blender natively. `RETOP_OT_reload_addon` defers the real work
   to a `bpy.app.timers` callback.
