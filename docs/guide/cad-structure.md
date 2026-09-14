@@ -12,9 +12,6 @@ and the distinction matters.
 | **Plasticity edges** | <kbd>E</kbd> | exact, recovered from the face ids |
 | **Surface flow** | <kbd>Ctrl</kbd>+<kbd>E</kbd> | **derived**, not imported |
 
-Both work in every session phase — the structure is read while *choosing* a
-surface as much as while adjusting one — and both are remappable. They can be
-scoped to the whole object or to the patch under the cursor.
 
 <video autoplay loop muted playsinline poster="../../assets/img/cad-edges.jpg">
   <source src="../../assets/video/cad-edges.webm" type="video/webm">
@@ -33,11 +30,6 @@ which is why they are worth seeing.
 **Show CAD Vertices** is off by default: on a real part every junction is a dot,
 and a few hundred of them bury the edges they punctuate.
 
-!!! info "One limitation"
-
-    On an **open sheet**, a whole free boundary is one run — nothing distinguishes
-    its segments. It costs nothing visually, since everything is drawn as
-    segments anyway.
 
 ## Surface flow is derived
 
@@ -50,26 +42,6 @@ same corner split, the same generators, at a low span, reprojected onto the
 surface. On a fillet or a swept face that lands very close to the true isoparms,
 because both answer the same question about the same boundary.
 
-It is arguably the more useful of the two here, being the topology the retopology
-would actually get. But it is derived, and the panel says so.
-
-A [non-band annulus](rings.md#two-loops-is-not-the-same-thing-as-a-band) draws
-its outer loop only, for the same reason it is not filled as a ring.
-
-## Drawing through the model
-
-**Draw Through the Mesh** is off by default.
-
-Through-the-mesh reads well on a flat layout — a whole part's structure at a
-glance — and turns a curved or enclosed part into a thicket, since the far side
-shows through the near one. The readable default is the honest one.
-
-Either way the lines are nudged very slightly towards the viewer. They lie
-exactly *on* the surface they describe, so depth-testing them against it is a
-coin flip per pixel and they come out as a stipple.
-
-The B-rep vertex dots stay on top regardless — they are screen-space, so there is
-no depth to test them against.
 
 ## Settings
 

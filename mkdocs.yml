@@ -68,7 +68,7 @@ nav:
       - 2. Choosing a generator: how-it-works/generators.md
       - 3. Matching a neighbour: how-it-works/matching.md
       - 4. Committing: how-it-works/commit.md
-      - Rings: guide/rings.md
+      - Rings: how-it-works/rings.md
   - Reference:
       - Keymap: reference/keymap.md
       - The N-panel: reference/panel.md
