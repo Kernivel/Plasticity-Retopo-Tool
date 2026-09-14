@@ -52,7 +52,7 @@ nav:
       - General: general.md
   - Guide:
       - Matching a neighbour: guide/matching.md
-      - Merging several faces: guide/merging.md
+      - One patch, several surfaces: guide/multi-surface.md
       - N-gon mode: guide/ngon.md
       - Faces with a hole: guide/rings.md
       - Symmetry: guide/symmetry.md

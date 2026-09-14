@@ -82,12 +82,13 @@ def _redraw_update(self: "RetopPatchState", context: bpy.types.Context) -> None:
 
 class RetopPatchState(bpy.types.PropertyGroup):
     active_face_id: bpy.props.IntProperty(name="Active Face Id", default=-1)
-    # The patches Shift+click has gathered, as a JSON list of face ids, waiting
-    # to be opened as one. A scene property rather than an attribute on the
-    # modal, for the same reason `typed_span` is: the operators that build it
-    # have no way to reach the running instance, and the overlay draws it.
-    merge_selection: bpy.props.StringProperty(
-        name="Merge Selection", default="", update=_redraw_update)
+    # The surfaces Shift+click has gathered, as a JSON list of face ids,
+    # waiting to be opened as one patch. A scene property rather than an
+    # attribute on the modal, for the same reason `typed_span` is: the
+    # operators that build it have no way to reach the running instance, and
+    # the overlay draws it.
+    surface_selection: bpy.props.StringProperty(
+        name="Surface Selection", default="", update=_redraw_update)
     generator_name: bpy.props.StringProperty(name="Generator", default="")
     num_sides: bpy.props.IntProperty(name="Num Sides", default=0)
     # Whether N-gon mode can run on the active patch at all: it needs a flat

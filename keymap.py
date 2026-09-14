@@ -110,11 +110,11 @@ ACTIONS: tuple[tuple[str, str, str, str, dict[str, object], list[dict[str, objec
     ("copy_spans", "Copy patch density", SESSION, "retop.copy_patch_spans", {},
      [_b('LEFTMOUSE', ctrl=True)]),
     # Shift on the same button, and in a phase where the plain click means
-    # "open this one": gathering several patches to open together is the same
-    # gesture with the same target, which is what a modifier is for. Exactly
-    # like `copy_spans`, the modifier comparison in `_matches` is exact, so the
-    # plain pick never fires on it and this never fires on a plain click.
-    ("merge_toggle", "Add to merge", SESSION, "retop.toggle_merge", {},
+    # "open this one": gathering several surfaces to open as one patch is the
+    # same gesture with the same target, which is what a modifier is for.
+    # Exactly like `copy_spans`, the modifier comparison in `_matches` is exact,
+    # so the plain pick never fires on it and this never fires on a plain click.
+    ("add_surface", "Add surface to patch", SESSION, "retop.toggle_surface", {},
      [_b('LEFTMOUSE', shift=True)]),
     ("delete_patch", "Delete patch", SESSION, "retop.delete_patch", {}, [_b('X')]),
     ("commit", "Commit patch", SESSION, "retop.commit_patch", {},

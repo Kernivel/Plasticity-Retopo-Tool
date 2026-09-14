@@ -90,115 +90,119 @@ def polygon_face_ids(mesh: "bpy.types.Mesh") -> tuple[list[int], list[int]]:
     return result, list(face_ids)
 
 
-# --- Merging several CAD faces into one patch --------------------------------
+# --- One patch from several CAD faces ----------------------------------------
 #
 # One Plasticity face is one patch, and that is the whole input contract -- but
 # a CAD model is cut into faces by the modelling history, not by what wants a
-# single grid over it. A boss with two fillet rings around it is five faces
+# single grid over it. A boss with two fillet rings around it is five surfaces
 # that the retopology has every reason to cross in one sheet, and the pipeline
 # already knows how to do that: `compute_boundary_loops` cancels every directed
 # edge whose reverse is emitted by the *same* patch, which is how a face's own
 # triangulation edges disappear. Hand it the union of several faces' polygons
 # and their shared borders cancel by exactly the same rule.
 #
-# So the merge happens here, at the parse, and nothing downstream learns about
-# it: corners, sides, `find_generator`, matching, the commit, the re-edit, the
-# crack report and `cad_display` all keep seeing one patch with one id. Doing
-# it at generation time instead would mean teaching every one of them that an
-# id can stand for a set.
+# A patch built that way is a **composite**, and it is assembled here, at the
+# parse, so that nothing downstream learns about it: corners, sides,
+# `find_generator`, matching, the commit, the re-edit, the crack report and
+# `cad_display` all keep seeing one patch with one id. Doing it at generation
+# time instead would mean teaching every one of them that an id can stand for a
+# set.
 #
-# The id a merged patch carries is synthetic and negative, below `NO_PATCH`
-# (-1), so it can never collide with a Plasticity face id nor with the sentinel
-# the result mesh already stamps on unclaimed faces. It is stored, because
+# The id a composite carries is synthetic and negative, below `NO_PATCH` (-1),
+# so it can never collide with a Plasticity face id nor with the sentinel the
+# result mesh already stamps on unclaimed faces. It is stored, because
 # `PATCH_ID_ATTR` on committed faces names it and has to keep meaning the same
 # patch across sessions and file loads.
-MERGED_ID_BASE = -1000
-# Mesh custom property holding the groups, as JSON: {"-1000": [12, 13, 14]}.
-# On the mesh rather than the object because that is what `analyse` is keyed by
-# and what the bridge writes `groups`/`face_ids` on -- a merge is a statement
+COMPOSITE_ID_BASE = -1000
+# Mesh custom property holding them, as JSON: {"-1000": [12, 13, 14]}. On the
+# mesh rather than the object because that is what `analyse` is keyed by and
+# what the bridge writes `groups`/`face_ids` on -- a composite is a statement
 # about the same data those are.
-MERGE_PROP = "retop_merges"
+COMPOSITE_PROP = "retop_composites"
 
 
-def read_merges(mesh: "bpy.types.Mesh") -> dict[int, list[int]]:
-    """The merge groups stored on `mesh`, as {merged id: [member face ids]}.
+def read_composites(mesh: "bpy.types.Mesh") -> dict[int, list[int]]:
+    """The composites stored on `mesh`, as {composite id: [surface face ids]}.
 
-    Members are always *raw* Plasticity face ids: merging a merged patch with
-    one more face flattens, rather than nesting, so nothing here has to resolve
-    a chain.
+    Surfaces are always *raw* Plasticity face ids: adding one more to a
+    composite rebuilds it flat rather than nesting, so nothing here has to
+    resolve a chain.
     """
-    raw = mesh.get(MERGE_PROP)
+    raw = mesh.get(COMPOSITE_PROP)
     if not raw:
         return {}
     try:
         stored = json.loads(raw)
     except (TypeError, ValueError):
         return {}  # hand-edited or written by something else: not our business
-    merges: dict[int, list[int]] = {}
-    for key, members in (stored or {}).items():
+    composites: dict[int, list[int]] = {}
+    for key, surfaces in (stored or {}).items():
         try:
-            merges[int(key)] = [int(member) for member in members]
+            composites[int(key)] = [int(surface) for surface in surfaces]
         except (TypeError, ValueError):
             continue
-    return merges
+    return composites
 
 
-def write_merges(mesh: "bpy.types.Mesh", merges: dict[int, list[int]]) -> None:
-    """Store `merges` on `mesh`, or drop the property when there are none.
+def write_composites(
+    mesh: "bpy.types.Mesh", composites: dict[int, list[int]]
+) -> None:
+    """Store `composites` on `mesh`, or drop the property when there are none.
 
     The cache invalidates itself: `mesh_fingerprint` reads this property, so a
-    merge written here is picked up by the next `analyse` without anyone having
-    to remember to call `invalidate`.
+    composite written here is picked up by the next `analyse` without anyone
+    having to remember to call `invalidate`.
     """
-    if merges:
-        mesh[MERGE_PROP] = json.dumps(
-            {str(key): list(members) for key, members in sorted(merges.items())})
-    elif mesh.get(MERGE_PROP) is not None:
-        del mesh[MERGE_PROP]
+    if composites:
+        mesh[COMPOSITE_PROP] = json.dumps(
+            {str(key): list(surfaces) for key, surfaces in sorted(composites.items())})
+    elif mesh.get(COMPOSITE_PROP) is not None:
+        del mesh[COMPOSITE_PROP]
 
 
-def next_merged_id(merges: dict[int, list[int]]) -> int:
-    """An id no existing group uses. Allocated downwards from MERGED_ID_BASE so
-    it stays stable once written -- deriving it from a position in the table
-    would renumber every other group the moment one was removed."""
-    return min([MERGED_ID_BASE + 1] + list(merges)) - 1
+def next_composite_id(composites: dict[int, list[int]]) -> int:
+    """An id no existing composite uses. Allocated downwards from
+    COMPOSITE_ID_BASE so it stays stable once written -- deriving it from a
+    position in the table would renumber every other one the moment a composite
+    was taken apart."""
+    return min([COMPOSITE_ID_BASE + 1] + list(composites)) - 1
 
 
-def applicable_merges(
+def applicable_composites(
     mesh: "bpy.types.Mesh", face_ids: Sequence[int]
 ) -> tuple[dict[int, list[int]], list[int]]:
-    """Split the stored groups into the ones this mesh can still honour and the
-    ids of the ones it cannot.
+    """Split the stored composites into the ones this mesh can still honour and
+    the ids of the ones it cannot.
 
-    A group needs two or more members and every member still declared by the
-    mesh. A re-export renumbers every Plasticity face id even when no vertex
-    moves, so a stored group *will* stop applying one day -- and a merge that
-    quietly stops being a merge looks exactly like an addon that forgot it, so
+    A composite needs two or more surfaces and every one of them still declared
+    by the mesh. A re-export renumbers every Plasticity face id even when no
+    vertex moves, so a stored composite *will* stop applying one day -- and one
+    that quietly stops applying looks exactly like an addon that forgot it, so
     the ones that fell through are handed back for the panel to report rather
     than dropped in silence.
     """
-    merges = read_merges(mesh)
-    if not merges:
+    composites = read_composites(mesh)
+    if not composites:
         return {}, []
 
     declared = set(face_ids)
     claimed: set[int] = set()
     applicable: dict[int, list[int]] = {}
     dropped: list[int] = []
-    for merged_id, members in sorted(merges.items(), reverse=True):
-        unique = list(dict.fromkeys(members))
-        # `claimed` is not defensive book-keeping: two groups naming one face
-        # would put its polygons in both, and the second would silently win.
+    for composite_id, surfaces in sorted(composites.items(), reverse=True):
+        unique = list(dict.fromkeys(surfaces))
+        # `claimed` is not defensive book-keeping: two composites naming one
+        # face would put its polygons in both, and the second would silently win.
         if len(unique) < 2 or not declared.issuperset(unique) or claimed.intersection(unique):
-            dropped.append(merged_id)
+            dropped.append(composite_id)
             continue
         claimed.update(unique)
-        applicable[merged_id] = unique
+        applicable[composite_id] = unique
     return applicable, dropped
 
 
-def parse_merge_selection(raw: str) -> list[int]:
-    """The face ids in a stored merge selection, in the order they were picked.
+def parse_surface_selection(raw: str) -> list[int]:
+    """The face ids in a stored surface selection, in the order they were picked.
 
     Here rather than in `operators` because the *overlay* has to read the same
     string to draw it, and two parsers of one format is how they come to
@@ -212,15 +216,15 @@ def parse_merge_selection(raw: str) -> list[int]:
         return []
 
 
-def format_merge_selection(face_ids: "Sequence[int]") -> str:
+def format_surface_selection(face_ids: "Sequence[int]") -> str:
     """The inverse. Empty for an empty selection, so the property reads false."""
     return json.dumps([int(value) for value in face_ids]) if face_ids else ""
 
 
 def patch_neighbour_ids(patch: Patch) -> set[int]:
-    """Every face id this patch borders. What contiguity is checked against:
-    a merge whose members only touch at a point has a pinched boundary, and one
-    whose members do not touch at all has two outer loops, which the whole
+    """Every face id this patch borders. What contiguity is checked against: a
+    composite whose surfaces only touch at a point has a pinched boundary, and
+    one whose surfaces do not touch at all has two outer loops, which the whole
     loop-count pipeline reads as a band."""
     return {neighbour for loop in patch.boundary_neighbours
             for neighbour in loop if neighbour is not NO_NEIGHBOUR}
@@ -228,22 +232,24 @@ def patch_neighbour_ids(patch: Patch) -> set[int]:
 
 def build_patches(
     mesh: "bpy.types.Mesh",
-    merges: dict[int, list[int]] | None = None,
+    composites: dict[int, list[int]] | None = None,
 ) -> tuple[dict[int, Patch], list[int], list[int]]:
     """Return ({face_id: Patch} with poly_indices filled in and boundary_loops
     still empty, polygon->face-id map, every declared face id).
 
-    `merges` folds several Plasticity faces into one patch -- see the section
-    above. The remap is applied to the polygon->face-id map itself rather than
-    to the grouping alone, so `build_directed_owners` carries the merged ids
-    too and every later reader (the neighbour of a boundary segment, the
-    topological corner test, `cad_display`) is consistent with it for free.
+    `composites` folds several Plasticity faces into one patch -- see the
+    section above. The remap is applied to the polygon->face-id map itself
+    rather than to the grouping alone, so `build_directed_owners` carries the
+    composite ids too and every later reader (the neighbour of a boundary
+    segment, the topological corner test, `cad_display`) is consistent with it
+    for free.
     """
     face_id_of_poly, face_ids = polygon_face_ids(mesh)
 
-    if merges:
-        owner = {member: merged_id
-                 for merged_id, members in merges.items() for member in members}
+    if composites:
+        owner = {surface: composite_id
+                 for composite_id, surfaces in composites.items()
+                 for surface in surfaces}
         face_id_of_poly = [owner.get(fid, fid) for fid in face_id_of_poly]
         face_ids = list(dict.fromkeys(owner.get(fid, fid) for fid in face_ids))
 
@@ -907,12 +913,12 @@ class MeshPatches:
     # (a, b) -> face id traversing that directed edge
     directed_owners: dict[tuple[int, int], int]
     positions: Positions           # vertex index -> mesh local space
-    # merged patch id -> the Plasticity faces it stands for. Empty on a mesh
-    # nobody has merged anything on, which is every mesh until asked.
-    merges: dict[int, list[int]] = field(default_factory=dict)
-    # Groups that could not be applied -- a member the mesh no longer declares,
-    # which is what a re-export leaves behind. Reported, never silently kept.
-    dropped_merges: list[int] = field(default_factory=list)
+    # composite patch id -> the Plasticity surfaces it stands for. Empty on a
+    # mesh nobody has built one on, which is every mesh until asked.
+    composites: dict[int, list[int]] = field(default_factory=dict)
+    # Composites that could not be applied -- a surface the mesh no longer
+    # declares, which is what a re-export leaves behind. Reported, never kept.
+    dropped_composites: list[int] = field(default_factory=list)
 
 
 def mesh_fingerprint(mesh: "bpy.types.Mesh") -> Fingerprint:
@@ -929,13 +935,13 @@ def mesh_fingerprint(mesh: "bpy.types.Mesh") -> Fingerprint:
     coords = array.array("f", bytes(4 * 3 * count))
     if count:
         mesh.vertices.foreach_get("co", coords)
-    # The merge groups are part of what the parse produces, so they are part of
-    # what invalidates it: merging two faces moves no vertex, and without this
+    # The composites are part of what the parse produces, so they are part of
+    # what invalidates it: joining two faces moves no vertex, and without this
     # the cached analysis would keep handing back the patches from before.
-    merges = str(mesh.get(MERGE_PROP) or "")
+    composites = str(mesh.get(COMPOSITE_PROP) or "")
     return (count, len(mesh.polygons), len(mesh.loops),
             len(mesh.get("face_ids") or ()), zlib.crc32(coords.tobytes()),
-            zlib.crc32(merges.encode("utf-8")))
+            zlib.crc32(composites.encode("utf-8")))
 
 
 # mesh name -> (fingerprint, MeshPatches). Keyed by name rather than by the
@@ -973,8 +979,9 @@ def analyse(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> MeshPatches:
 
     # The declared ids straight off the mesh, not through `polygon_face_ids`:
     # that walks every polygon, and all this needs is the list the bridge wrote.
-    merges, dropped_merges = applicable_merges(mesh, mesh.get("face_ids") or ())
-    patches, face_id_of_poly, face_ids = build_patches(mesh, merges)
+    composites, dropped_composites = applicable_composites(
+        mesh, mesh.get("face_ids") or ())
+    patches, face_id_of_poly, face_ids = build_patches(mesh, composites)
     weld_map = build_weld_map(mesh, weld_epsilon)
     directed_owners = build_directed_owners(mesh, face_id_of_poly, weld_map)
     for patch in patches.values():
@@ -992,8 +999,8 @@ def analyse(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> MeshPatches:
         weld_map=weld_map,
         directed_owners=directed_owners,
         positions=positions,
-        merges=merges,
-        dropped_merges=dropped_merges,
+        composites=composites,
+        dropped_composites=dropped_composites,
     )
 
     if len(_cache) >= _CACHE_LIMIT:

@@ -110,21 +110,19 @@ COPY_SOURCE_WIDTH = 3.0
 TOOLTIP_COPY = (1.0, 0.82, 0.5, 1.0)
 
 
-# --- the pending merge -----------------------------------------------------
+# --- the surfaces gathered for the next patch ------------------------------
 #
-# Cyan, which nothing else here uses: a gathered patch is not matched,
+# Cyan, which nothing else here uses: a gathered surface is not matched,
 # unmatched, copied from or cracked, and borrowing any of those colours would
-# put it on a scale it has no business being on. Its own outline, like the copy
-# source, because the patches are still CAD surfaces -- nothing has been built
-# over them yet, so there is no geometry to tint.
-MERGE_SELECTED_COLOR = (0.30, 0.90, 1.0, 0.95)
-MERGE_SELECTED_WIDTH = 3.0
-# The surface itself, tinted. An outline alone picks a patch out only if you
-# can already see which border is which, and on a part with hundreds of them
-# you cannot -- least of all for the small faces this exists to gather up.
-# Faint, because several selected patches tint a large area and the CAD surface
-# under them is what is being judged.
-MERGE_FILL_COLOR = (0.30, 0.90, 1.0, 0.22)
+# put it on a scale it has no business being on.
+SURFACE_SELECTED_COLOR = (0.30, 0.90, 1.0, 0.95)
+SURFACE_SELECTED_WIDTH = 3.0
+# The surface itself, tinted. An outline alone picks one out only if you can
+# already see which border is which, and on a part with hundreds of them you
+# cannot -- least of all for the small surfaces this exists to gather up.
+# Faint, because several of them tint a large area and the CAD surface under
+# them is what is being judged.
+SURFACE_FILL_COLOR = (0.30, 0.90, 1.0, 0.22)
 
 
 # --- cracked borders -------------------------------------------------------
@@ -323,19 +321,20 @@ def keybinds_for(
         ]
 
     if phase == 'PATCH':
-        # Merging is behind a modifier on a click, which is exactly the kind of
-        # gesture nobody finds on their own -- so it is named here whether or
-        # not anything is gathered yet. Once something is, the entry carries
-        # the count: the tinted patches say *which*, and this says how many and
-        # that a plain click on one of them is what opens them.
-        gathered = len(patch_data.parse_merge_selection(
-            getattr(state, "merge_selection", "")))
-        merge = (key("merge_toggle"),
-                 f"Merge: {gathered} picked — click one" if gathered
-                 else "Add to merge")
+        # Building one patch from several surfaces is behind a modifier on a
+        # click, which is exactly the kind of gesture nobody finds on their own
+        # -- so it is named here whether or not anything is gathered yet. Once
+        # something is, the entry carries the count: the tinted surfaces say
+        # *which*, and this says how many and that a plain click on one of them
+        # is what opens them as a patch.
+        gathered = len(patch_data.parse_surface_selection(
+            getattr(state, "surface_selection", "")))
+        surfaces = (key("add_surface"),
+                    f"{gathered} surfaces — click one for one patch" if gathered
+                    else "Add surface to patch")
         return [
             ("Click", "Re-edit patch" if hover_committed else "Pick surface"),
-            merge,
+            surfaces,
             (key("hand_edit"), "Hand-edit mesh"),
             # Ctrl+Z is deliberately *not* listed. It is Blender's own key and
             # reaching for it is automatic; what the session does is make one
@@ -1040,7 +1039,7 @@ def _draw_points() -> None:
     _draw_cad_structure(context, state)
     _draw_cracked_borders(context, state)
     _draw_copy_source(context, state)
-    _draw_merge_selection(context, state)
+    _draw_surface_selection(context, state)
 
     if state.session_phase != 'ADJUST':
         return
@@ -1161,10 +1160,10 @@ def _draw_copy_source(
     gpu.state.blend_set('NONE')
 
 
-def _draw_merge_selection(
+def _draw_surface_selection(
     context: bpy.types.Context, state: "state_mod.RetopPatchState"
 ) -> None:
-    """POST_VIEW: outline the patches Shift+click has gathered.
+    """POST_VIEW: tint and outline the surfaces Shift+click has gathered.
 
     Their B-rep edges, which `cad_display` already has cached per patch -- this
     redraws on every mouse move while the selection stands, and a draw handler
@@ -1172,7 +1171,7 @@ def _draw_merge_selection(
     """
     if state.session_phase != 'PATCH':
         return
-    raw = getattr(state, "merge_selection", "")
+    raw = getattr(state, "surface_selection", "")
     if not raw:
         return
     obj = bpy.data.objects.get(getattr(state, "session_object_name", ""))
@@ -1181,7 +1180,7 @@ def _draw_merge_selection(
 
     outline = []
     fill = []
-    for face_id in patch_data.parse_merge_selection(raw):
+    for face_id in patch_data.parse_surface_selection(raw):
         outline.extend(cad_display.edge_segments(obj.data, face_id))
         fill.extend(cad_display.patch_triangles(obj.data, face_id))
     if not outline and not fill:
@@ -1201,9 +1200,9 @@ def _draw_merge_selection(
         return _towards_viewer([matrix @ point for point in points], rv3d)
 
     # Fill first, outline over it: the border is the exact statement of where
-    # the patch ends, and a translucent fill must never soften it.
-    _draw_tri_batch(place(fill), MERGE_FILL_COLOR)
-    _draw_line_batch(place(outline), MERGE_SELECTED_COLOR, MERGE_SELECTED_WIDTH)
+    # the surface ends, and a translucent fill must never soften it.
+    _draw_tri_batch(place(fill), SURFACE_FILL_COLOR)
+    _draw_line_batch(place(outline), SURFACE_SELECTED_COLOR, SURFACE_SELECTED_WIDTH)
     gpu.state.blend_set('NONE')
 
 

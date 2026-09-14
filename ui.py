@@ -126,48 +126,51 @@ def _draw_session(
                                f"{done} patch(es)", icon='OUTLINER_OB_MESH')
                 if done:
                     box.label(text="Click a done patch to re-edit it", icon='FILE_REFRESH')
-        _draw_merge_block(box, state)
+        _draw_surface_block(box, state)
         box.label(text=f"{keymap.describe('back')}: leave this object")
     else:
         box.label(text="Adjust & commit", icon='TOOL_SETTINGS')
         box.label(text=f"In: {state.session_object_name}")
-        _draw_merged_patch(box, state)
+        _draw_composite_patch(box, state)
     box.operator("retop.end_session", text="Stop Session", icon='X')
 
 
-def _draw_merge_block(
+def _draw_surface_block(
     layout: bpy.types.UILayout, state: "state_mod.RetopPatchState"
 ) -> None:
-    """The pending merge, while one is being gathered.
+    """The surfaces gathered for the next patch, while they are being picked.
 
     One Plasticity face is one patch, and a CAD model is cut into faces by the
     modelling history rather than by what wants a single grid across it. This
     is the line that says the gesture exists -- it is behind a modifier on a
     click, which is exactly the kind of thing nobody finds on their own.
     """
-    selection = operators.merge_selection(state)
+    selection = operators.surface_selection(state)
     if not selection:
-        layout.label(text=f"{keymap.describe('merge_toggle')}: merge several faces")
+        layout.label(
+            text=f"{keymap.describe('add_surface')}: one patch, several surfaces")
         return
 
-    merge = layout.box().column(align=True)
-    merge.label(text=f"Merging {len(selection)} patches", icon='SELECT_EXTEND')
-    merge.label(text="Click any of them to open as one")
-    merge.label(text=f"{keymap.describe('back')}: cancel")
+    picked = layout.box().column(align=True)
+    picked.label(text=f"{len(selection)} surfaces picked", icon='SELECT_EXTEND')
+    picked.label(text="Click any of them to open as one patch")
+    picked.label(text=f"{keymap.describe('back')}: cancel")
 
 
-def _draw_merged_patch(
+def _draw_composite_patch(
     layout: bpy.types.UILayout, state: "state_mod.RetopPatchState"
 ) -> None:
-    """What the patch being adjusted is made of, when it is made of several
-    faces, and the way back out of that."""
+    """How many CAD surfaces the patch being adjusted covers, when it covers
+    more than one, and the way back out of that."""
     obj = bpy.data.objects.get(state.source_object_name or state.session_object_name)
-    members = operators.merged_members(obj, state.active_face_id)
-    if not members:
+    surfaces = operators.composite_surfaces(obj, state.active_face_id)
+    if not surfaces:
         return
-    merged = layout.column(align=True)
-    merged.label(text=f"Merged patch — {len(members)} faces", icon='SELECT_EXTEND')
-    merged.operator("retop.split_merge", text="Split Back Apart", icon='MOD_EXPLODE')
+    composite = layout.column(align=True)
+    composite.label(text=f"One patch over {len(surfaces)} surfaces",
+                    icon='SELECT_EXTEND')
+    composite.operator("retop.split_patch", text="Split Into Surfaces",
+                       icon='MOD_EXPLODE')
 
 
 def _draw_warnings(
@@ -199,7 +202,7 @@ def _draw_warnings(
 
     if obj is not None and obj.type == 'MESH' and obj.data.get("face_ids"):
         _draw_group_integrity(layout, obj)
-        _draw_dropped_merges(layout, obj)
+        _draw_dropped_composites(layout, obj)
 
     if obj is None or obj.type != 'MESH' or obj.data.get("face_ids"):
         return
@@ -223,25 +226,27 @@ def _draw_warnings(
     warn.label(text="Re-import it through the bridge.")
 
 
-def _draw_dropped_merges(
+def _draw_dropped_composites(
     layout: bpy.types.UILayout, obj: bpy.types.Object
 ) -> None:
-    """Say so when a stored merge no longer applies to this mesh.
+    """Say so when a patch built from several surfaces no longer applies here.
 
     A re-export renumbers every Plasticity face id even when no vertex moves,
-    so a group written before one names faces that are gone. Silently ignoring
-    it looks exactly like an addon that forgot the merge, and the retopology
-    that comes out is a patch per face again -- correct geometry answering a
-    question nobody asked.
+    so one recorded before it names surfaces that are gone. Silently ignoring
+    it looks exactly like an addon that forgot, and the retopology that comes
+    out is a patch per surface again -- correct geometry answering a question
+    nobody asked.
     """
-    dropped = patch_data.analyse(obj.data).dropped_merges
+    dropped = patch_data.analyse(obj.data).dropped_composites
     if not dropped:
         return
     warn = layout.box().column(align=True)
     warn.alert = True
-    warn.label(text=f"{len(dropped)} merged patch(es) no longer apply", icon='ERROR')
-    for line in _wrapped("Their faces are gone from this mesh — most likely it was "
-                         "re-exported, which renumbers every face id. Merge them again."):
+    warn.label(text=f"{len(dropped)} multi-surface patch(es) no longer apply",
+               icon='ERROR')
+    for line in _wrapped("Their surfaces are gone from this mesh — most likely it "
+                         "was re-exported, which renumbers every face id. Pick them "
+                         "again."):
         warn.label(text=line)
 
 
