@@ -80,7 +80,7 @@ Click on an already committed patch to edit it.
   puts the old patch back.
 - <kbd>X</kbd> deletes it.
 
-## Stepping back out
+!!! tip "Leaving the session"
 
-<kbd>Esc</kbd> goes back one level each press: **Adjust** → **Patch** →
-**Object** → session ends.
+    <kbd>Esc</kbd> goes back one level each press: **Adjust** → **Patch** →
+    **Object** → session ends.

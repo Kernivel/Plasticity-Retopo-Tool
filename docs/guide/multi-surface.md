@@ -21,9 +21,9 @@ neighbours, and commits like any other.
 Clicking a surface that is **not** picked opens that one instead and drops the
 selection. <kbd>Esc</kbd> cancels the selection without leaving the object.
 
-## The surfaces have to touch
-
-Every surface added must border the ones already picked.
+!!! warning "Surfaces have to touch"
+    
+    Every surface added must border the ones already picked.
 
 ## Splitting it back
 
@@ -39,18 +39,12 @@ names that patch, and those faces would be left pointing at something that no
 longer exists. Delete the patch first
 (<kbd>X</kbd> while re-editing it), then split.
 
-## The CAD edges stay
+!!! note "No data is modified"
 
-The Plasticity model stays untouched in case the grouping was a mistake,
- you can always go back to the original surfaces.
+    The Plasticity model stays untouched in case the grouping was a mistake,
+    you can always go back to the original surfaces.
 
 
-## What this does not do
+!!! warning "Issues when refreshing the mesh"
 
-The retopology still follows the surface underneath it. Picking several
-surfaces dissolves the *borders* between them, not the shapes of the faces
-themselves: a grid across a boss still drapes over the boss.
-
-## After a re-export
-
-Re-exporting the mesh breaks the grouping so you will need to rebuild it.
+    Re-exporting the mesh breaks the grouping so you will need to rebuild it.

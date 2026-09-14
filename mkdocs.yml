@@ -56,7 +56,7 @@ nav:
       - Complex cases help: guide/complexcases.md
   - Tools:
       - Neighbour Matching: guide/matching.md
-      - Multi surfaces: guide/multi-surface.md
+      - Multi Surfaces: guide/multi-surface.md
       - Flat N-gon: guide/ngon.md
       - Symmetry: guide/symmetry.md
       - Hand-edits: guide/hand-editing.md

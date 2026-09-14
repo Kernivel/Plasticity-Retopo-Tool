@@ -4,13 +4,6 @@ Retopologizing with this addon includes jumping back and forth between different
 phases: picking a mesh, picking a patch, adjusting the patch, and (optionally)
 tweaking the retopology in Edit Mode.
 
-| Phase | You are | Left click | <kbd>Esc</kbd> |
-|---|---|---|---|
-| **Object** | choosing which mesh to retop | enter that object | end the session |
-| **Patch** | choosing a surface | open that patch | leave the object |
-| **Adjust** | tuning one patch | take the side under the cursor, or commit | clear typing, then discard |
-| **Tweak** | in Blender's Edit Mode | Blender's | Blender's |
-r
 The viewport draws the keybinds that currently apply to the phase.
 
 **One Plasticity face is one patch**, which is why hovering follows the CAD faces
@@ -23,7 +16,7 @@ Committed geometry is written to a second object named **`<Source>_Retop`**,
 filed under a `Retop` collection that mirrors the Inbox hierarchy the bridge
 built.
 
-!!! warning "The name is the link"
+!!! warning "The object's name is the link"
 
     Everything resolves through `<Source>_Retop`. Rename or re-import the CAD
     object and its retopology becomes unreachable.
@@ -37,9 +30,9 @@ to avoid manually scrolling the spans too much.
 |---|---|---|---|---|---|
 | relative to computed | ¼ | ½ | 1 | 2 | 4 |
 
-!!! tip Low poly density
+!!! tip "Low poly density"
 
-    "For a low poly game ready mesh, I recommend Very Low as a base and then tweak the density from there."
+    For a low poly game ready mesh, I recommend Very Low as a base and then tweak the density from there.
 
 
 ## Using N-gons
