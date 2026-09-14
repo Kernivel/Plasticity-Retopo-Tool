@@ -1146,6 +1146,134 @@ def side_bubble_under_cursor(context: bpy.types.Context, event: bpy.types.Event)
     return best_index
 
 
+# --- Merging several faces into one patch -------------------------------------
+#
+# The merge itself lives in `patch_data` (see the section there): these are the
+# session's half of it -- what Shift+click gathers, and the two moments that
+# write a group to the mesh.
+
+
+def merge_selection(state: state_mod.RetopPatchState) -> list[int]:
+    """The patches Shift+click has gathered, in the order they were picked."""
+    return patch_data.parse_merge_selection(getattr(state, "merge_selection", ""))
+
+
+def set_merge_selection(
+    state: state_mod.RetopPatchState, face_ids: "list[int]"
+) -> None:
+    state.merge_selection = patch_data.format_merge_selection(face_ids)
+
+
+def toggle_merge_face(
+    context: bpy.types.Context, obj: bpy.types.Object, face_id: int
+) -> tuple[bool, str]:
+    """Add `face_id` to the pending merge, or drop it if it is already in.
+
+    Returns (changed, message) -- the message is the refusal when it did not.
+    """
+    state = context.scene.plasticity_retop
+    selection = merge_selection(state)
+
+    if face_id in selection:
+        selection.remove(face_id)
+        set_merge_selection(state, selection)
+        return True, (f"Dropped patch {face_id} — {len(selection)} selected"
+                      if selection else "Merge selection cleared")
+
+    # A committed patch's faces carry *its* id, and the merged patch would
+    # carry a new one: nothing would ever delete them again, so they would sit
+    # under the new grid as a second surface. Refused rather than resolved --
+    # stamping them over is a re-edit, and a re-edit is something you ask for.
+    if mesh_build.is_patch_committed(obj, face_id):
+        return False, (f"patch {face_id} is already committed — delete its retopology "
+                       "first (X while re-editing it)")
+
+    analysis = patch_data.analyse(obj.data)
+    patch = analysis.patches.get(face_id)
+    if patch is None or not patch.boundary_loops:
+        return False, f"patch {face_id} has no usable boundary"
+
+    # Contiguity, checked as the selection is built rather than when it is
+    # opened. Two reasons it is the right moment: the answer is cheap here (the
+    # analysis is already in hand and the neighbours are one attribute away),
+    # and a refusal at the click points at the face that caused it, while one
+    # at the end can only say that the set is wrong. What it prevents is a
+    # union whose parts meet at a point -- a pinched boundary -- or not at all,
+    # which comes back with two outer loops and is read as a band.
+    if selection and not patch_data.patch_neighbour_ids(patch).intersection(selection):
+        return False, ("that patch does not touch the selection — a merge has to be "
+                       "one connected area")
+
+    selection.append(face_id)
+    set_merge_selection(state, selection)
+    return True, f"{len(selection)} patches selected to merge"
+
+
+def apply_merge(
+    context: bpy.types.Context, obj: bpy.types.Object, face_ids: "list[int]"
+) -> tuple[int | None, str]:
+    """Write `face_ids` to the mesh as one merge group and return its new id.
+
+    Merging something already merged *flattens*: the groups the selection was
+    standing on are replaced by the one that now owns their faces, so a member
+    list is always raw Plasticity face ids and nothing has to follow a chain.
+    """
+    mesh = obj.data
+    analysis = patch_data.analyse(mesh)
+
+    members: list[int] = []
+    for face_id in face_ids:
+        members.extend(analysis.merges.get(face_id, [face_id]))
+    members = list(dict.fromkeys(members))
+    if len(members) < 2:
+        return None, "a merge needs at least two faces"
+
+    merges = patch_data.read_merges(mesh)
+    # Allocated *before* the old groups are dropped, so an id that a result
+    # mesh may still have faces stamped with is never handed out twice.
+    merged_id = patch_data.next_merged_id(merges)
+    for face_id in face_ids:
+        merges.pop(face_id, None)
+    merges[merged_id] = members
+    patch_data.write_merges(mesh, merges)
+    return merged_id, f"Merged {len(members)} faces"
+
+
+def split_merge(
+    context: bpy.types.Context, obj: bpy.types.Object, merged_id: int
+) -> tuple[bool, str]:
+    """Take a merge group back apart, so its faces are patches again."""
+    mesh = obj.data
+    merges = patch_data.read_merges(mesh)
+    members = merges.get(merged_id)
+    if not members:
+        return False, "that patch is not a merge"
+    # Committed, *or* open in a re-edit -- which is the same thing seen halfway
+    # through: picking a committed patch takes its faces out of the result mesh
+    # before anything else runs, so `is_patch_committed` says no exactly when
+    # the button offering this is on screen. Either way those faces would be
+    # left naming a patch that no longer exists, and nothing would ever delete
+    # them again.
+    state = context.scene.plasticity_retop
+    reediting = (state.editing_committed and state.active_face_id == merged_id)
+    if reediting or mesh_build.is_patch_committed(obj, merged_id):
+        return False, ("it is committed — delete its retopology first "
+                       f"({keymap.describe('delete_patch')} while re-editing it), or "
+                       "those faces would be left naming a patch that no longer exists")
+
+    del merges[merged_id]
+    patch_data.write_merges(mesh, merges)
+    return True, f"Split back into {len(members)} patches"
+
+
+def merged_members(obj: bpy.types.Object | None, face_id: int) -> list[int]:
+    """The Plasticity faces `face_id` stands for, or [] when it stands for
+    itself. What the panel reads to say how many faces a patch is."""
+    if obj is None or obj.type != 'MESH' or face_id >= 0:
+        return []
+    return list(patch_data.analyse(obj.data).merges.get(face_id, []))
+
+
 def set_active_patch(
     context: bpy.types.Context, obj: bpy.types.Object, face_id: int
 ) -> tuple[str | None, int | None, list[str] | None]:
@@ -1281,6 +1409,9 @@ def end_session(context: bpy.types.Context, push: bool = True) -> None:
     state.generator_name = ""
     state.num_sides = 0
     state.editing_committed = False
+    # Gathered patches describe a pick that never happened; nothing was written
+    # to the mesh, so there is nothing to undo, only state to drop.
+    state.merge_selection = ""
     _clear_match_state(state)
 
     mesh_build.refresh_result_appearance(context)
@@ -1388,6 +1519,8 @@ def exit_session_object(context: bpy.types.Context) -> None:
     state.active_face_id = -1
     state.generator_name = ""
     state.num_sides = 0
+    # Named faces of the object being left: they mean nothing on the next one.
+    state.merge_selection = ""
     _clear_match_state(state)
 
     mesh_build.refresh_result_appearance(context)
@@ -1553,6 +1686,45 @@ class RETOP_OT_session(bpy.types.Operator):
         self._hover_ngon = preview.ngon
         # so the overlay can advertise "Re-edit patch" instead of "Pick surface"
         overlay.hover_committed = preview.committed
+        return True
+
+    def _open_merge(
+        self, context: bpy.types.Context, selection: "list[int]"
+    ) -> bool:
+        """Write the pending selection to the mesh as one patch and open it.
+
+        A merge that cannot then be generated is **taken back apart**: a patch
+        nothing can open is worse than a refusal, and the mesh would be left
+        carrying a group with no way to reach it -- the only route back is the
+        Split button on a patch that never opened.
+        """
+        state = context.scene.plasticity_retop
+        obj = bpy.data.objects.get(state.session_object_name)
+        if obj is None:
+            return False
+
+        merged_id, message = apply_merge(context, obj, selection)
+        if merged_id is None:
+            self.report({'WARNING'}, f"Can't merge: {message}")
+            return False
+
+        # The hover preview is the *un*merged patch's grid; the merged one
+        # replaces it. Cleared first, since set_active_patch regenerates.
+        self._clear_hover(context)
+        generator, _sides, _propagated = set_active_patch(context, obj, merged_id)
+        if generator is None:
+            split_merge(context, obj, merged_id)
+            self.report({'WARNING'},
+                        "Merged patch has no usable boundary — merge undone")
+            return False
+
+        state.session_phase = 'ADJUST'
+        self._set_typed("")
+        self._apply_phase_ui(context)
+        # A datablock changed, so the merge gets its own step: Ctrl+Z takes it
+        # back rather than rolling the session up to the patch before.
+        push_undo("Retop: merge patches")
+        self.report({'INFO'}, f"{message} — {generator}")
         return True
 
     def _clear_hover(self, context: bpy.types.Context) -> None:
@@ -2096,8 +2268,31 @@ class RETOP_OT_session(bpy.types.Operator):
                 self.report({'INFO'}, f"Retopping {obj.name}")
                 return {'RUNNING_MODAL'}
 
+            # A click carrying a modifier is a binding -- Shift gathers the
+            # patch under the cursor into a merge -- and has to be dispatched
+            # before the plain pick below claims it. Same arrangement as in
+            # ADJUST, and safe for the plain click: nothing polls for one here.
+            if self._dispatch_bound(context, event):
+                return {'RUNNING_MODAL'}
+
             if self._hover_face_id is None:
                 return {'RUNNING_MODAL'}
+
+            # A pending merge is opened by clicking any patch in it -- the
+            # selection is the gesture, and needing a second key to confirm it
+            # would make the first click mean nothing on its own. Clicking
+            # outside it opens that patch instead and drops the selection,
+            # which is what abandoning it looks like.
+            selection = merge_selection(state)
+            if selection:
+                if len(selection) > 1 and self._hover_face_id in selection:
+                    # The selection is only dropped once the merge has taken:
+                    # a refusal leaves it on screen to be adjusted, rather than
+                    # making the user pick all of it again.
+                    if self._open_merge(context, selection):
+                        set_merge_selection(state, [])
+                    return {'RUNNING_MODAL'}
+                set_merge_selection(state, [])
 
             state.active_face_id = self._hover_face_id
             state.generator_name = self._hover_generator_name
@@ -2726,6 +2921,92 @@ class RETOP_OT_copy_patch_spans(bpy.types.Operator):
         self.report({'INFO'} if done else {'WARNING'},
                     message if done else f"Can't copy density: {message}")
         return {'FINISHED'} if done else {'CANCELLED'}
+
+
+class RETOP_OT_toggle_merge(bpy.types.Operator):
+    """Gather the patch under the cursor into a merge, or drop it again.
+
+    One Plasticity face is one patch, which is the input contract and not
+    always the right unit of work: a boss with two fillet rings around it is
+    five faces that want a single sheet of retopology across them. Shift+click
+    marks the ones that should be filled together; clicking any of them opens
+    the union as one patch, with the borders between them gone.
+    """
+    bl_idname = "retop.toggle_merge"
+    bl_label = "Add To Merge"
+    bl_description = ("Add the patch under the cursor to the pending merge, or take it back "
+                      "out. Click any selected patch to open them all as one")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return _in_phase(context, 'PATCH')
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        state = context.scene.plasticity_retop
+        obj = bpy.data.objects.get(state.session_object_name)
+        if obj is None:
+            return {'CANCELLED'}
+
+        # The pointer the modal left behind: an operator it dispatches never
+        # gets the event, the same arrangement `copy_patch_spans` has.
+        cursor = overlay.cursor_window
+        origin, direction = (ray_from_window(context, cursor[0], cursor[1])
+                             if cursor is not None else (None, None))
+        if origin is None:
+            self.report({'WARNING'}, "Cursor is not over the viewport")
+            return {'CANCELLED'}
+
+        hit_obj, face_id, _distance = _raycast_patch_ray(
+            context, origin, direction, space=context.space_data)
+        if face_id is None or hit_obj != obj:
+            self.report({'WARNING'}, "No patch of this object under the cursor")
+            return {'CANCELLED'}
+
+        changed, message = toggle_merge_face(context, obj, face_id)
+        self.report({'INFO'} if changed else {'WARNING'},
+                    message if changed else f"Can't merge: {message}")
+        return {'FINISHED'} if changed else {'CANCELLED'}
+
+
+class RETOP_OT_split_merge(bpy.types.Operator):
+    """Take the active merged patch back apart into the CAD faces it was made
+    of. The way back from a merge, and the reason merging is not destructive.
+    """
+    bl_idname = "retop.split_merge"
+    bl_label = "Split Merged Patch"
+    bl_description = ("Take this merged patch back apart into the Plasticity faces it was "
+                      "made of")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        state = context.scene.plasticity_retop
+        return (state.session_active
+                and state.active_face_id <= patch_data.MERGED_ID_BASE)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        state = context.scene.plasticity_retop
+        obj = bpy.data.objects.get(state.source_object_name
+                                   or state.session_object_name)
+        if obj is None:
+            return {'CANCELLED'}
+
+        done, message = split_merge(context, obj, state.active_face_id)
+        if not done:
+            self.report({'WARNING'}, f"Can't split: {message}")
+            return {'CANCELLED'}
+
+        # The patch it was open on no longer exists, so the session goes back
+        # to picking one -- which is what clearing active_face_id tells the
+        # modal to do.
+        if bpy.ops.retop.clear_preview.poll():
+            bpy.ops.retop.clear_preview()
+        state.active_face_id = -1
+        state.session_phase = 'PATCH'
+        push_undo("Retop: split merged patch")
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
 
 
 class RETOP_OT_tweak_mesh(bpy.types.Operator):
@@ -3608,6 +3889,12 @@ class RETOP_OT_back(bpy.types.Operator):
             return {'FINISHED'}
 
         if state.session_phase == 'PATCH':
+            # A pending merge is a step in, so Esc is a step out of it -- the
+            # same rule that makes the first Esc in ADJUST clear a half-typed
+            # span rather than throw the patch away.
+            if merge_selection(state):
+                set_merge_selection(state, [])
+                return {'FINISHED'}
             exit_session_object(context)
             return {'FINISHED'}
 
@@ -3765,6 +4052,8 @@ CLASSES = (
     RETOP_OT_corners_accept,
     RETOP_OT_corners_cancel,
     RETOP_OT_copy_patch_spans,
+    RETOP_OT_toggle_merge,
+    RETOP_OT_split_merge,
     RETOP_OT_tweak_mesh,
     RETOP_OT_end_tweak,
     RETOP_OT_mirror_axis,

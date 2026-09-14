@@ -343,6 +343,53 @@ Two boundary loops does **not** by itself mean Ring: see the band invariant.
   `positions`, because a generator may hand its input straight through into a
   preview mesh (`resample_polyline_by_arclength` returns the very objects it was
   given when the count already matches).
+- **Several CAD faces can be one patch, and the merge happens at the parse.**
+  A model is cut into faces by the modelling history, not by what wants a
+  single grid across it: a boss with two fillet rings around it is five faces
+  one sheet of retopology should cross. `compute_boundary_loops` already
+  cancels every directed edge whose reverse is emitted by the *same* patch --
+  that is how a face's own triangulation edges disappear -- so handing
+  `build_patches` the union of several faces' polygons dissolves the borders
+  between them by exactly the same rule, and costs nothing new.
+  The remap is applied to **`face_id_of_poly` itself**, not to the grouping
+  alone, so `build_directed_owners` carries the merged ids too and every later
+  reader (a boundary segment's neighbour, the topological corner test,
+  `cad_display`, the crack report) agrees with it for free. Nothing downstream
+  learns that an id can stand for a set -- doing it at generation time instead
+  would mean teaching every one of those that it can.
+  The id is synthetic and **negative**, at or below `MERGED_ID_BASE` (-1000),
+  so it collides with neither a Plasticity face id nor `NO_PATCH` (-1); it is
+  stored on the mesh (`patch_data.MERGE_PROP`, JSON) because `PATCH_ID_ATTR` on
+  every committed face names it and has to keep meaning the same patch across
+  file loads. `mesh_fingerprint` reads that property, so a merge invalidates
+  the cached parse by itself -- merging moves no vertex, and without it the
+  next `analyse` would hand back the patches from before.
+  **Contiguity is checked as the selection is built**, not when it is opened:
+  the analysis is already in hand at the click and the refusal can point at the
+  face that caused it, where one at the end can only say the set is wrong. What
+  it prevents is a union whose parts meet at a point -- a pinched boundary --
+  or not at all, which comes back with two outer loops and is read as a *band*.
+  A merge that cannot then be generated is **taken back apart** by
+  `_open_merge`: a patch nothing can open would leave the mesh carrying a group
+  with no way to reach it. Splitting is refused while the patch is committed
+  *or* open in a re-edit -- the two are the same state seen halfway through,
+  since picking a committed patch takes its faces out first, so
+  `is_patch_committed` says no exactly when the Split button is on screen.
+  Members are always **raw** face ids: merging a merged patch flattens rather
+  than nesting, and the new id is allocated *before* the old groups are
+  dropped so one a result mesh may still be stamped with is never reissued. A
+  re-export renumbers every face id, so a stored group will stop applying one
+  day: `applicable_merges` hands those back as `dropped_merges` and the panel
+  says so, because a merge that quietly stops being a merge looks exactly like
+  an addon that forgot it. `tests/test_merge.py` pins every one of these, each
+  against the unmerged behaviour as well -- "the merged rectangle has four
+  sides" passes just as well on a build where merging does nothing.
+  What this does **not** do is skip a dissolved feature's *shape*:
+  reprojection is scoped to the patch's polygons (`build_bvh_for_polygons`), so
+  a merged grid drapes over the boss rather than flattening it. Leaving those
+  polygons out of the BVH leaves a hole in it that `find_nearest` answers with
+  its rim, which is the fold `nside.interior_point` exists to avoid met from
+  another direction -- a separate question, not a tweak to this one.
 - **A neighbour missed by half-edge pairing is found by geometry, and the
   tolerance is a share of the model extent.** `resolve_neighbours_by_geometry`
   fills in a segment's neighbour with the patch whose own boundary segment this
@@ -1024,6 +1071,20 @@ hand the viewport straight back, since it does nothing in another mode. Two
 datablocks created from inside an edit session, for a session that never
 opened: that is the shape of the Ctrl+Z crash the undo invariant exists to
 prevent. The panel says which mode to leave rather than offering a dead button.
+
+**Merging several faces into one patch.** `Shift`+click in `PATCH` gathers the
+patch under the cursor (`retop.toggle_merge`); clicking any patch in the
+selection opens them all as one, and clicking outside it drops the selection
+and opens that patch instead. A binding rather than a line in `_modal`, for the
+same reason `Ctrl`+click is: a click carrying a modifier is a binding, and the
+modifier comparison in `keymap._matches` is exact, so the plain pick never
+fires on it. The selection is `state.merge_selection` -- a scene property, not
+an attribute of the modal, because the operators that build it have no way to
+reach the running instance and the overlay draws it (cyan, which nothing else
+uses: a gathered patch is not matched, unmatched, copied from or cracked).
+`Esc` clears a pending selection before it leaves the object, the same step-out
+rule that makes the first `Esc` in `ADJUST` clear a half-typed span. The way
+back is `retop.split_merge`, a panel button on the open patch.
 
 **Deleting a patch** (`X`, `RETOP_OT_delete_patch`) falls straight out of the
 re-edit model: picking a committed patch already took its faces out and
@@ -2138,7 +2199,11 @@ cannot be built is reported rather than prevented, and the span is allocated
 per sub-side so the corner inside a merged group stays a vertex neighbours can
 weld to -- a matched sub-side pinning its own share of that allocation.
 
-Not implemented yet: **N-gon on a face with several holes** (the pipeline
+Not implemented yet: **ignoring a merged-away feature's shape** -- a merged
+patch still reprojects onto every polygon it covers, so it drapes over a boss
+rather than flattening it; **box-selecting** patches to merge, which needs a
+screen-space selection over patches that does not exist here yet;
+**N-gon on a face with several holes** (the pipeline
 truncates past two loops, so only one bridge pair is ever possible),
 **Ring with corner matching** (the two loops are paired by
 arc length, so a hole shaped very differently from the outer boundary distorts
@@ -2153,6 +2218,13 @@ in Object *and* Edit Mode, behind Developer Mode; and the **group
 integrity check** under it, which is shown to everyone because group ranges
 that have stopped lining up with the polygons make `polygon_face_ids` wrong
 everywhere without raising anything.
+
+Also implemented: **merging several CAD faces into one patch** (`Shift`+click
+in the surface-picking phase), so a feature the modelling history cut into five
+faces can be retopologized as the one sheet it wants to be -- the borders
+between the members dissolve, the union keeps one id that commits and re-edits
+like any other patch, and a merge that cannot be built is refused at the click
+that would have broken it.
 
 Also implemented: **several matches on one N-Side patch**, since its sides no
 longer share a span (`nside.spoke_allocation`); and **cracked borders**, the

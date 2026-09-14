@@ -30,8 +30,10 @@ arrow puts one back.
 | Key | Action |
 |---|---|
 | Click | Pick a surface — again on a done one to re-edit it |
+| <kbd>Shift</kbd> + click | Add a surface to a merge, or take it back out |
+| Click a merged-in surface | Open the whole selection as one patch |
 | <kbd>Tab</kbd> | Hand-edit the mesh |
-| <kbd>Esc</kbd> | Leave the object |
+| <kbd>Esc</kbd> | Clear a pending merge, then leave the object |
 
 ## Any phase
 

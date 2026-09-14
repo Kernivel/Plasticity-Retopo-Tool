@@ -27,6 +27,7 @@ from . import cad_display
 from . import constants
 from . import keymap
 from . import mesh_build
+from . import patch_data
 from . import sidematch
 
 if TYPE_CHECKING:
@@ -107,6 +108,17 @@ COPY_SOURCE_COLOR = (1.0, 0.72, 0.25, 0.95)
 COPY_SOURCE_REFUSED_COLOR = (0.75, 0.45, 0.30, 0.7)
 COPY_SOURCE_WIDTH = 3.0
 TOOLTIP_COPY = (1.0, 0.82, 0.5, 1.0)
+
+
+# --- the pending merge -----------------------------------------------------
+#
+# Cyan, which nothing else here uses: a gathered patch is not matched,
+# unmatched, copied from or cracked, and borrowing any of those colours would
+# put it on a scale it has no business being on. Its own outline, like the copy
+# source, because the patches are still CAD surfaces -- nothing has been built
+# over them yet, so there is no geometry to tint.
+MERGE_SELECTED_COLOR = (0.30, 0.90, 1.0, 0.95)
+MERGE_SELECTED_WIDTH = 3.0
 
 
 # --- cracked borders -------------------------------------------------------
@@ -1011,6 +1023,7 @@ def _draw_points() -> None:
     _draw_cad_structure(context, state)
     _draw_cracked_borders(context, state)
     _draw_copy_source(context, state)
+    _draw_merge_selection(context, state)
 
     if state.session_phase != 'ADJUST':
         return
@@ -1128,6 +1141,38 @@ def _draw_copy_source(
     _draw_line_batch([matrix @ point for point in segments],
                      COPY_SOURCE_COLOR if matches else COPY_SOURCE_REFUSED_COLOR,
                      COPY_SOURCE_WIDTH)
+    gpu.state.blend_set('NONE')
+
+
+def _draw_merge_selection(
+    context: bpy.types.Context, state: "state_mod.RetopPatchState"
+) -> None:
+    """POST_VIEW: outline the patches Shift+click has gathered.
+
+    Their B-rep edges, which `cad_display` already has cached per patch -- this
+    redraws on every mouse move while the selection stands, and a draw handler
+    may not walk a mesh.
+    """
+    if state.session_phase != 'PATCH':
+        return
+    raw = getattr(state, "merge_selection", "")
+    if not raw:
+        return
+    obj = bpy.data.objects.get(getattr(state, "session_object_name", ""))
+    if obj is None or obj.type != 'MESH':
+        return
+
+    points = []
+    for face_id in patch_data.parse_merge_selection(raw):
+        points.extend(cad_display.edge_segments(obj.data, face_id))
+    if not points:
+        return
+
+    matrix = obj.matrix_world
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('NONE')
+    _draw_line_batch([matrix @ point for point in points],
+                     MERGE_SELECTED_COLOR, MERGE_SELECTED_WIDTH)
     gpu.state.blend_set('NONE')
 
 
