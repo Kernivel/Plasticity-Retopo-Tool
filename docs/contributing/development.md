@@ -7,8 +7,8 @@ My input in this is guiding the user experience towards something comfortable an
 ## Working from a checkout
 
 ```bash
-git clone https://github.com/Kernivel/Plasticty-Retopo-Tool.git
-cd Plasticty-Retopo-Tool
+git clone https://github.com/Kernivel/Plasticity-Retopo-Tool.git
+cd Plasticity-Retopo-Tool
 python scripts/deploy.py
 ```
 
@@ -85,7 +85,7 @@ bundled interpreter runs them.
 Testing covers the addon's precision and robustness when creating shapes.
 Some basic shapes were created in Plasticity and exported to a .blend file.
 
-[RESULTS.md](https://github.com/Kernivel/Plasticty-Retopo-Tool/blob/main/RESULTS.md) is the golden table of results.
+[RESULTS.md](https://github.com/Kernivel/Plasticity-Retopo-Tool/blob/main/RESULTS.md) is the golden table of results.
 
 `RESULTS.md` and the golden table in `tests/test_fixtures.py` are **generated —
 never hand-edit either**:

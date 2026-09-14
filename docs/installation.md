@@ -17,7 +17,7 @@
 ## Installing the addon
 
 Download the `.zip` from the
-[latest release](https://github.com/Kernivel/Plasticty-Retopo-Tool/releases)
+[latest release](https://github.com/Kernivel/Plasticity-Retopo-Tool/releases)
 and **drag it into Blender**, or use `Edit > Preferences > Add-ons >
 Install from Disk`. Then enable **Plasticity Retop** in the add-ons list.
 

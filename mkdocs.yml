@@ -1,13 +1,16 @@
 site_name: Plasticity Retop
 site_description: Patch-based retopology for CAD meshes in Blender
-site_url: https://kernivel.github.io/Plasticty-Retopo-Tool/
-repo_url: https://github.com/Kernivel/Plasticty-Retopo-Tool
+site_url: https://kernivel.github.io/Plasticity-Retopo-Tool/
+repo_url: https://github.com/Kernivel/Plasticity-Retopo-Tool
 # 'GitHub' exactly: the theme's versions.html special-cases that value and
 # renders a short icon link. Any other string falls through to a branch that
 # prints the name in full, inside the fixed 300px bar at the foot of the
 # sidebar -- where a long one wraps onto three lines and collides with the
 # Previous/Next links.
 repo_name: GitHub
+# MkDocs assumes 'master'; this repository's branch is main, so the theme's
+# 'Edit on GitHub' link on every page 404s without this.
+edit_uri: edit/main/docs/
 copyright: Plasticity Retop is an independent project, not affiliated with Plasticity.
 
 # The addon package lives at the repository root, so the docs sit in a
