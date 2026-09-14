@@ -197,6 +197,51 @@ check("clicking a selected patch drops it again",
 
 
 # ---------------------------------------------------------------------------
+# 5b. The overlay draws the selection, and says how to build one
+#
+# The draw handlers are the one code Blender alone invokes, so nothing else
+# notices when they break -- and a highlight is only ever seen by running it.
+# The assertion is that the callback gets all the way down to the GPU call,
+# which headless Blender has none of: a name that is not there raises long
+# before that.
+# ---------------------------------------------------------------------------
+overlay = pr.overlay
+triangles = pr.cad_display.patch_triangles(mesh, 10)
+check("a patch's fill is its own polygons, fanned", len(triangles) == 6,
+      f"got {len(triangles)}")
+check("and it is cached on the mesh like everything a draw handler reads",
+      pr.cad_display.patch_triangles(mesh, 10) is triangles)
+
+state.session_active = True
+state.session_phase = 'PATCH'
+state.session_object_name = obj.name
+operators.set_merge_selection(state, [10, 11])
+
+overlay.enable()
+try:
+    overlay._draw_points()
+    reached = "no error"
+except SystemError as exc:
+    reached = "gpu" if "background mode" in str(exc) else repr(exc)
+except Exception as exc:  # noqa: BLE001
+    reached = repr(exc)
+check("the highlight draws down to the GPU call and no further",
+      reached in ("gpu", "no error"), reached)
+overlay.disable()
+
+hints = dict(overlay.keybinds_for(state))
+check("the viewport says how many are picked",
+      any("2 picked" in action for action in hints.values()), hints)
+operators.set_merge_selection(state, [])
+hints = dict(overlay.keybinds_for(state))
+check("and names the gesture before anything is picked -- it is behind a "
+      "modifier, which nobody finds on their own",
+      any(action == "Add to merge" for action in hints.values()), hints)
+state.session_active = False
+state.session_object_name = ""
+
+
+# ---------------------------------------------------------------------------
 # 6. Applying it, and flattening
 #
 # Merging something already merged replaces the group it stood on rather than

@@ -558,10 +558,12 @@ state.session_phase = 'PATCH'
 # here: it opens the hand-edit round trip into Blender's Edit Mode, which a
 # patch open for adjustment must not do (its faces are out of the result mesh
 # with only a snapshot to put them back, and Edit Mode discards writes to it on
-# exit).
+# exit). Shift+Click gathers several faces into one patch, and is named here
+# whether or not anything is gathered yet: it is behind a modifier on a click,
+# which is exactly the kind of gesture nobody finds on their own.
 check("patch phase overlay shows its own binds",
       [k for k, _a in pr.overlay.keybinds_for(state)]
-      == ["Click", "Tab", "Alt+X", "E", "V", "Esc"],
+      == ["Click", "Shift+Click", "Tab", "Alt+X", "E", "V", "Esc"],
       str(pr.overlay.keybinds_for(state)))
 
 # ---------------------------------------------------------------------------

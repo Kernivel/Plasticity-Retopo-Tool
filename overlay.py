@@ -119,6 +119,12 @@ TOOLTIP_COPY = (1.0, 0.82, 0.5, 1.0)
 # over them yet, so there is no geometry to tint.
 MERGE_SELECTED_COLOR = (0.30, 0.90, 1.0, 0.95)
 MERGE_SELECTED_WIDTH = 3.0
+# The surface itself, tinted. An outline alone picks a patch out only if you
+# can already see which border is which, and on a part with hundreds of them
+# you cannot -- least of all for the small faces this exists to gather up.
+# Faint, because several selected patches tint a large area and the CAD surface
+# under them is what is being judged.
+MERGE_FILL_COLOR = (0.30, 0.90, 1.0, 0.22)
 
 
 # --- cracked borders -------------------------------------------------------
@@ -317,8 +323,19 @@ def keybinds_for(
         ]
 
     if phase == 'PATCH':
+        # Merging is behind a modifier on a click, which is exactly the kind of
+        # gesture nobody finds on their own -- so it is named here whether or
+        # not anything is gathered yet. Once something is, the entry carries
+        # the count: the tinted patches say *which*, and this says how many and
+        # that a plain click on one of them is what opens them.
+        gathered = len(patch_data.parse_merge_selection(
+            getattr(state, "merge_selection", "")))
+        merge = (key("merge_toggle"),
+                 f"Merge: {gathered} picked — click one" if gathered
+                 else "Add to merge")
         return [
             ("Click", "Re-edit patch" if hover_committed else "Pick surface"),
+            merge,
             (key("hand_edit"), "Hand-edit mesh"),
             # Ctrl+Z is deliberately *not* listed. It is Blender's own key and
             # reaching for it is automatic; what the session does is make one
@@ -1162,17 +1179,31 @@ def _draw_merge_selection(
     if obj is None or obj.type != 'MESH':
         return
 
-    points = []
+    outline = []
+    fill = []
     for face_id in patch_data.parse_merge_selection(raw):
-        points.extend(cad_display.edge_segments(obj.data, face_id))
-    if not points:
+        outline.extend(cad_display.edge_segments(obj.data, face_id))
+        fill.extend(cad_display.patch_triangles(obj.data, face_id))
+    if not outline and not fill:
         return
 
     matrix = obj.matrix_world
+    rv3d = context.region_data
     gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('NONE')
-    _draw_line_batch([matrix @ point for point in points],
-                     MERGE_SELECTED_COLOR, MERGE_SELECTED_WIDTH)
+    # Depth-tested, unlike the copy-source outline: this is a tint *on* a
+    # surface, and drawn through the model the far side of a curved part paints
+    # over the near side -- which is the same reason `cad_display_xray` is off
+    # by default. The nudge is what keeps it from z-fighting with the very
+    # surface it lies on, exactly as the depth-tested CAD lines do.
+    gpu.state.depth_test_set('LESS_EQUAL')
+
+    def place(points: "list[mathutils.Vector]") -> "list[mathutils.Vector]":
+        return _towards_viewer([matrix @ point for point in points], rv3d)
+
+    # Fill first, outline over it: the border is the exact statement of where
+    # the patch ends, and a translucent fill must never soften it.
+    _draw_tri_batch(place(fill), MERGE_FILL_COLOR)
+    _draw_line_batch(place(outline), MERGE_SELECTED_COLOR, MERGE_SELECTED_WIDTH)
     gpu.state.blend_set('NONE')
 
 
@@ -1266,6 +1297,24 @@ def _draw_line_batch(
     shader.uniform_float("lineWidth", width)
     shader.uniform_float("color", color)
     batch_for_shader(shader, 'LINES', {"pos": points}).draw(shader)
+
+
+def _draw_tri_batch(
+    points: "list[mathutils.Vector]",
+    color: tuple[float, float, float, float],
+) -> None:
+    """One TRIS batch for a whole list of triangle corners.
+
+    Corners rather than indices: what this draws is a patch's own polygons,
+    which come out of `cad_display` already fanned, and an index buffer would
+    mean building a vertex table per redraw to save nothing.
+    """
+    if len(points) < 3:
+        return
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch_for_shader(shader, 'TRIS', {"pos": points}).draw(shader)
 
 
 # How far a depth-tested CAD line is nudged towards the viewer, as a share of

@@ -16,7 +16,12 @@ disappear, and what is left is the outline of the whole area.
 ## Gathering the faces
 
 <kbd>Shift</kbd>+click a surface to add it to the merge. Selected patches are
-outlined in cyan. <kbd>Shift</kbd>+click one again to take it back out.
+tinted cyan and outlined, so a small face gathered up on a busy part is visible
+as a surface rather than as one more border among hundreds.
+<kbd>Shift</kbd>+click one again to take it back out.
+
+The hint line along the bottom of the viewport carries the key, and the count
+once anything is picked.
 
 Click any selected patch to open them all as one. The patch that opens is a
 normal patch: it picks a generator from its own outline, takes spans, matches

@@ -198,6 +198,35 @@ def edge_segments(
     return _cached(mesh, f"edge_segments:{face_id}", build)
 
 
+def patch_triangles(
+    mesh: "bpy.types.Mesh", face_id: int
+) -> "list[mathutils.Vector]":
+    """One patch's polygons as a flat list of triangle corners, for a TRIS batch.
+
+    What a *highlight* over a surface needs, as against the outline
+    `edge_segments` gives: a patch picked out of a dense CAD part by its border
+    alone is a border among hundreds of other borders.
+
+    Fan-triangulated, which the bridge's triangle soup makes a no-op -- the
+    same thing `geometry.build_bvh_with_polygon_map` does, and for the same
+    reason: nothing here requires the triangulated export.
+    """
+    def build() -> list["mathutils.Vector"]:
+        patch = patch_data.analyse(mesh).patches.get(face_id)
+        if patch is None:
+            return []
+        points = []
+        for poly_index in patch.poly_indices:
+            corners = list(mesh.polygons[poly_index].vertices)
+            for i in range(1, len(corners) - 1):
+                points.append(mesh.vertices[corners[0]].co.copy())
+                points.append(mesh.vertices[corners[i]].co.copy())
+                points.append(mesh.vertices[corners[i + 1]].co.copy())
+        return points
+
+    return _cached(mesh, f"patch_triangles:{face_id}", build)
+
+
 def brep_vertices(
     mesh: "bpy.types.Mesh", face_id: int | None = None
 ) -> "list[mathutils.Vector]":

@@ -1082,6 +1082,16 @@ fires on it. The selection is `state.merge_selection` -- a scene property, not
 an attribute of the modal, because the operators that build it have no way to
 reach the running instance and the overlay draws it (cyan, which nothing else
 uses: a gathered patch is not matched, unmatched, copied from or cracked).
+**Tinted, not merely outlined** -- an outline picks a patch out only if you can
+already tell which border is which, and on a real part you cannot, least of all
+for the small faces this exists to gather. `cad_display.patch_triangles` is the
+fill, cached per patch on the same fingerprint as everything else a draw
+handler reads. Depth-tested with the `_towards_viewer` nudge rather than drawn
+through the model, for the reason `cad_display_xray` is off by default: a tint
+that ignores depth paints the far side of a curved part over the near side.
+The keybind is advertised in the hint row **before anything is picked** -- it
+sits behind a modifier on a click, which is the one kind of gesture nobody
+finds on their own -- and carries the count once something is.
 `Esc` clears a pending selection before it leaves the object, the same step-out
 rule that makes the first `Esc` in `ADJUST` clear a half-typed span. The way
 back is `retop.split_merge`, a panel button on the open patch.
