@@ -23,14 +23,30 @@ a *grid* neighbour along a shared edge (a grid resamples evenly, this doesn't),
 so only their shared corners weld. Raising `corner_angle_threshold` until the
 feature reads as a real corner restores both the shape and the welding.
 
-A face **with a hole** is filled by `generate_holed`, which bridges the hole to
-the outer boundary with two edges and emits two n-gons rather than one. That is
-the only way to do it: a Blender n-gon has a single loop, and the alternative
-(one "keyhole" face running up to the hole and back) needs the bridge vertices
-duplicated, which the boundary weld would then merge back and destroy the face.
-Two faces need no duplicates and stay manifold. Where the bridges land is
-arbitrary -- nearest pair, then roughly opposite -- since on a flat face it
-changes nothing but which two edges are drawn.
+A face **with holes** is filled by `generate_holed`, which bridges each hole to
+the boundary around it with two edges. That is the only way to do it: a Blender
+n-gon has a single loop, and the alternative (one "keyhole" face running up to
+the hole and back) needs the bridge vertices duplicated, which the boundary weld
+would then merge back and destroy the face. Two faces need no duplicates and
+stay manifold.
+
+**Any number of holes, one at a time.** Each hole is bridged into whichever face
+already built *contains* it, splitting that one in two, so `k` holes come out as
+`k + 1` n-gons. The containment test is a point-in-polygon in the patch's own
+plane, which costs nothing and is available for free here: n-gon mode is only
+offered on a face that is already flat, so the projection is the face.
+
+**Where a bridge lands is arbitrary but not unchecked.** With one hole in a
+convex outline any pair of edges will do, which is why this started as "nearest
+pair, then roughly opposite" and stayed that way for a year. It stops being true
+the moment there is a second hole or a concave outline: a bridge drawn across
+another hole, or out through a notch in the boundary, leaves a face that
+self-intersects -- which Blender tessellates into a bowtie rather than
+refusing. So the old heuristic is still tried *first*, and kept when it is
+sound; `_bridge_is_clear` is what says whether it is, and a search over the
+remaining pairs by length is the fallback. A patch whose every pair fails takes
+the heuristic anyway: a bowtie is visible and fixable, and nothing is a better
+answer than something here.
 
 Reached explicitly (like the Ring generator, and unlike the span-based ones):
 it's a mode the user toggles during a session, not something a side count
@@ -168,23 +184,6 @@ def loop_allocation(
     return loop_points(loop_sides, angle_per_segment, forced_segments)[2]
 
 
-def _nearest_pair(
-    outer: list[mathutils.Vector], hole: list[mathutils.Vector]
-) -> tuple[int, int] | None:
-    """Indices (i, j) of the closest outer/hole point pair. O(n*m), which is
-    nothing at these counts and avoids a KD-tree for a dozen points.
-    """
-    best = None
-    best_distance = float("inf")
-    for i, a in enumerate(outer):
-        for j, b in enumerate(hole):
-            distance = (a - b).length_squared
-            if distance < best_distance:
-                best_distance = distance
-                best = (i, j)
-    return best
-
-
 def _arc(start: int, end: int, count: int) -> list[int]:
     """Indices from `start` forward to `end` inclusive, wrapping at `count`."""
     walk = [start]
@@ -195,10 +194,12 @@ def _arc(start: int, end: int, count: int) -> list[int]:
     return walk
 
 
-def _plane_uvs(points: list[mathutils.Vector]) -> list[tuple[float, float]]:
-    """UVs from a best-fit plane through the boundary (Newell's method), scaled
-    into 0..1. A patch retopped as an n-gon is planar or nearly so, which is
-    exactly when a planar projection is the right unwrap.
+def _plane_frame(
+    points: list[mathutils.Vector],
+) -> tuple[mathutils.Vector, mathutils.Vector, mathutils.Vector]:
+    """(origin, tangent, bitangent) of a best-fit plane through `points`,
+    Newell's method. A patch retopped as an n-gon is planar or nearly so, so
+    this frame is the face itself rather than an approximation of it.
     """
     normal = mathutils.Vector((0.0, 0.0, 0.0))
     count = len(points)
@@ -216,10 +217,24 @@ def _plane_uvs(points: list[mathutils.Vector]) -> list[tuple[float, float]]:
     reference = (mathutils.Vector((1.0, 0.0, 0.0))
                  if abs(normal.x) < 0.9 else mathutils.Vector((0.0, 1.0, 0.0)))
     tangent = (reference - normal * reference.dot(normal)).normalized()
-    bitangent = normal.cross(tangent)
+    return points[0], tangent, normal.cross(tangent)
 
-    origin = points[0]
-    raw = [((p - origin).dot(tangent), (p - origin).dot(bitangent)) for p in points]
+
+def _flatten(
+    points: list[mathutils.Vector],
+    frame: tuple[mathutils.Vector, mathutils.Vector, mathutils.Vector],
+) -> list[tuple[float, float]]:
+    """`points` in the plane frame's own 2D coordinates."""
+    origin, tangent, bitangent = frame
+    return [((p - origin).dot(tangent), (p - origin).dot(bitangent)) for p in points]
+
+
+def _plane_uvs(points: list[mathutils.Vector]) -> list[tuple[float, float]]:
+    """UVs from a best-fit plane through the boundary, scaled into 0..1. A
+    patch retopped as an n-gon is planar or nearly so, which is exactly when a
+    planar projection is the right unwrap.
+    """
+    raw = _flatten(points, _plane_frame(points))
     min_u = min(u for u, _ in raw)
     max_u = max(u for u, _ in raw)
     min_v = min(v for _, v in raw)
@@ -227,6 +242,198 @@ def _plane_uvs(points: list[mathutils.Vector]) -> list[tuple[float, float]]:
     span_u = max(max_u - min_u, 1e-9)
     span_v = max(max_v - min_v, 1e-9)
     return [((u - min_u) / span_u, (v - min_v) / span_v) for u, v in raw]
+
+
+# One segment in the patch's own plane: the two ends of a bridge already drawn.
+Segment2D = tuple[tuple[float, float], tuple[float, float]]
+
+
+# --- the 2D predicates a bridge is checked against -------------------------
+#
+# All of this runs in the patch's own plane, which is what lets it be this
+# plain: n-gon mode is only offered on a face that is already flat, so there is
+# no projection error to carry and nothing near-degenerate to be robust to.
+
+def _side_of(
+    a: tuple[float, float], b: tuple[float, float], p: tuple[float, float]
+) -> float:
+    """Twice the signed area of a-b-p: which side of a->b the point p is on."""
+    return (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+
+
+def _segments_cross(
+    a: tuple[float, float], b: tuple[float, float],
+    c: tuple[float, float], d: tuple[float, float],
+) -> bool:
+    """Whether a-b and c-d cross *properly*, each strictly straddling the other.
+
+    Touching at a shared endpoint is deliberately not a crossing, and that is
+    the case that matters: a bridge starts and ends on a boundary vertex, so it
+    shares an endpoint with four boundary edges by construction, and a test
+    calling those crossings would refuse every bridge there is.
+    """
+    d1 = _side_of(a, b, c)
+    d2 = _side_of(a, b, d)
+    d3 = _side_of(c, d, a)
+    d4 = _side_of(c, d, b)
+    if d1 == 0.0 or d2 == 0.0 or d3 == 0.0 or d4 == 0.0:
+        return False
+    return ((d1 > 0.0) != (d2 > 0.0)) and ((d3 > 0.0) != (d4 > 0.0))
+
+
+def _point_inside(
+    point: tuple[float, float], polygon: list[tuple[float, float]]
+) -> bool:
+    """Ray casting along +u, counting the edges the ray crosses."""
+    inside = False
+    count = len(polygon)
+    for i in range(count):
+        a = polygon[i]
+        b = polygon[(i + 1) % count]
+        if (a[1] > point[1]) != (b[1] > point[1]):
+            t = (point[1] - a[1]) / (b[1] - a[1])
+            if point[0] < a[0] + t * (b[0] - a[0]):
+                inside = not inside
+    return inside
+
+
+def _bridge_is_clear(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    loops_uv: list[list[tuple[float, float]]],
+    drawn: list[Segment2D],
+) -> bool:
+    """Whether a bridge from `start` to `end` stays inside the region.
+
+    Two conditions, and neither implies the other. It may cross no boundary
+    edge and no bridge already drawn, or the faces either side of it overlap.
+    And its midpoint must be inside the outer loop and outside every hole: a
+    segment between two vertices of one concave loop can clear every edge in
+    the patch and still run entirely *outside* the face, which is what a notch
+    in the outline does.
+    """
+    midpoint = ((start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5)
+    if not _point_inside(midpoint, loops_uv[0]):
+        return False
+    for hole in loops_uv[1:]:
+        if _point_inside(midpoint, hole):
+            return False
+    for loop in loops_uv:
+        count = len(loop)
+        for i in range(count):
+            if _segments_cross(start, end, loop[i], loop[(i + 1) % count]):
+                return False
+    for a, b in drawn:
+        if _segments_cross(start, end, a, b):
+            return False
+    return True
+
+
+def _containing_face(
+    point: tuple[float, float],
+    faces: list[list[int]],
+    flat: list[tuple[float, float]],
+) -> int:
+    """Which of the faces built so far encloses `point`.
+
+    A hole yet to be cut lies strictly inside exactly one of them, so this is a
+    lookup rather than a judgement. It falls back to the first face instead of
+    raising: a point-in-polygon that answers nothing means the loops were not
+    what this was told they are, and a hole cut into the wrong face is easier
+    to see -- and to report -- than a patch that refused to generate at all.
+    """
+    for index, cycle in enumerate(faces):
+        if _point_inside(point, [flat[v] for v in cycle]):
+            return index
+    return 0
+
+
+# A bridge is normally found on the first try, so this cap only bites on a
+# boundary that is genuinely hard to cut -- where scanning a dense outline
+# against a dense hole pair by pair would cost more than the fill itself, on
+# every hover.
+MAX_BRIDGE_CANDIDATES = 400
+
+
+def _cyclic_gap(a: int, b: int, count: int) -> int:
+    """How far apart two positions are around a cycle, the short way round."""
+    difference = abs(a - b) % count
+    return min(difference, count - difference)
+
+
+def _pairs_by_length(
+    face_uv: list[tuple[float, float]], hole_uv: list[tuple[float, float]]
+) -> list[tuple[int, int]]:
+    """Every (face position, hole position) pair, shortest first."""
+    pairs = []
+    for i, a in enumerate(face_uv):
+        for j, b in enumerate(hole_uv):
+            pairs.append(((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2, i, j))
+    pairs.sort()
+    return [(i, j) for _, i, j in pairs]
+
+
+def find_bridges(
+    face_uv: list[tuple[float, float]],
+    hole_uv: list[tuple[float, float]],
+    loops_uv: list[list[tuple[float, float]]],
+    drawn: list[Segment2D],
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """The two bridges cutting `hole_uv` into `face_uv`, as positions in each.
+
+    The historical heuristic -- nearest pair, then roughly opposite it -- is
+    tried first and kept whenever it is sound, so a face that was already being
+    filled correctly comes out exactly as before. Only when it is not do we pay
+    for the search, and a boundary where nothing at all works takes the
+    heuristic anyway: a visible bowtie beats a face that was never emitted.
+    """
+    n_face = len(face_uv)
+    n_hole = len(hole_uv)
+    candidates = _pairs_by_length(face_uv, hole_uv)
+
+    def clear(i: int, j: int, extra: "list[Segment2D] | None" = None) -> bool:
+        return _bridge_is_clear(face_uv[i], hole_uv[j], loops_uv,
+                                drawn + (extra or []))
+
+    i_a, j_a = candidates[0]
+    i_b = (i_a + n_face // 2) % n_face
+    j_b = min(range(n_hole),
+              key=lambda j: (hole_uv[j][0] - face_uv[i_b][0]) ** 2
+              + (hole_uv[j][1] - face_uv[i_b][1]) ** 2)
+    if j_b == j_a:
+        # Degenerate: the whole hole is nearest to one point. Any second
+        # attachment will do -- this is an arbitrary cut by definition.
+        j_b = (j_a + n_hole // 2) % n_hole
+    heuristic = ((i_a, j_a), (i_b, j_b))
+
+    first = None
+    if clear(i_a, j_a):
+        first = (i_a, j_a)
+        if i_b != i_a and j_b != j_a and clear(i_b, j_b,
+                                               [(face_uv[i_a], hole_uv[j_a])]):
+            return heuristic
+
+    candidates = candidates[:MAX_BRIDGE_CANDIDATES]
+    if first is None:
+        for i, j in candidates:
+            if clear(i, j):
+                first = (i, j)
+                break
+    if first is None:
+        return heuristic
+
+    # The second bridge is kept away from the first, so neither face comes back
+    # a sliver: a cut leaving three vertices on one side is valid and useless.
+    # Relaxed to "not the same vertex" when nothing that far round works.
+    for gap_face, gap_hole in ((max(1, n_face // 4), max(1, n_hole // 4)), (1, 1)):
+        for i, j in candidates:
+            if _cyclic_gap(i, first[0], n_face) < gap_face:
+                continue
+            if _cyclic_gap(j, first[1], n_hole) < gap_hole:
+                continue
+            if clear(i, j, [(face_uv[first[0]], hole_uv[first[1]])]):
+                return first, (i, j)
+    return heuristic
 
 
 class NgonGenerator(Generator):
@@ -275,56 +482,74 @@ class NgonGenerator(Generator):
         span_settings: dict[str, Any],
         bvh: "BVHTree | None" = None,
     ) -> GenerationResult:
-        """Fill a face with one hole: two n-gons joined by two bridge edges.
+        """Fill a face with one or more holes: `k` holes come back as `k + 1`
+        n-gons, joined by two bridge edges each.
 
-        `loops_sides` is [outer_sides, hole_sides], outer first (the caller
+        `loops_sides` is [outer_sides, hole_sides, ...], outer first (the caller
         sorts them -- which loop comes out of the boundary walk first is hash
-        order). Corner indices are emitted outer-loop-first to match the order
-        `PreparedPatch.corner_source_ids` flattens them in, or the welding
-        would pair a corner with the wrong source vertex.
+        order). Corner indices are emitted in that same loop order, to match
+        the order `PreparedPatch.corner_source_ids` flattens them in, or the
+        welding would pair a corner with the wrong source vertex.
+
+        Holes are inserted one at a time, each into whichever face already
+        built contains it. That is what makes several of them work at all: a
+        hole cut into the wrong face leaves one face with a loop it does not
+        enclose and another enclosing a loop it never mentions, which no amount
+        of choosing the bridges well would repair.
         """
-        if len(loops_sides) != 2:
-            raise ValueError("generate_holed expects exactly two boundary loops")
+        if len(loops_sides) < 2:
+            raise ValueError("generate_holed expects an outer loop and at least one hole")
 
         angle = span_settings.get("ngon_angle", DEFAULT_ANGLE)
         # One override map per loop, in the same order as loops_sides.
-        forced = span_settings.get("side_segments") or [None, None]
-        outer, outer_corners, outer_allocation = loop_points(
-            loops_sides[0], angle, forced[0])
-        hole, hole_corners, hole_allocation = loop_points(
-            loops_sides[1], angle, forced[1] if len(forced) > 1 else None)
+        forced = span_settings.get("side_segments") or []
 
-        if len(outer) < 3 or len(hole) < 3:
-            raise ValueError("N-gon with a hole needs 3+ points on each boundary")
+        verts: list[mathutils.Vector] = []
+        corner_local_indices: list[int] = []
+        allocation: list[int] = []
+        # Each loop as positions into `verts`, outer first.
+        rings: list[list[int]] = []
+        for loop_i, loop_sides in enumerate(loops_sides):
+            points, corners, loop_allocation = loop_points(
+                loop_sides, angle, forced[loop_i] if loop_i < len(forced) else None)
+            if len(points) < 3:
+                raise ValueError("N-gon with a hole needs 3+ points on each boundary")
+            offset = len(verts)
+            rings.append([offset + k for k in range(len(points))])
+            corner_local_indices.extend(offset + c for c in corners)
+            allocation.extend(loop_allocation)
+            verts.extend(points)
 
-        n_outer = len(outer)
-        n_hole = len(hole)
+        frame = _plane_frame(verts)
+        flat = _flatten(verts, frame)
+        loops_uv = [[flat[v] for v in ring] for ring in rings]
 
-        # First bridge on the closest pair, second roughly opposite it, so the
-        # two arcs are comparable and the bridges don't cross.
-        i_a, j_a = _nearest_pair(outer, hole)
-        i_b = (i_a + n_outer // 2) % n_outer
-        j_b = _nearest_pair([outer[i_b]], hole)[1]
-        if j_b == j_a:
-            # Degenerate: the whole hole is nearest to one point. Any second
-            # attachment will do -- this is an arbitrary cut by definition.
-            j_b = (j_a + n_hole // 2) % n_hole
+        # A face is a cycle of vertex indices; the outer loop is the only one
+        # until the first hole is cut into it.
+        faces: list[list[int]] = [list(rings[0])]
+        drawn: list[Segment2D] = []
 
-        verts = outer + hole
-        uvs = _plane_uvs(verts)
+        for hole_i, hole in enumerate(rings[1:], start=1):
+            hole_uv = loops_uv[hole_i]
+            target = _containing_face(hole_uv[0], faces, flat)
+            cycle = faces[target]
+            face_uv = [flat[v] for v in cycle]
+            (a1, b1), (a2, b2) = find_bridges(face_uv, hole_uv, loops_uv, drawn)
+            drawn.append((face_uv[a1], hole_uv[b1]))
+            drawn.append((face_uv[a2], hole_uv[b2]))
 
-        # The hole's loop is wound opposite to the outer one (both are boundary
-        # half-edges of the same patch), so walking both *forward* is what
-        # closes each face consistently.
-        faces = [
-            tuple(_arc(i_a, i_b, n_outer)
-                  + [n_outer + k for k in _arc(j_b, j_a, n_hole)]),
-            tuple(_arc(i_b, i_a, n_outer)
-                  + [n_outer + k for k in _arc(j_a, j_b, n_hole)]),
-        ]
+            # The hole's loop is wound opposite to the outer one (both are
+            # boundary half-edges of the same patch), so walking both *forward*
+            # is what closes each face consistently.
+            n_face = len(cycle)
+            n_hole = len(hole)
+            faces[target] = ([cycle[k] for k in _arc(a1, a2, n_face)]
+                             + [hole[k] for k in _arc(b2, b1, n_hole)])
+            faces.append([cycle[k] for k in _arc(a2, a1, n_face)]
+                         + [hole[k] for k in _arc(b1, b2, n_hole)])
 
-        corner_local_indices = outer_corners + [n_outer + c for c in hole_corners]
-        result = GenerationResult(verts, faces, uvs, corner_local_indices,
+        result = GenerationResult(verts, [tuple(face) for face in faces],
+                                  _plane_uvs(verts), corner_local_indices,
                                   list(range(len(verts))))
-        result.side_allocation = outer_allocation + hole_allocation
+        result.side_allocation = allocation
         return result

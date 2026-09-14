@@ -70,8 +70,10 @@ which rim counted as first was decided by extent, which on a tube is a coin flip
 
 ## What is not handled
 
-- **More than one hole in a single face.** Only the outer boundary is used and
-  the panel says so, rather than quietly paving over the holes.
+- **More than one hole in a single face.** A band runs between two loops and
+  there is no band between three. A flat face like that is filled as an
+  [n-gon](ngon.md) instead, which takes any number of holes; one that is not
+  flat gets its outer boundary alone, and the panel says so.
 - **Corner matching between the two loops.** They are paired by arc length, so a
   hole shaped very differently from the outer boundary distorts the band.
 - **Spans propagating *into* a ring.** "Around" is one number for the whole loop.

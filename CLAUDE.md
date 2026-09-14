@@ -689,8 +689,9 @@ Two boundary loops does **not** by itself mean Ring: see the band invariant.
   with a hole is as likely to be the hole as the face. Anything reducing a
   patch to one loop goes through `patch_data.sort_loops_outer_first` (largest
   extent first). Two loops = a band, filled by the Ring generator; more than
-  two = only the outer loop is used, and `state.num_loops` makes the panel say
-  so rather than silently paving over the holes.
+  two = several holes, which only the n-gon fill takes. A span generator is
+  handed the outer loop alone, so a flat patch is routed to the n-gon instead
+  and `state.num_loops` makes the panel say so for one that is not.
 - **Two boundary loops is not the same thing as a band.** The Ring generator
   gives both loops the same point count, because every quad it makes runs
   straight from one to the other. On a washer, a tube wall or a fillet round a
@@ -1117,7 +1118,18 @@ fingerprint as everything else a draw handler reads. Depth-tested with the
 side of a curved part over the near side. The keybind is advertised in the hint
 row **before anything is picked** -- it sits behind a modifier on a click,
 which is the one kind of gesture nobody finds on their own -- and carries the
-count once something is.
+count once something is. **And holding the modifier answers for itself**: the
+surface under the cursor takes the same blue at a lighter alpha
+(`SURFACE_CANDIDATE_COLOR`, no outline), so the gesture is visible on the model
+rather than only in a line of text. Two levels of one colour rather than two
+colours: "taken" and "what the click would take" are the same kind of thing at
+different strengths, and a second hue would read as a third state. The
+candidate is a **surface**, so it is looked up with `patch_triangles(...,
+surfaces=True)` -- a composite has already swallowed the picked ones, and
+reading the patches would stop lighting anything up at the moment the gesture
+is in use. `state.surface_hover_face_id` carries it, written by the modal only
+while `event.shift` is down (a second raycast, and only on a mesh that already
+has a composite -- otherwise the hover's own answer *is* the surface).
 
 **The selection is not a list waiting to become a patch -- from the second
 pick on it *is* one, on the mesh.** `refresh_pending_composite` rebuilds the
@@ -1728,26 +1740,67 @@ back so the panel and overlay follow.
 
 `operators.ngon_blocker` decides whether a patch may take one at all, and
 writes `ngon_available`/`ngon_unavailable_reason` for the panel and the `N`
-key to explain themselves instead of doing nothing. Two blockers:
+key to explain themselves instead of doing nothing. One blocker:
 
 - **Not flat.** `patch_is_planar` compares every polygon of the patch against
   their average normal (`ngon_planar_tolerance`, 5° default). One face across
   a bevel or a fillet is a flat lid over it — the shape is simply gone. This
   runs on every hover, so it uses polygon normals only: no boundary walk, no
   KD-tree.
-- **More than one hole.** One hole is fine: `generate_holed` bridges it to the
-  outer boundary with two edges and emits **two** n-gons. That is forced —
-  a Blender n-gon carries a single loop, and the one-face "keyhole" alternative
-  needs the bridge vertices duplicated, which the boundary weld then merges
-  back and destroys the face. Two faces need no duplicates and stay manifold.
-  The hole loop is wound opposite to the outer one (both are half-edges of the
-  same patch), which is why both arcs are walked *forward*. Corner indices are
-  emitted outer-loop-first to match `PreparedPatch.corner_source_ids`, and the
-  commit registers spans per loop like a ring does.
+
+**Holes used to be the second blocker and no longer are.** `generate_holed`
+takes **any number** of them: each is bridged to the boundary around it with
+two edges, so `k` holes come back as `k + 1` n-gons. Two edges rather than one
+is forced — a Blender n-gon carries a single loop, and the one-face "keyhole"
+alternative needs the bridge vertices duplicated, which the boundary weld then
+merges back and destroys the face. Two faces need no duplicates and stay
+manifold. Each hole loop is wound opposite to the outer one (both are
+half-edges of the same patch), which is why both arcs are walked *forward*.
+Corner indices are emitted in loop order to match
+`PreparedPatch.corner_source_ids`, and the commit registers spans per loop like
+a ring does.
+
+**Each hole is cut into the face that contains it, not into the outer loop.**
+After the first bridge pair the region is two faces, and the second hole lies
+in exactly one of them; cutting it into the other leaves one face enclosing a
+loop it never mentions and another mentioning a loop it does not enclose —
+which no choice of bridges repairs. `_containing_face` is a point-in-polygon in
+the patch's own plane, which is free here: n-gon mode is only offered on a face
+that is already flat, so the projection *is* the face.
+
+**And a bridge is checked rather than merely chosen.** With one hole inside a
+convex outline any pair of points will do, which is why "nearest pair, then
+roughly opposite" held for a year. It stops holding the moment there are two
+holes or a concave outline: a bridge drawn through another hole, or out through
+a notch in the boundary, leaves a face that self-intersects — and Blender does
+not refuse one, it tessellates it into a bowtie, so nothing reports it.
+`ngon._bridge_is_clear` is the test (crosses no boundary edge and no bridge
+already drawn, **and** its midpoint is inside the outer loop and outside every
+hole — neither half implies the other), and `find_bridges` still tries the old
+heuristic *first*, so a face that was already being filled soundly comes out
+exactly as before. Only when it fails is the search over the remaining pairs
+paid for, capped at `MAX_BRIDGE_CANDIDATES` because this runs on every hover.
+A boundary where nothing at all works takes the heuristic anyway: a visible
+bowtie beats a patch that refused to generate.
+
+**A span generator is still handed the outer boundary alone**, since none of
+them paves more than one outline — `patchprep.prepare_patch(keep_holes=...)`
+is that split, and `_generate_for_face` passes it the same bool it prepares the
+corners with. So a flat face with several holes is **rerouted to the n-gon
+fill** rather than quietly paved over, the same judgement (and the same
+`state.generator_note`) as the non-band ring above; a committed patch is never
+rerouted, and one that is not flat keeps the warning, which then names the
+blocker instead of telling you to press `N`. Measured on the fixture, that
+takes `Shape with holes` — two faces of fifteen sides with four holes each —
+from 226 open boundary edges to **zero**, at 569v/454f down to 243v/200f. Its
+deviation p95 rises (0.16% to 0.70%), which is what an n-gon costs on a face
+that is flat only to within the tolerance, and its max is unchanged.
+`tests/test_multi_hole.py` pins the fill, the routing and the two refusals,
+and checks every emitted face edge against edge — a bowtie is invisible to
+every count the benchmark takes.
 
 The mode gate and the corner method interact: the method depends on which
-generator will run, so `_generate_for_face` decides the mode *first* and
-re-prepares the patch if a blocker only shows up once the loop count is known.
+generator will run, so `_generate_for_face` decides the mode *first*.
 
 **Its boundary is *selected*, never resampled** (`ngon.side_points`): it walks
 the source boundary accumulating turn and keeps a vertex every `ngon_angle`
@@ -2278,13 +2331,11 @@ Not implemented yet: **ignoring a dissolved feature's shape** -- a patch still
 reprojects onto every polygon it covers, so one across a boss drapes over it
 rather than flattening it; **box-selecting** surfaces, which needs a
 screen-space selection over patches that does not exist here yet;
-**N-gon on a face with several holes** (the pipeline
-truncates past two loops, so only one bridge pair is ever possible),
 **Ring with corner matching** (the two loops are paired by
 arc length, so a hole shaped very differently from the outer boundary distorts
-the band, and spans don't propagate *into* a ring), faces with **more than one
-hole** (outer loop only, panel warns), **Quad Fill** with configurable loop
-cuts, **N-Side** with per-side spans and manual corner placement, quad-family
+the band, and spans don't propagate *into* a ring), a **grid** across a face
+with more than one hole (the n-gon fill takes them, no span generator does),
+**Quad Fill** with configurable loop cuts, **N-Side** with per-side spans and manual corner placement, quad-family
 (solving a chain of connected quads in one click).
 
 Also implemented: the **patch debug display** — each patch's face id and
@@ -2304,6 +2355,12 @@ that would have broken it.
 Also implemented: **several matches on one N-Side patch**, since its sides no
 longer share a span (`nside.spoke_allocation`); and **cracked borders**, the
 standing report of a shared CAD edge two committed patches failed to close.
+
+Also implemented: **a flat face with any number of holes**, filled as one n-gon
+per hole plus one, each hole bridged into the face that contains it and every
+bridge checked against the rest of the boundary before it is drawn. A patch
+like that is routed to the n-gon fill on its own, because the alternative is a
+span generator paving the holes over.
 
 Also implemented: **matching one side of a multi-side ring**. A rim of one
 cornerless side made "this loop carries a neighbour's vertices" and "this

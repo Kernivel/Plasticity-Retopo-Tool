@@ -10,9 +10,9 @@ blender tests/fixtures/TestCases.blend --background --python scripts/gen_results
 
 | | |
 |---|---|
-| Generated | 2026-09-13 |
+| Generated | 2026-09-14 |
 | Blender | 5.1.1 |
-| Addon | 0.67.0 (2026-09-12-b) |
+| Addon | 0.78.0 (2026-09-14-m) |
 | Resolution | MID |
 | Fixture | `tests/fixtures/TestCases.blend`, 21 objects |
 
@@ -34,7 +34,7 @@ blender tests/fixtures/TestCases.blend --background --python scripts/gen_results
 | `Non Cordal Bevels` | 336 | 18 | 18&nbsp;Quad | 42v / 32f | 1.8776% | 16 |
 | `Plate` | 622 | 5 | 3&nbsp;Ring, 2&nbsp;Quad | 775v / 657f | 0.0770% | 232 |
 | `Plate And Cylinder` | 2803 | 14 | 10&nbsp;Quad, 4&nbsp;Ring | 2229v / 2139f | 0.1399% | 184 |
-| `Shape with holes` | 616 | 17 | 15&nbsp;Quad, 2&nbsp;Ring | 569v / 454f | 8.9746% | 226 |
+| `Shape with holes` | 616 | 17 | 13&nbsp;Quad, 2&nbsp;N-gon, 2&nbsp;Ring | 243v / 200f | 8.9746% | 0 |
 | `Sphere` | 12320 | 1 | 1&nbsp;unusable | — | — | — |
 | `Square Plate Small Hole` | 28 | 11 | 10&nbsp;Quad, 1&nbsp;Ring | 16v / 14f | 0.0001% | 0 |
 | `Square Plate Small Hole Far Away` | 28 | 11 | 10&nbsp;Quad, 1&nbsp;Ring | 16v / 14f | 0.0007% | 0 |
@@ -60,7 +60,7 @@ blender tests/fixtures/TestCases.blend --background --python scripts/gen_results
 | `Non Cordal Bevels` | 0.3398% | 0.6903% | 1.6046% | **1.8776%** | 0.0000% |
 | `Plate` | 0.0072% | 0.0179% | 0.0478% | **0.0770%** | 0.0001% |
 | `Plate And Cylinder` | 0.0145% | 0.0261% | 0.0599% | **0.1399%** | 0.0081% |
-| `Shape with holes` | 0.0242% | 0.1563% | 0.0675% | **8.9746%** | 0.0000% |
+| `Shape with holes` | 0.2015% | 0.6966% | 0.5635% | **8.9746%** | 0.0000% |
 | `Square Plate Small Hole` | 0.0000% | 0.0000% | 0.0000% | **0.0001%** | 0.0000% |
 | `Square Plate Small Hole Far Away` | 0.0000% | 0.0001% | 0.0000% | **0.0007%** | 0.0000% |
 | `Square Plate Small Hole Scaled Down` | 0.0059% | 0.0172% | 0.0441% | **0.0661%** | 0.0001% |
@@ -86,7 +86,7 @@ A large `max` against a modest `p95` means a few samples are far out rather than
 | `Non Cordal Bevels` | 42 | 32 | 32&times;4-gon | 16 | 0 | 0 | 0 | 8 |
 | `Plate` | 775 | 657 | 657&times;4-gon | 232 | 0 | 0 | 0 | 4 |
 | `Plate And Cylinder` | 2229 | 2139 | 2139&times;4-gon | 184 | 0 | 0 | 0 | 4 |
-| `Shape with holes` | 569 | 454 | 454&times;4-gon | 226 | 0 | 0 | 0 | 8 |
+| `Shape with holes` | 243 | 200 | 190&times;4-gon, 1&times;8-gon, 1&times;9-gon, 2&times;10-gon, 1&times;12-gon, 1&times;13-gon, 1&times;15-gon, 1&times;19-gon, 2&times;21-gon | 0 | 0 | 0 | 0 | 78 |
 | `Square Plate Small Hole` | 16 | 14 | 14&times;4-gon | 0 | 0 | 0 | 0 | 8 |
 | `Square Plate Small Hole Far Away` | 16 | 14 | 14&times;4-gon | 0 | 0 | 0 | 0 | 8 |
 | `Square Plate Small Hole Scaled Down` | 12 | 10 | 10&times;4-gon | 0 | 0 | 0 | 0 | 8 |
@@ -112,7 +112,7 @@ A large `max` against a modest `p95` means a few samples are far out rather than
 | `Non Cordal Bevels` | 2.37 | 5.80 | **5.8** | 0.0° | 45.0° | 45.0° | 0.54 |
 | `Plate` | 1.05 | 1.11 | **1.1** | 6.2° | 52.9° | 83.3° | 0.12 |
 | `Plate And Cylinder` | 1.12 | 1.81 | **10.0** | 0.0° | 34.5° | 79.9° | 1.63 |
-| `Shape with holes` | 1.01 | 1.03 | **9.2** | 0.0° | 0.0° | 0.0° | 2.51 |
+| `Shape with holes` | 1.57 | 9.25 | **163.9** | 0.0° | 54.8° | 134.8° | 1.81 |
 | `Square Plate Small Hole` | 5.00 | 800.00 | **800.0** | 0.0° | 45.0° | 45.0° | 0.81 |
 | `Square Plate Small Hole Far Away` | 5.00 | 798.92 | **798.9** | 0.0° | 45.0° | 45.0° | 0.81 |
 | `Square Plate Small Hole Scaled Down` | 3.54 | 7.07 | **7.1** | 0.0° | 45.0° | 45.0° | 0.68 |

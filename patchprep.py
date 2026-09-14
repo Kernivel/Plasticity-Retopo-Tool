@@ -31,9 +31,14 @@ class PreparedPatch:
     """A patch's boundary, split into sides, one entry per boundary loop.
 
     Most patches have a single loop. Two loops means a band: a face with a hole
-    in it, or a tube-like face with two rims -- see generators/ring.py. More
-    than two (several holes) isn't handled: only the outer loop is used, and
-    `num_loops` is what the panel warns from.
+    in it, or a tube-like face with two rims -- see generators/ring.py.
+
+    More than two is several holes, and only the n-gon fill can take them
+    (`generators.ngon.generate_holed`, which bridges each one into the face
+    around it). Every span generator paves a single outline, so for those the
+    holes are dropped at the preparation -- `keep_holes` is which of the two is
+    being prepared, and `num_loops` counts what the patch really has either
+    way, since that is what the panel warns from.
     """
 
     __slots__ = ("patch", "loops_sides", "loops_corner_ids", "num_loops",
@@ -73,6 +78,13 @@ class PreparedPatch:
         return len(self.loops_sides) == 2
 
     @property
+    def has_holes(self) -> bool:
+        """Whether anything is enclosed by the outer boundary -- what the n-gon
+        fill branches on. Not `is_ring`: a ring is exactly two loops, and an
+        n-gon takes any number of them."""
+        return len(self.loops_sides) > 1
+
+    @property
     def sides(self) -> LoopSides:
         """Sides of the outer loop -- what the single-loop generators take."""
         return self.loops_sides[0]
@@ -90,9 +102,14 @@ def prepare_patch(
     angle_threshold: float,
     small_side_tolerance: float,
     corner_method: str = 'BOTH',
+    keep_holes: bool = False,
 ) -> PreparedPatch | None:
     """Split patch `face_id`'s boundary into sides. Returns a PreparedPatch, or
     None if the patch has no usable boundary.
+
+    `keep_holes` asks for every boundary loop, which only the n-gon fill can
+    use; without it a face with several holes comes back as its outer boundary
+    alone, which is all a span generator can pave.
     """
     analysis = patch_data.analyse(mesh)
     patch = analysis.patches.get(face_id)
@@ -111,7 +128,7 @@ def prepare_patch(
     # hash order, so without this a holed face can be retopped on its hole.
     loops = patch_data.sort_loops_outer_first(patch.boundary_loops, positions)
     num_loops = len(loops)
-    if num_loops > 2:
+    if num_loops > 2 and not keep_holes:
         loops = loops[:1]  # several holes: fall back to the outer boundary alone
 
     loops_sides = []
@@ -129,7 +146,7 @@ def prepare_patch(
             # ring goes straight to its own generator and pairs its two
             # loops itself, so corners it never asked for only get in the
             # way -- see resolve_corners.
-            allow_synthesis=(num_loops == 1))
+            allow_synthesis=(len(loops) == 1))
         loops_arbitrary.append(arbitrary)
         if not corner_warning and sides_mod.corners_are_uniform(
                 loop, positions, sides_mod.detect_corners(loop, positions, angle_threshold)):

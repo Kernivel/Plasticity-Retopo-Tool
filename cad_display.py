@@ -227,7 +227,7 @@ def edge_segments(
 
 
 def patch_triangles(
-    mesh: "bpy.types.Mesh", face_id: int
+    mesh: "bpy.types.Mesh", face_id: int, surfaces: bool = False
 ) -> "list[mathutils.Vector]":
     """One patch's polygons as a flat list of triangle corners, for a TRIS batch.
 
@@ -235,12 +235,19 @@ def patch_triangles(
     `edge_segments` gives: a patch picked out of a dense CAD part by its border
     alone is a border among hundreds of other borders.
 
+    `surfaces=True` reads the mesh's own surfaces instead, so `face_id` can be
+    one that a composite has swallowed -- which is exactly the case the surface
+    picker's hover is in, since it marks the surface a click would take rather
+    than the patch it may already be part of.
+
     Fan-triangulated, which the bridge's triangle soup makes a no-op -- the
     same thing `geometry.build_bvh_with_polygon_map` does, and for the same
     reason: nothing here requires the triangulated export.
     """
     def build() -> list["mathutils.Vector"]:
-        patch = patch_data.analyse(mesh).patches.get(face_id)
+        analysis = (patch_data.analyse_surfaces(mesh) if surfaces
+                    else patch_data.analyse(mesh))
+        patch = analysis.patches.get(face_id)
         if patch is None:
             return []
         points = []
@@ -252,7 +259,8 @@ def patch_triangles(
                 points.append(mesh.vertices[corners[i + 1]].co.copy())
         return points
 
-    return _cached(mesh, f"patch_triangles:{face_id}", build)
+    return _cached(mesh, f"patch_triangles:{surfaces}:{face_id}", build,
+                   surfaces=surfaces)
 
 
 def brep_vertices(

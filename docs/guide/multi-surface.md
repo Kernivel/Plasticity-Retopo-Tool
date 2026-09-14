@@ -15,10 +15,15 @@ them disappear, and what is left is the outline of the whole area.
 
 ## Picking the surfaces
 
-<kbd>Shift</kbd>+click a surface to add it. Picked surfaces are tinted cyan and
-outlined, so a small one gathered up on a busy part is visible as a surface
-rather than as one more border among hundreds. <kbd>Shift</kbd>+click it again
-to take it back out.
+Hold <kbd>Shift</kbd> and the surface under the cursor picks up a faint blue
+tint. That is the whole of the discovery: the gesture is behind a modifier, so
+holding the modifier is made to show what it acts on.
+
+<kbd>Shift</kbd>+click a surface to add it. Picked surfaces are tinted the same blue more
+strongly, and outlined — so a small one gathered up on a busy part is visible
+as a surface rather than as one more border among hundreds.
+<kbd>Shift</kbd>+click it again to take it back out; hovering one that is
+already picked brightens it, which is what says the click would remove it.
 
 There is no limit on how many. The hint line along the bottom of the viewport
 carries the key, and the count once anything is picked.

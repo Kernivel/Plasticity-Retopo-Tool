@@ -256,7 +256,7 @@ class PatchPreview:
         self.ngon = ngon  # generated as a single n-gon rather than a span grid
         self.generator = generator
         self.num_sides = num_sides
-        self.num_loops = num_loops  # boundary loops the patch has (2 = ring, >2 = unsupported)
+        self.num_loops = num_loops  # boundary loops the patch has (2 = ring, >2 = n-gon only)
         self.spans = spans  # (span_u, span_v, span)
         self.corner_source_ids = corner_source_ids
         self.propagated = propagated  # span keys taken from a committed neighbour
@@ -341,14 +341,17 @@ def ngon_blocker(
 ) -> str:
     """Why this patch can't be an n-gon, or "" when it can.
 
-    Two reasons, both hard: a curved face would get a flat lid over it, and
-    more than one hole can't be bridged by the two-edge cut generate_holed
-    makes (the pipeline only ever hands generators the outer loop past two).
+    One reason, and it is hard: a curved face would get a flat lid over it and
+    the shape would simply be gone.
+
+    Holes used to be the second one. They no longer are -- `generate_holed`
+    bridges each hole into the face around it, so any number of them comes back
+    as that many n-gons plus one. `num_loops` is still taken, because callers
+    pass it and because the count is what the panel reports, but it blocks
+    nothing.
     """
     if not patchprep.patch_is_planar(mesh, face_id, state.ngon_planar_tolerance):
         return "not a flat face"
-    if num_loops is not None and num_loops > 2:
-        return f"{num_loops} boundary loops"
     return ""
 
 
@@ -451,21 +454,14 @@ def _generate_for_face(
             mesh, face_id, state.corner_angle_threshold,
             # Like every other distance in the panel: typed in state.length_unit.
             state_mod.to_blender_units(state, state.small_side_tolerance),
-            state.corner_method_ngon if for_ngon else state.corner_method_spans)
+            state.corner_method_ngon if for_ngon else state.corner_method_spans,
+            # Several holes are the n-gon fill's to bridge and nobody else's,
+            # so a span generator is still handed the outer boundary alone.
+            keep_holes=for_ngon)
 
     prepared = prepare(ngon)
     if prepared is None:
         return None
-
-    if ngon:
-        # The loop count only comes out of the preparation, so this second gate
-        # can't be merged into the first one.
-        blocker = ngon_blocker(state, mesh, face_id, prepared.num_loops)
-        if blocker:
-            ngon = False
-            prepared = prepare(False)  # corners resolved for the wrong mode
-            if prepared is None:
-                return None
 
     # Two boundary loops is not the same thing as a band. A flat plate with a
     # small hole is an annulus too, and the Ring generator has to give both of
@@ -483,6 +479,26 @@ def _generate_for_face(
         else:
             ngon = True
             ring_note = "hole too small for a band -- filled as an n-gon"
+            prepared = prepare(True)
+            if prepared is None:
+                return None
+
+    # More than one hole, and nothing with a span can pave more than a single
+    # outline -- so under one of those the holes are simply covered over, while
+    # the n-gon fill bridges every one of them. Same judgement as the non-band
+    # ring above and for the same reason: a patch quietly ruined is worse than
+    # one built by the other generator. The planarity test is paid for here
+    # rather than on every hover, since this is the one branch that asks.
+    if not ngon and prepared.num_loops > 2:
+        blocker = ngon_blocker(state, mesh, face_id)
+        holes = prepared.num_loops - 1
+        if committed:
+            pass  # a committed patch comes back as whatever it was built as
+        elif blocker:
+            ring_note = f"{holes} holes, and {blocker}"
+        else:
+            ngon = True
+            ring_note = f"{holes} holes -- filled as an n-gon"
             prepared = prepare(True)
             if prepared is None:
                 return None
@@ -537,9 +553,10 @@ def _generate_for_face(
                                         winners=winners)
         settings = {"ngon_angle": state.ngon_angle,
                     "side_segments": sidematch.ngon_side_segments(prepared, matched)}
-        if prepared.is_ring:
-            # One hole: bridged to the outer boundary with two edges, giving
-            # two n-gons (a Blender n-gon can't carry a hole on its own).
+        if prepared.has_holes:
+            # Each hole bridged into the face around it with two edges, giving
+            # one more n-gon per hole (a Blender n-gon can't carry a hole on
+            # its own).
             result = generator.generate_holed(prepared.loops_sides, settings)
         else:
             settings = dict(settings, side_segments=settings["side_segments"][0])
@@ -1380,6 +1397,32 @@ def dissolve_composite(obj: bpy.types.Object, composite_id: int) -> int:
     return len(surfaces)
 
 
+def surface_under_cursor(
+    context: bpy.types.Context,
+    event: bpy.types.Event,
+    obj: bpy.types.Object | None,
+    face_id: int | None,
+) -> int:
+    """The mesh's own surface under the cursor, or -1.
+
+    `obj`/`face_id` are what the hover already found, which is a *patch*. With
+    no composite on the mesh the two are the same thing, and the answer is free;
+    only once one exists does this cost a second cast, and only while Shift is
+    held. That matters because it runs on every mouse move.
+    """
+    if obj is None or face_id is None:
+        return -1
+    if not patch_data.analyse(obj.data).composites:
+        return face_id
+
+    origin, direction = ray_from_event(context, event)
+    if origin is None:
+        return -1
+    hit_obj, surface_id, _distance = _raycast_patch_ray(
+        context, origin, direction, space=context.space_data, surfaces=True)
+    return surface_id if hit_obj is obj and surface_id is not None else -1
+
+
 def composite_surfaces(obj: bpy.types.Object | None, face_id: int) -> list[int]:
     """The Plasticity surfaces `face_id` is built from, or [] when it is a
     single one. What the panel reads to say how many a patch covers."""
@@ -1528,6 +1571,7 @@ def end_session(context: bpy.types.Context, push: bool = True) -> None:
     state.generator_name = ""
     state.num_sides = 0
     state.editing_committed = False
+    state.surface_hover_face_id = -1
     _clear_match_state(state)
 
     mesh_build.refresh_result_appearance(context)
@@ -2241,6 +2285,10 @@ class RETOP_OT_session(bpy.types.Operator):
             # clearing it there would delete the geometry that was picked.
             if state.session_phase in {'PATCH', 'OBJECT'}:
                 self._clear_hover(context)
+                # Written only on a mouse move, so a phase reached by a key
+                # would otherwise draw one frame of the surface the cursor was
+                # over when the last pick ended.
+                state.surface_hover_face_id = -1
             self._cursor_in_viewport = None
             self._apply_phase_ui(context)
 
@@ -2298,6 +2346,7 @@ class RETOP_OT_session(bpy.types.Operator):
         # own region keymaps behave anyway.
         if not over_viewport:
             state.hovered_side = -1
+            state.surface_hover_face_id = -1
             return {'PASS_THROUGH'}
 
         # The session's keys, resolved against the *live* KeyMapItems and run
@@ -2371,6 +2420,17 @@ class RETOP_OT_session(bpy.types.Operator):
             # stay within the object being retopped
             if obj is not None and session_obj is not None and obj != session_obj:
                 obj, face_id = None, None
+
+            # What Shift+click would take, while Shift is actually held. The
+            # gesture is behind a modifier on a click, which is the one kind
+            # nobody finds on their own -- so holding the modifier is made to
+            # answer for itself, on the surface rather than in a hint line.
+            # Drawn whether or not that surface can be taken: an indicator that
+            # appears only over a valid target makes a refusal look like a
+            # target that was never there, and the click says which it is.
+            state.surface_hover_face_id = (
+                surface_under_cursor(context, event, obj, face_id)
+                if event.shift else -1)
 
             if obj is not None and face_id is not None:
                 if face_id != self._hover_face_id or obj != self._hover_obj:
@@ -2554,11 +2614,14 @@ class RETOP_OT_commit_patch(bpy.types.Operator):
         # generation already does, just no need to regenerate geometry here).
         # Same corner method the preview was generated with, or the spans
         # registered for propagation would describe sides that don't exist.
+        ngon_committed = state.generator_name == generators.NGON.name
         prepared = patchprep.prepare_patch(
             source_obj.data, face_id, state.corner_angle_threshold,
             state.small_side_tolerance,
-            state.corner_method_ngon if state.generator_name == generators.NGON.name
-            else state.corner_method_spans)
+            state.corner_method_ngon if ngon_committed else state.corner_method_spans,
+            # Same loops generation was handed, or the registry would describe
+            # an n-gon's holes as if they had never been filled.
+            keep_holes=ngon_committed)
 
         # Passing the face id is what lets a re-committed patch replace its own
         # previous faces instead of stacking a second grid on top of them.

@@ -317,10 +317,10 @@ EXPECTED = {
     ),
     "Shape with holes": dict(
         source_tris=616, patches=17,
-        result_verts=569, result_faces=454,
+        result_verts=243, result_faces=200,
         faces=[
-            (546, "Quad", 4, 5),
-            (547, "Quad", 4, 5),
+            (546, "N-gon", 15, 5),
+            (547, "N-gon", 15, 5),
             (550, "Quad", 4, 1),
             (551, "Quad", 4, 1),
             (555, "Quad", 4, 1),
@@ -338,7 +338,7 @@ EXPECTED = {
             (579, "Quad", 4, 1),
         ],
         max_deviation_pct=12.0,  # measured 8.9746%
-        open_edges=226,
+        open_edges=0,
     ),
     "Sphere": dict(
         source_tris=12320, patches=1,

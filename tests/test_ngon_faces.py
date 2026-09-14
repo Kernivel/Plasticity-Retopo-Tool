@@ -2,7 +2,7 @@
 
 What N-gon mode may and may not be applied to:
   - flat faces only (a single face over a bevel is a lid, not a retopology)
-  - a face with one hole, bridged to its outer boundary with two edges
+  - a face with holes, each bridged into the face around it with two edges
 """
 import os
 import sys
@@ -89,8 +89,9 @@ check("ngon_blocker names the reason",
       pr.operators.ngon_blocker(state, bevel.data, 9))
 check("and says nothing about a flat face",
       pr.operators.ngon_blocker(state, flat.data, 7) == "")
-check("more than one hole is the other blocker",
-      pr.operators.ngon_blocker(state, flat.data, 7, num_loops=3) == "3 boundary loops")
+check("and several holes are no longer a blocker -- generate_holed bridges them",
+      pr.operators.ngon_blocker(state, flat.data, 7, num_loops=3) == "",
+      pr.operators.ngon_blocker(state, flat.data, 7, num_loops=3))
 
 # --- with the mode on, a curved patch silently falls back to a grid ---
 state.ngon_mode = True

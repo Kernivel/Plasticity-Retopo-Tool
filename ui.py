@@ -326,13 +326,16 @@ def _draw_active_patch(
         for line in _wrapped(state.group_warning):
             warn.label(text=line)
 
-    if state.num_loops > 2:
-        # More than one hole: the band generator handles two loops, not three,
-        # so only the outer boundary was used and the holes are covered over.
+    if state.num_loops > 2 and state.generator_name != constants.NGON:
+        # More than one hole. The n-gon fill bridges every one of them; no span
+        # generator paves anything but a single outline, so under one of those
+        # the holes have been covered over and only N will get them back.
         warn = box.column(align=True)
         warn.alert = True
         warn.label(text=f"{state.num_loops} boundary loops — holes ignored", icon='ERROR')
-        warn.label(text="Split the face in Plasticity to retop it.")
+        warn.label(text="Press N to fill it as an n-gon, holes and all."
+                   if state.ngon_available
+                   else f"N-gon would take them, but: {state.ngon_unavailable_reason}")
 
     if state.editing_committed:
         # Re-edit: the old patch has already been taken out of the result mesh,
@@ -371,8 +374,10 @@ def _draw_active_patch(
         # in the settings tab, so having them here too made the patch block
         # look as though the mode changed more than it does.
         box.prop(state, "ngon_angle")
-        if state.num_loops == 2:
-            box.label(text="Hole bridged with 2 edges (2 n-gons)", icon='MESH_TORUS')
+        if state.num_loops > 1:
+            holes = state.num_loops - 1
+            box.label(text=f"{holes} hole{'s' if holes > 1 else ''} bridged "
+                           f"({state.num_loops} n-gons)", icon='MESH_TORUS')
         row = box.row(align=True)
         row.operator("retop.commit_patch",
                      text="Replace" if state.editing_committed else "Commit",

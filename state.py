@@ -94,6 +94,12 @@ class RetopPatchState(bpy.types.PropertyGroup):
     # way out of the pick can take it back apart again. -1 when there is none.
     pending_composite_id: bpy.props.IntProperty(
         name="Pending Composite", default=-1)
+    # The surface Shift+click would take, while Shift is actually held. Written
+    # by the modal on every mouse move, read by the overlay -- the same
+    # arrangement `copy_hover_face_id` has, and for the same reason: a draw
+    # handler is given no event to read the keyboard or the pointer from.
+    surface_hover_face_id: bpy.props.IntProperty(
+        name="Surface Under Cursor", default=-1)
     generator_name: bpy.props.StringProperty(name="Generator", default="")
     num_sides: bpy.props.IntProperty(name="Num Sides", default=0)
     # Whether N-gon mode can run on the active patch at all: it needs a flat

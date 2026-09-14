@@ -123,6 +123,12 @@ SURFACE_SELECTED_WIDTH = 3.0
 # Faint, because several of them tint a large area and the CAD surface under
 # them is what is being judged.
 SURFACE_FILL_COLOR = (0.30, 0.90, 1.0, 0.22)
+# The one under the cursor while Shift is held: the same blue, lighter, and
+# with no outline. Two levels rather than two colours -- "taken" and "this is
+# what the click would take" are the same kind of thing at different strengths,
+# and a second hue would read as a third state. On a surface already picked the
+# two stack, which is what says the click there would take it back out.
+SURFACE_CANDIDATE_COLOR = (0.30, 0.90, 1.0, 0.10)
 
 
 # --- cracked borders -------------------------------------------------------
@@ -1172,7 +1178,8 @@ def _draw_surface_selection(
     if state.session_phase != 'PATCH':
         return
     raw = getattr(state, "surface_selection", "")
-    if not raw:
+    candidate = getattr(state, "surface_hover_face_id", -1)
+    if not raw and candidate == -1:
         return
     obj = bpy.data.objects.get(getattr(state, "session_object_name", ""))
     if obj is None or obj.type != 'MESH':
@@ -1192,7 +1199,14 @@ def _draw_surface_selection(
     for face_id in face_ids:
         outline.extend(cad_display.edge_segments(obj.data, face_id))
         fill.extend(cad_display.patch_triangles(obj.data, face_id))
-    if not outline and not fill:
+
+    # The candidate is a *surface*, which a composite may already have
+    # swallowed -- so it is looked up among the mesh's own, not among the
+    # patches. Without that it would stop lighting up the moment the second
+    # surface was picked, i.e. the moment the gesture was in use.
+    candidate_fill = (cad_display.patch_triangles(obj.data, candidate, surfaces=True)
+                      if candidate != -1 else [])
+    if not outline and not fill and not candidate_fill:
         return
 
     matrix = obj.matrix_world
@@ -1208,8 +1222,9 @@ def _draw_surface_selection(
     def place(points: "list[mathutils.Vector]") -> "list[mathutils.Vector]":
         return _towards_viewer([matrix @ point for point in points], rv3d)
 
-    # Fill first, outline over it: the border is the exact statement of where
-    # the surface ends, and a translucent fill must never soften it.
+    # Fills first, outline over them: the border is the exact statement of
+    # where the surface ends, and a translucent fill must never soften it.
+    _draw_tri_batch(place(candidate_fill), SURFACE_CANDIDATE_COLOR)
     _draw_tri_batch(place(fill), SURFACE_FILL_COLOR)
     _draw_line_batch(place(outline), SURFACE_SELECTED_COLOR, SURFACE_SELECTED_WIDTH)
     gpu.state.blend_set('NONE')

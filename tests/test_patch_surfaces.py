@@ -292,6 +292,50 @@ check("the highlight draws down to the GPU call and no further",
       reached in ("gpu", "no error"), reached)
 overlay.disable()
 
+# The surface Shift is hovering is tinted more faintly than the picked ones,
+# and it is looked up among the mesh's **own** surfaces -- a composite has
+# swallowed the picked ones, so reading the patches would stop lighting
+# anything up the moment the gesture was in use, which is the moment it matters.
+state.surface_hover_face_id = 10
+candidate = pr.cad_display.patch_triangles(mesh, 10, surfaces=True)
+check("the hovered surface still has a fill of its own while it is inside a patch",
+      len(candidate) == 6, f"got {len(candidate)}")
+check("which reading the patches would not have found",
+      pr.cad_display.patch_triangles(mesh, 10) == [])
+check("and it is fainter than a picked one",
+      overlay.SURFACE_CANDIDATE_COLOR[3] < overlay.SURFACE_FILL_COLOR[3],
+      f"{overlay.SURFACE_CANDIDATE_COLOR[3]} vs {overlay.SURFACE_FILL_COLOR[3]}")
+check("the same blue, not a second colour",
+      overlay.SURFACE_CANDIDATE_COLOR[:3] == overlay.SURFACE_FILL_COLOR[:3])
+
+try:
+    overlay._draw_points()
+    reached = "no error"
+except SystemError as exc:
+    reached = "gpu" if "background mode" in str(exc) else repr(exc)
+except Exception as exc:  # noqa: BLE001
+    reached = repr(exc)
+check("and it draws down to the GPU call with a candidate on screen",
+      reached in ("gpu", "no error"), reached)
+
+# It is drawn with nothing picked at all, which is the state the gesture has to
+# advertise itself in: a tint that only appears once you are already using the
+# feature explains it to nobody.
+operators.discard_pending_composite(bpy.context)
+state.surface_hover_face_id = 12
+try:
+    overlay._draw_points()
+    reached = "no error"
+except SystemError as exc:
+    reached = "gpu" if "background mode" in str(exc) else repr(exc)
+except Exception as exc:  # noqa: BLE001
+    reached = repr(exc)
+check("a candidate draws with nothing picked yet", reached in ("gpu", "no error"),
+      reached)
+state.surface_hover_face_id = -1
+operators.toggle_patch_surface(bpy.context, obj, 10)
+operators.toggle_patch_surface(bpy.context, obj, 11)
+
 hints = dict(overlay.keybinds_for(state))
 check("the viewport says how many are picked",
       any("2 surfaces" in action for action in hints.values()), hints)

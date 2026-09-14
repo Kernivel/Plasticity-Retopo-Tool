@@ -116,8 +116,7 @@ reload.
 |---|---|
 | *Corners look uniform* | Every boundary vertex bends the same and every one is flagged — a coarsely tessellated circle and a real octagon are the same polyline. Raise the corner threshold |
 | *N-gon unavailable: not flat* | The patch is a bevel or a fillet; one face would be a flat lid over it |
-| *N-gon unavailable: more than one hole* | Only one hole can be bridged |
-| *N boundary loops* | More than two — only the outer loop is used, rather than quietly paving over the holes |
+| *N boundary loops* | More than two. A flat face is filled as an [n-gon](../guide/ngon.md) so its holes survive; one that is not flat gets its outer boundary alone, and the warning names the reason |
 | *N matches outvoted* | Two sides wanted different counts along the same span. See [matching](../guide/matching.md#a-grid-cannot-honour-two-counts-in-one-direction) |
 | *Orphan result object* | A `<X>_Retop` whose source no longer exists — usually a rename or a re-import |
 | *Session active with no modal* | A reload or a crash left the state set. The panel offers a reset |

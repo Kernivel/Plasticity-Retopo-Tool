@@ -172,10 +172,10 @@ the decisions shows:
    it was built as — same rule as its spans. Hovering finished work must show
    what is there, not what the current mode would build.
 2. **Does the mode ask for an n-gon?** <kbd>N</kbd>, or a patch committed as one.
-3. **Can it take one?** Two hard blockers: a patch that is not flat (a bevel
-   would get a flat lid over it), and more than one hole (the two-edge bridge can
-   only handle one). The panel names the blocker rather than the key doing
-   nothing.
+3. **Can it take one?** One hard blocker: a patch that is not flat, which would
+   get a flat lid over it. The panel names it rather than the key doing nothing.
+   Holes are not a blocker — each one is bridged into the face around it, so a
+   face with four holes comes back as five n-gons.
 4. **Does it have two boundary loops?** Then it is a Ring candidate — but two
    loops is not the same thing as a band. A 200×100 plate with a 5 mm hole is an
    annulus too, and a Ring has to give both loops the same point count. So the
