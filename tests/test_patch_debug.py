@@ -385,6 +385,45 @@ check("_draw_patch_debug draws with no object at all", ok, detail)
 panel_state.debug_patch_ids = False
 
 
+# ===========================================================================
+# Registering under Blender's restricted context
+#
+# `operators.register` calls `sync_patch_hover`, which asks whether the display
+# wants its modal running -- and Blender registers an addon under a
+# `_RestrictContext` that has no `scene` on it at all, because no file is
+# loaded yet. Reaching straight for `context.scene` there raised
+# `'_RestrictContext' object has no attribute 'scene'` and took the whole
+# registration down with it: enabling the addon, or deploying and re-enabling
+# it, failed outright while the identical code was fine once running.
+#
+# There is nothing to want at that moment anyway -- the scene the toggle lives
+# on arrives with `load_post`, which asks again.
+# ===========================================================================
+class _RestrictedContext:
+    """What Blender hands an addon during registration: no `scene`."""
+
+
+try:
+    wanted = pr.operators._patch_hover_wanted(_RestrictedContext())
+    ok, detail = True, repr(wanted)
+except Exception as exc:  # noqa: BLE001
+    ok, detail = False, repr(exc)
+check("the hover check survives a context with no scene", ok, detail)
+check("and answers no, since there is no toggle to read yet",
+      ok and wanted is False, detail)
+
+# The whole registration, which is what the user actually hits. Not a
+# restricted context here -- no test can produce one -- so this only pins that
+# a register/unregister round trip stays clean alongside the guard above.
+try:
+    pr.unregister()
+    pr.register()
+    ok, detail = True, ""
+except Exception as exc:  # noqa: BLE001
+    ok, detail = False, repr(exc)
+check("register survives a full round trip", ok, detail)
+
+
 print()
 if FAILURES:
     print(f"=== {len(FAILURES)} FAILURE(S): {FAILURES}")
