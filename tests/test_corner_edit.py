@@ -441,6 +441,136 @@ for position in (1, 2):
     check(f"corner {position} survives a span too small to hold it",
           closest < 1e-4, closest)
 
+# ---------------------------------------------------------------------------
+#  Committing a grouped patch
+# ---------------------------------------------------------------------------
+# The registry records one span per side, keyed by the corner pair the side
+# runs between -- so it has to see the *groups*. A pentagon committed as a Quad
+# has four spans and five corners, and pairing the five against the four raised
+# IndexError out of register_patch_spans, which took the session down.
+sidematch.set_side_groups(state, {1: numbers[0]})
+state.span_u = 3
+state.span_v = 3
+pr.operators.regenerate_active_preview(bpy.context)
+check("the merged patch is a Quad again before committing",
+      state.generator_name == "Quad", state.generator_name)
+
+try:
+    bpy.ops.retop.commit_patch()
+    committed_ok, detail = True, ""
+except Exception as exc:  # noqa: BLE001
+    committed_ok, detail = False, repr(exc)
+check("committing a grouped patch does not raise", committed_ok, detail)
+check("and it lands in the result mesh", state.committed_patch_count == 1,
+      state.committed_patch_count)
+
+# Re-opening it has to come back as what it was built as, grouping and all.
+pr.operators.set_active_patch(bpy.context, obj, 7)
+check("re-editing it reopens as a Quad",
+      state.generator_name == "Quad" and state.num_sides == 4,
+      f"{state.generator_name} / {state.num_sides}")
+check("with the spans it was committed with",
+      (state.span_u, state.span_v) == (3, 3), (state.span_u, state.span_v))
+
+pr.operators.end_session(bpy.context)
+
+# ===========================================================================
+#  Matching, on a patch that has been grouped
+#
+#  A pentagon with a strip committed along one of its edges. Merging two
+#  *other* sides must leave that one matching exactly as before: the grouping
+#  changes which sides the generator counts, not which faces a side borders.
+#  And a side swallowed into a merged group is dropped out loud -- it carries
+#  only part of its group's span, so it cannot be honoured yet, and it has to
+#  read as unmatched rather than silently reproduce the wrong count.
+# ===========================================================================
+edge = (rim[1] - rim[0])
+outward = mathutils.Vector((edge.y, -edge.x, 0.0)).normalized() * 0.8
+if (rim[0] + outward).length < rim[0].length:
+    outward = -outward
+
+gverts = [(0.0, 0.0, 0.0)] + [tuple(point) for point in rim] + [
+    tuple(rim[0] + outward), tuple(rim[1] + outward)]
+penta_tris = [(0, 1 + n, 1 + (n + 1) % 5) for n in range(5)]
+strip_tris = [(1, 6, 7), (1, 7, 2)]
+
+gmesh = bpy.data.meshes.new("GroupMatchMesh")
+gmesh.from_pydata(gverts, [], penta_tris + strip_tris)
+gmesh.update()
+gmesh["groups"] = [0, len(penta_tris) * 3, len(penta_tris) * 3, len(strip_tris) * 3]
+gmesh["face_ids"] = [11, 12]
+
+gobj = bpy.data.objects.new("GroupMatchObj", gmesh)
+bpy.context.collection.objects.link(gobj)
+bpy.context.view_layer.objects.active = gobj
+
+pr.operators.enter_session_object(bpy.context, gobj)
+state.ngon_mode = False
+
+pr.operators.set_active_patch(bpy.context, gobj, 12)
+state.span_u = 4
+state.span_v = 4
+bpy.ops.retop.commit_patch()
+check("the neighbouring strip is committed", state.committed_patch_count == 1,
+      state.committed_patch_count)
+
+pr.operators.set_active_patch(bpy.context, gobj, 11)
+references = sidematch.active_sides()
+bordering = [ref.index for ref in references if 12 in ref.neighbours]
+check("exactly one side of the pentagon borders it", len(bordering) == 1, bordering)
+shared = bordering[0]
+check("and ungrouped it is matched",
+      references[shared].applied, references[shared].reason)
+
+# Merge two sides that are not the shared one.
+others = [ref.index for ref in references if ref.index != shared]
+pair = next((a, b) for a, b in zip(others, others[1:]) if b == a + 1)
+numbers = sidematch.group_numbers(references, state)
+sidematch.set_side_groups(state, {pair[1]: numbers[pair[0]]})
+pr.operators.regenerate_active_preview(bpy.context)
+
+references = sidematch.active_sides()
+check("grouped elsewhere, the patch is a Quad",
+      state.num_sides == 4, f"{state.generator_name} / {state.num_sides}")
+check("and the shared side is still matched -- grouping changes what the "
+      "generator counts, not what a side borders",
+      references[shared].applied, references[shared].reason)
+
+# Now merge the shared side *into* its neighbour. Its count is only a share of
+# the group's span now, so it cannot be a vote on the direction the way an
+# unmerged side is -- it becomes a pin on the allocation instead, and the
+# neighbour's vertices have to come through untouched all the same.
+sidematch.set_side_groups(state, {})
+pr.operators.regenerate_active_preview(bpy.context)
+references = sidematch.active_sides()
+wanted = len(references[shared].applied_points) - 1
+check("the neighbour put a definite count along the shared side", wanted >= 2, wanted)
+
+neighbour_side = shared - 1 if shared > 0 else 1
+numbers = sidematch.group_numbers(references, state)
+sidematch.set_side_groups(state, {shared: numbers[neighbour_side]})
+pr.operators.regenerate_active_preview(bpy.context)
+
+references = sidematch.active_sides()
+check("swallowed into a merged group, the match still applies",
+      references[shared].applied, references[shared].reason)
+check("and reproduces exactly the count it did before -- a pin on the "
+      "allocation, not a vote on the direction",
+      len(references[shared].applied_points) - 1 == wanted,
+      f"{len(references[shared].applied_points) - 1} vs {wanted}")
+check("nothing was outvoted for it", state.match_conflicts == 0,
+      state.match_conflicts)
+
+# The span had to grow to hold the pin plus a segment for the side beside it:
+# below that the pin set cannot fit, and a dropped pin is the crack this
+# arrangement exists to close.
+preview = bpy.data.objects.get(pr.mesh_build.PREVIEW_OBJ_NAME)
+world = [preview.matrix_world @ vertex.co for vertex in preview.data.vertices]
+for point in references[shared].applied_points:
+    closest = min((vertex - (gobj.matrix_world @ point)).length for vertex in world)
+    check("every vertex the neighbour committed is reproduced", closest < 1e-4, closest)
+    break
+
 pr.operators.end_session(bpy.context)
 
 print()

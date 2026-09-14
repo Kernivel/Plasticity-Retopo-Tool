@@ -1229,20 +1229,44 @@ already matches. The span driving a group is **floored at its sub-side count**
 for the same reason — per span, not globally, so a quad whose U side is merged
 does not also inflate V.
 
-**Matching does not yet reach inside a merged group.** A grid has one count per
-direction, so a match normally *is* that count — but a sub-side of a group
-carries only part of it, and `_honours` would compare the part against the
-whole. Those matches are dropped **out loud** (`_matches_outside_groups` marks
-them outvoted), so the side draws red and the panel counts it: that edge may
-genuinely crack, and saying so is the honest state of this until the allocation
-learns to pin a sub-side the way `ring.allocate_segments` does. Single-side
-groups match exactly as before.
+**A match inside a merged group is a pin on the allocation, not a vote on the
+direction.** A grid has one count per direction, so an unmerged side's match
+*is* that count — but a sub-side of a group carries only a share of it, and
+comparing the share against the whole drops every such match. So a side inside
+a merged group keys its span **per side** (`SideReference.grouped`, and
+`span_key_for` then answers `side:{index}` as it does for an N-Side), its count
+becomes a pin on `allocate_group_segments`, and the group's span is floored at
+`sum(pins) + free` — below that the pin set cannot fit, and
+`allocate_group_segments` drops it **whole**, exactly as `ring.allocate_segments`
+does: half a pin set is half a weld, which is a crack down a boundary that had
+just been arranged to close.
+
+The allocation runs **once** (`operators._group_pins`, then `group_counts`),
+and both the per-side spans the matching is checked against and the polylines
+the generator is handed come out of that one call — two calls to the allocator
+could only ever agree by luck.
+
+**The commit path reads the same grouping**, through the same helper, or the
+registry describes a patch that was not built: a pentagon committed as a Quad
+has four spans and five corners, and pairing the five against the four is what
+raised `IndexError` out of `register_patch_spans` and took the session down.
+What it registers is one pair per *group*; the corner **inside** a group is
+deliberately not registered, since a pair describes a shared boundary and a
+group's boundary is the whole merged run. A neighbour across only part of it
+has no pair to look up — the same propagation this gives up as matching does.
+And the grouping goes into the patch's own record beside its spans
+(`register_patch_settings`), because a patch committed as a Quad has to reopen
+as that Quad; `set_active_patch` restores it on the way in, where the rest of
+the per-patch state is cleared.
 
 `tests/test_corner_edit.py` builds a regular pentagon — five corners bending 72
 degrees, no cliff for the ranking to cut at — asserts it really does go to the
 N-Side fan first, then that merging two sides makes it a Quad with the corner
-between them still on the grid to 1e-7, and that an unusable grouping leaves
-the generator on the ungrouped sides rather than reaching it.
+between them still on the grid to 1e-7, that an unusable grouping leaves the
+generator on the ungrouped sides rather than reaching it, that committing and
+re-opening it comes back as the Quad it was, and — on a second object with a
+strip committed along one edge — that the shared side matches whether it is its
+own group or swallowed into one, reproducing the same count either way.
 
 **A neighbour covering part of a side is completed, not refused — and only
 when you point at it.** A bore's rim is one long cornerless side and the patch
@@ -2112,7 +2136,7 @@ chamfer or a boolean can be built as the quad it wants to be -- each side
 carries a numbered bubble in the viewport, the numbering is free and what
 cannot be built is reported rather than prevented, and the span is allocated
 per sub-side so the corner inside a merged group stays a vertex neighbours can
-weld to. Matching does not yet reach inside a merged group.
+weld to -- a matched sub-side pinning its own share of that allocation.
 
 Not implemented yet: **N-gon on a face with several holes** (the pipeline
 truncates past two loops, so only one bridge pair is ever possible),

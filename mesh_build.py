@@ -201,9 +201,17 @@ def register_patch_settings(
     span_v: int,
     span: int,
     generator_name: str,
+    side_groups: str = "",
 ) -> None:
     """Record what a just-committed patch was built with, so re-selecting it
     later comes back with those exact spans rather than recomputed defaults.
+
+    `side_groups` is the grouping its sides were gathered into, as the JSON
+    `state.side_groups` holds. It belongs here with the spans and the generator
+    for exactly the same reason: a patch committed as a Quad because two of its
+    five sides were merged has to reopen as that Quad. Recomputing it from the
+    live scene cannot work -- the grouping is per patch and `set_active_patch`
+    clears it on the way in, like every other per-patch choice.
     """
     result_obj = bpy.data.objects.get(result_object_name_for(source_obj))
     if result_obj is None:
@@ -214,6 +222,7 @@ def register_patch_settings(
         "span_v": span_v,
         "span": span,
         "generator": generator_name,
+        "side_groups": side_groups,
     }
     save_patch_settings_table(result_obj, table)
 

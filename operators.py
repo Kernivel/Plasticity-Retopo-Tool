@@ -144,6 +144,22 @@ def register_spans_for(
                         forced[loop_i] if loop_i < len(forced) else None))
         return
 
+    # The same grouping generation used, or the registry describes a patch that
+    # was not built: a pentagon committed as a Quad has four spans and five
+    # corners, and pairing the five against the four is what raised IndexError
+    # out of `register_patch_spans`. Read through the one helper, so the two can
+    # only ever agree. Neither the n-gon nor the ring path above reaches here --
+    # both are grouping-free, and both have already returned.
+    groups = _side_groups_for(state, prepared, ngon=False)
+    corner_ids = prepared.corner_source_ids
+    if groups:
+        # One entry per group, naming the corner it starts at. The corner
+        # *inside* a group is deliberately not registered: what these pairs
+        # describe is a shared boundary, and a group's boundary is the whole
+        # merged run -- a neighbour across only part of it has no pair to look
+        # up, which is the same propagation this gives up as the matching does.
+        corner_ids = [prepared.loops_corner_ids[0][run[0]] for run in groups]
+
     if state.generator_name == constants.NSIDE:
         # Per side, from the same solve generation ran: the registry has to
         # advertise what the mesh actually got, and an N-Side's sides no longer
@@ -151,8 +167,8 @@ def register_spans_for(
         # over, off the side references the preview left behind -- same patch,
         # same pins, same answer.
         winners, _outvoted = sidematch.collect_side_matches(context, constants.NSIDE)
-        spokes, _refused = nside_allocation(len(prepared.sides), state.span, winners)
-        corner_ids = prepared.corner_source_ids
+        spokes, _refused = nside_allocation(len(corner_ids) or len(prepared.sides),
+                                            state.span, winners)
         if corner_ids:
             mesh_build.register_patch_spans(
                 source_obj, corner_ids, generators.nside.side_segments(spokes))
@@ -166,7 +182,6 @@ def register_spans_for(
             mesh_build.register_patch_spans(source_obj, corner_ids, alloc)
         return
 
-    corner_ids = prepared.corner_source_ids
     if corner_ids:
         mesh_build.register_patch_spans(
             source_obj, corner_ids, spans_per_side(state, len(corner_ids)))
@@ -389,25 +404,25 @@ def _side_groups_for(
     return runs
 
 
-def _matches_outside_groups(
-    winners: dict, groups: "list[list[int]]"
-) -> "tuple[dict, list]":
-    """(the winners that survive, the ones dropped for being inside a group).
+def _group_pins(
+    winners: "sidematch.Winners", groups: "list[list[int]]"
+) -> "list[dict[int, int]]":
+    """Per group, {position within it: segments} for its matched sub-sides.
 
-    See the call site: a sub-side of a merged group carries only part of its
-    group's span, so a match on it cannot be honoured yet.
+    A match hands a side a committed neighbour's own vertices, so its count is
+    not negotiable -- resampling it off them is the crack matching exists to
+    close. Inside a merged group that count is only a *share* of the group's
+    span, which is why those sides key their span per side (`span_key_for`)
+    and end up here as pins on the allocation rather than as a vote on the
+    direction.
     """
-    merged = {index for run in groups if len(run) > 1 for index in run}
-    if not merged:
-        return winners, []
-    kept, dropped = {}, []
-    for key, entry in winners.items():
-        if entry[0].index in merged:
-            entry[0].outvoted = True
-            dropped.append(entry[0])
-        else:
-            kept[key] = entry
-    return kept, dropped
+    wanted = {reference.index: len(points) - 1
+              for _key, (reference, points, _pinned) in winners.items()}
+    pins = []
+    for run in groups:
+        pins.append({position: wanted[index]
+                     for position, index in enumerate(run) if index in wanted})
+    return pins
 
 
 def _generate_for_face(
@@ -513,19 +528,6 @@ def _generate_for_face(
     # rewritten. The references have to exist first -- they are what holds the
     # neighbour's vertices.
     winners, outvoted = sidematch.collect_side_matches(context, generator.name)
-    if groups:
-        # **Matching does not yet reach inside a merged group.** A grid has one
-        # count per direction, so a match normally *is* that count -- but a
-        # sub-side of a group carries only part of it, and `_honours` would
-        # compare the part against the whole and drop it anyway, or worse keep
-        # it and resample the rest off the neighbour's vertices.
-        #
-        # Dropped out loud rather than quietly: the side goes back to wanting a
-        # match it is not getting, which is what the overlay paints red and the
-        # panel counts. That edge may genuinely crack, and saying so is the
-        # honest state of this until the allocation learns to pin a sub-side.
-        winners, dropped = _matches_outside_groups(winners, groups)
-        outvoted = list(outvoted) + dropped
     state.match_conflicts = len(outvoted)
 
     if ngon:
@@ -637,16 +639,39 @@ def _generate_for_face(
         # -- is no longer on our grid. Floored per span rather than globally,
         # so a quad whose U side is merged does not also inflate V.
         floors: dict[str, int] = {}
+        group_pins = _group_pins(winners, groups)
         for position, run in enumerate(groups):
             key = sidematch.span_base(
                 sidematch.span_key_for(generator.name, sidematch.SideSlot(
                     position, 0, position)))
-            floors[key] = max(floors.get(key, 1), len(run))
+            pins = group_pins[position]
+            # Room for what the matched sub-sides must reproduce exactly, plus
+            # one segment for each of the rest: below that the pin set cannot
+            # fit and `allocate_group_segments` drops it whole, which is a
+            # boundary that had been arranged to weld coming back cracked.
+            needed = max(len(run), sum(pins.values()) + (len(run) - len(pins)))
+            floors[key] = max(floors.get(key, 1), needed)
         span_u = max(span_u, floors.get("span_u", 1))
         span_v = max(span_v, floors.get("span_v", 1))
         span = max(span, floors.get("span", 1))
 
     spans = {"span_u": span_u, "span_v": span_v, "span": span}
+    group_counts: "list[list[int]]" = []
+    if groups:
+        # Allocated once, here, because the counts the matching is checked
+        # against have to be the very numbers the polylines are built from --
+        # two calls to the allocator could only ever agree by luck. A sub-side
+        # carrying a neighbour's vertices is pinned to its exact count; the
+        # rest share out what is left by arc length.
+        for position, run in enumerate(groups):
+            group_counts.append(patchprep.allocate_group_segments(
+                [prepared.sides[i] for i in run],
+                _span_for_group(spans, generator.name, position),
+                group_pins[position]))
+        for run, counts in zip(groups, group_counts):
+            if len(run) > 1:
+                spans.update({f"side:{index}": count
+                              for index, count in zip(run, counts)})
     nside_spokes = None
     if generator.name == constants.NSIDE:
         # An N-Side patch splits every side at a spoke, so with nothing matched
@@ -656,7 +681,8 @@ def _generate_for_face(
         # before any side is rewritten, and handed down as a per-side span so
         # `_honours` drops exactly the matches it could not fit.
         span = generators.nside.even_span(span)
-        nside_spokes, _refused = nside_allocation(len(prepared.sides), span, winners)
+        nside_spokes, _refused = nside_allocation(
+            len(groups) if groups else len(prepared.sides), span, winners)
         segments_of = generators.nside.side_segments(nside_spokes)
         spans.update({f"side:{index}": count
                       for index, count in enumerate(segments_of)})
@@ -670,9 +696,8 @@ def _generate_for_face(
         # the substitution, so a single-side group that was matched still hands
         # its neighbour's own vertices through untouched.
         generation_input = [
-            patchprep.group_side_points([prepared.sides[i] for i in run],
-                                        _span_for_group(spans, generator.name, position))
-            for position, run in enumerate(groups)]
+            patchprep.group_side_points([prepared.sides[i] for i in run], counts)
+            for run, counts in zip(groups, group_counts)]
 
     bvh = (geometry.build_bvh_for_polygons(mesh, prepared.patch.poly_indices)
            if state.reproject else None)
@@ -1140,7 +1165,14 @@ def set_active_patch(
     # The corner set names sides by index too, so it is per patch for exactly
     # the same reason -- and the editor is closed rather than carried over: it
     # is a gesture on one patch, not a mode the session sits in.
-    state.side_groups = ""
+    # Cleared, then put back from the record if this patch has one: a patch
+    # committed as a Quad because two of its five sides were merged has to
+    # reopen as that Quad, the same rule its spans and its n-gon mode follow.
+    # Here rather than inside `_generate_for_face`, because the restore is
+    # about *opening* a patch -- doing it on every regeneration would undo the
+    # user's next change to the grouping.
+    stored_settings = mesh_build.lookup_patch_settings(obj, face_id) or {}
+    state.side_groups = str(stored_settings.get("side_groups", "") or "")
     state.group_warning = ""
     state.corner_edit = False
     state.side_groups_backup = ""
@@ -2214,7 +2246,8 @@ class RETOP_OT_commit_patch(bpy.types.Operator):
         update_committed_count(context, source_obj)
 
         mesh_build.register_patch_settings(
-            source_obj, face_id, state.span_u, state.span_v, state.span, state.generator_name)
+            source_obj, face_id, state.span_u, state.span_v, state.span,
+            state.generator_name, state.side_groups)
         if prepared is not None:
             register_spans_for(context, source_obj, prepared)
 

@@ -55,7 +55,7 @@ class SideReference:
     picker offers and one it greys out.
     """
 
-    __slots__ = ("index", "loop", "in_loop", "group", "points", "match_points",
+    __slots__ = ("index", "loop", "in_loop", "group", "grouped", "points", "match_points",
                  "neighbours", "reason", "strict_points",
                  "match_world", "applied", "applied_points",
                  "outvoted", "tied_points", "tied_key")
@@ -94,6 +94,10 @@ class SideReference:
         # generator counts as one side. Filled in by `build_side_references`
         # once the numbering is known; `in_loop` when nothing is grouped.
         self.group = in_loop
+        # Whether that group holds more than this one side. A side inside a
+        # merged group carries only *part* of its group's span, so it drives a
+        # count of its own rather than the direction's -- see `span_key_for`.
+        self.grouped = False
         self.index = index      # flat index across every loop, in order
         self.loop = loop        # which boundary loop it belongs to
         self.in_loop = in_loop  # its index within that loop
@@ -266,6 +270,7 @@ def assign_groups(references: list[SideReference], numbers: dict[int, int]) -> N
         position_in_loop[loop] = position + 1
         for index in run:
             by_index[index].group = position
+            by_index[index].grouped = len(run) > 1
 
 
 def _recut_arbitrary_loop(
@@ -753,6 +758,13 @@ def span_key_for(generator_name: str, reference: SideReference) -> str:
     position = getattr(reference, "group", None)
     if position is None:
         position = reference.in_loop
+    if getattr(reference, "grouped", False):
+        # Inside a merged group: its count is its own share of the group's
+        # span, allocated by `patchprep.allocate_group_segments`, so comparing
+        # it against the whole direction would drop every match on a merged
+        # side. Keyed per side like an N-Side's, and for the same reason --
+        # what settles a disagreement is the allocation, not a vote here.
+        return f"side:{reference.index}"
     if generator_name in (constants.NGON, constants.NSIDE):
         # Both carry a segment count per side rather than per direction: an
         # n-gon because every side is its own edge run, an N-Side because side

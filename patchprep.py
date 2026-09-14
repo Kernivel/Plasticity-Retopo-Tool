@@ -149,8 +149,7 @@ def prepare_patch(
 
 def group_side_points(
     subsides: "list[list[mathutils.Vector]]",
-    total: int,
-    pinned: dict[int, int] | None = None,
+    counts: list[int],
 ) -> "list[mathutils.Vector]":
     """One polyline for a group, carrying exactly `total` segments.
 
@@ -169,10 +168,10 @@ def group_side_points(
     points it was given when the count already matches, which is the same thing
     that makes a matched side work.
 
-    `pinned` fixes a sub-side's count -- that is a side carrying a committed
-    neighbour's own vertices, which may not be resampled off them.
+    `counts` is the allocation, computed once by the caller: the spans the
+    matching is checked against have to be the very numbers the polyline is
+    built from, and two calls to the allocator could only ever agree by luck.
     """
-    counts = allocate_group_segments(subsides, total, pinned)
     points: list = []
     for sub, count in zip(subsides, counts):
         resampled = geometry.resample_polyline_by_arclength(sub, count + 1)
@@ -189,11 +188,15 @@ def allocate_group_segments(
     """`total` segments shared out over the sub-sides, by arc length.
 
     At least one each, because a sub-side with none has lost its end corner,
-    which is the whole reason this exists. The caller floors the span at the
-    sub-side count for the same reason, so the only way this can run short is a
-    pin set that cannot fit -- and then the pins are dropped **whole**, exactly
-    as `ring.allocate_segments` does and for the same reason: half a pin set is
-    half a weld, which is a crack down a boundary that was arranged to close.
+    which is the whole reason this exists.
+
+    `pinned` fixes a sub-side's count: that is a side carrying a committed
+    neighbour's own vertices, which may not be resampled off them. The caller
+    floors the group's span at `sum(pinned) + free`, so a pin set normally
+    fits; when it cannot -- the span was typed down since -- the pins are
+    dropped **whole**, exactly as `ring.allocate_segments` does and for the
+    same reason: half a pin set is half a weld, which is a crack down a
+    boundary that had just been arranged to close.
     """
     count = len(subsides)
     if count == 0:
