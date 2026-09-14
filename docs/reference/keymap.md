@@ -5,9 +5,6 @@ them in the addon's preferences — the panel's **Keybinds** tab has a button th
 opens the page — or find them under
 `Preferences > Keymap > Add-ons > 3D View`.
 
-They are ordinary rows: click the key field, press a new key, and the restore
-arrow puts one back.
-
 ## While adjusting a patch
 
 | Key | Action |
@@ -46,8 +43,6 @@ arrow puts one back.
 | <kbd>/</kbd> | Isolate, retopology included |
 | <kbd>Ctrl</kbd> + <kbd>Z</kbd> | Blender's undo — one step per committed patch |
 
-Wheel without <kbd>Ctrl</kbd> still zooms.
-
 ## Three keys, one <kbd>Tab</kbd>
 
 <kbd>Tab</kbd> is bound to three actions with mutually exclusive conditions, and
@@ -61,10 +56,6 @@ the phase decides which runs:
 | **Tweak** | come back from it |
 | *no session* | Blender's own Edit Mode toggle |
 
-In **Adjust** on a single-span generator it is still swallowed — a patch is open
-and letting Blender toggle Edit Mode would take the session out from under it —
-but it **reports** that rather than doing nothing. A key that does nothing and
-says nothing reads as a captured key.
 
 ## Not remappable
 
@@ -78,38 +69,8 @@ cursor. Taking the side is a normal binding like any other.
 
 ## Outside a session
 
-**No key of the addon's is live outside a session.** The three global ones
-(<kbd>/</kbd>, <kbd>Alt</kbd>+<kbd>X</kbd>, <kbd>V</kbd>) are
-all keys something else wants — Hard Ops binds `Alt+X`, and <kbd>/</kbd> is
-Blender's own isolate — and an addon that has to be *disabled* to give a key back
-is not self-contained.
+**No key of the addon's is live outside a session.** 
 
 With no session open, those events are handed straight on: Blender's own binding,
 or the other addon's, runs unchanged.
 
-**Keep Global Keys Outside a Session** is an addon *preference* (per user, not
-per file) for anyone who wants the isolate and the mirror between sessions.
-
-Panel buttons are unaffected — the mirror's UI is bound to nothing and works
-whenever there is a result mesh.
-
-## Why the modal dispatches them
-
-Session keys are resolved by the modal operator itself rather than being left to
-fall through to the keymap. A keymap item in *3D View* does not reliably beat one
-in a *mode* keymap, and the session's keys collide with those constantly:
-<kbd>X</kbd> is `object.delete` in Object Mode, <kbd>Tab</kbd> is
-`object.editmode_toggle` in Object Non-modal.
-
-That was not a cosmetic failure. With <kbd>X</kbd> falling through, pressing it on
-a patch that turned out not to be committed reached `object.delete` and **took the
-CAD object with it**.
-
-The modal sits above every keymap, so dispatching there always wins — and the
-items stay real, so Blender's rows edit them and your preferences save them. The
-two keys Blender claims (<kbd>X</kbd>, <kbd>Tab</kbd>) are consumed even when the
-action refuses, and it says why; everything else falls through on purpose, so
-<kbd>N</kbd> outside Adjust still opens the sidebar.
-
-The viewport hints at the bottom read the **live** items, so they follow a
-remapping rather than saying what the default was.

@@ -37,7 +37,9 @@ to avoid manually scrolling the spans too much.
 |---|---|---|---|---|---|
 | relative to computed | ¼ | ½ | 1 | 2 | 4 |
 
-!!! tip "For a low poly game ready mesh, I recommend Very Low as a base and then tweak the density from there."
+!!! tip Low poly density
+
+    "For a low poly game ready mesh, I recommend Very Low as a base and then tweak the density from there."
 
 
 ## Using N-gons
@@ -47,7 +49,8 @@ Regular spanning can create weird grids when working surfaces that have too many
 In this cas creating an N-gon that matches the neighbor quad patches is usually easier.
 
 ## Complex cases
-!! warning "Complex geometry"
+
+!!! warning "Complex geometry"
 
     If you have a complex case, with a single surface containing, rings, holes and curved surfaces,
     the addon might not be able to produce a patch that would be acceptable.

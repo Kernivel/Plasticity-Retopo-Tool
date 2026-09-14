@@ -51,22 +51,24 @@ nav:
   - Home: index.md
   - Getting started:
       - Installation: installation.md
-      - Your first patch: first-patch.md
+      - First steps: first-patch.md
       - General: general.md
-  - Guide:
-      - Matching a neighbour: guide/matching.md
-      - One patch, several surfaces: guide/multi-surface.md
-      - N-gon mode: guide/ngon.md
-      - Faces with a hole: guide/rings.md
+      - Complex cases help: guide/complexcases.md
+  - Tools:
+      - Neighbour Matching: guide/matching.md
+      - Multi surfaces: guide/multi-surface.md
+      - Flat N-gon: guide/ngon.md
       - Symmetry: guide/symmetry.md
-      - Hand-editing the result: guide/hand-editing.md
-      - Seeing the CAD structure: guide/cad-structure.md
+      - Hand-edits: guide/hand-editing.md
+  -  Visualisation:
+      - CAD structure: guide/cad-structure.md
   - How it works:
       - Overview: how-it-works/index.md
       - 1. Identifying a patch: how-it-works/patches.md
       - 2. Choosing a generator: how-it-works/generators.md
       - 3. Matching a neighbour: how-it-works/matching.md
       - 4. Committing: how-it-works/commit.md
+      - Rings: guide/rings.md
   - Reference:
       - Keymap: reference/keymap.md
       - The N-panel: reference/panel.md
