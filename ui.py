@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 
 import bpy
 
+from . import bridge
 from . import cad_display
 from . import constants
 from . import keymap
@@ -943,6 +944,62 @@ def _draw_tab_system(
         _draw_patch_debug(layout, state, obj)
 
 
+def _draw_tab_bridge(
+    layout: bpy.types.UILayout,
+    context: bpy.types.Context,
+) -> None:
+    """The Plasticity bridge's own panel, drawn here.
+
+    Delegated, never rebuilt: `bridge.draw_bridge_panel` calls the bridge's own
+    `PlasticityPanel.draw` with this layout, so Connect / Server / Disconnect /
+    Refresh / Refacet are the rows that addon draws, and they follow its
+    updates without anything here being touched. Rebuilding them would be a
+    second, worse copy of a UI whose author is free to change it.
+
+    The version note is the only thing this addon adds, and it is deliberately
+    the whole of the "are the bridge's settings right" question for now: the
+    facet settings are not checkable against anything, because this addon reads
+    a triangulated and an n-gon export alike (`patch_data.group_report` reports
+    which, and requires neither). A warning with no criterion behind it would
+    send people re-exporting to fix something that was never broken.
+    """
+    body = layout.box().column()
+    body.label(text="Plasticity Bridge", icon='EVENT_P')
+
+    status = bridge.status()
+    if not status.installed:
+        body.separator()
+        col = body.column(align=True)
+        for line in _wrapped(
+            "The Plasticity bridge addon was not found. It is what imports the "
+            "meshes this addon retopologizes -- install and enable it, and its "
+            "panel appears here."
+        ):
+            col.label(text=line)
+        col.label(text="github.com/nkallen/plasticity-blender-addon", icon='URL')
+        return
+
+    note = bridge.version_note()
+    if note:
+        warn = body.box().column(align=True)
+        # Untested is not broken, so this informs rather than alerts. The one
+        # thing it must do is be readable on the day a patch lands on the wrong
+        # face, which is what a changed import contract looks like from here.
+        warn.label(text="Bridge version", icon='INFO')
+        for line in _wrapped(note):
+            warn.label(text=line)
+
+    body.separator()
+    failed = bridge.draw_bridge_panel(body, context)
+    if failed:
+        alert = body.box().column(align=True)
+        alert.alert = True
+        for line in _wrapped(failed):
+            alert.label(text=line)
+        alert.label(text=f"Retop is tested against bridge "
+                         f"{bridge.version_string(bridge.TESTED_VERSION)}.")
+
+
 class VIEW3D_PT_retop(bpy.types.Panel):
     bl_label = "Retop"
     bl_idname = "VIEW3D_PT_retop"
@@ -1005,6 +1062,8 @@ class VIEW3D_PT_retop(bpy.types.Panel):
             _draw_tab_keys(layout, state)
         elif tab == 'SYSTEM':
             _draw_tab_system(layout, state, obj)
+        elif tab == 'BRIDGE':
+            _draw_tab_bridge(layout, context)
 
 
 CLASSES = (VIEW3D_PT_retop,)

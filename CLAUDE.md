@@ -297,6 +297,7 @@ this before anything else when a patch dices strangely far from the origin.
 | `sides.py` | corner detection (angle and/or topology), corner *ranking*, split loop into sides, merge small sides |
 | `geometry.py` | Coons/transfinite grids, arc-length resampling, BVH, reprojection, the interior relaxation and the cell-quality measure it steers by |
 | `generators/` | one generator per patch type; `find_generator(n_sides)` picks the first match |
+| `bridge.py` | detecting the Plasticity bridge addon and delegating to its own panel; registers nothing |
 | `cad_display.py` | B-rep edges/vertices recovered from `face_ids`, the derived surface flow, and the raw group data behind the patch debug display — all cached, for the overlay |
 | `patchprep.py` | one face → `PreparedPatch`: corners resolved, boundary split into sides, planarity |
 | `sidematch.py` | side references, what each may match, pin kinds, span-collision resolution, substitution |
@@ -1815,6 +1816,59 @@ The cost: a curvature-selected n-gon side does not line up point-for-point with
 a *grid* neighbour along a shared edge, so only their shared corners weld. Side
 matching buys that back exactly — a matched side is handed the neighbour's own
 vertices — and `ngon_match_neighbours` does it without being asked.
+
+## The bridge's panel, inside ours (`bridge.py`)
+
+The first thing anyone does after changing the part in Plasticity is a
+**Refresh** in the bridge's panel, which means leaving the Retop tab and coming
+back. So the bridge's panel is drawn in a Retop tab of its own.
+
+**Delegated, never rebuilt.** `bridge.draw_bridge_panel` calls the bridge's own
+`PlasticityPanel.draw` with a layout of our choosing, so Connect / Server /
+Disconnect / Refresh / Refacet are literally its rows and they follow its
+updates for free. That is safe because that `draw` touches `self` only through
+`self.layout` -- everything else it reads comes from `context.scene` and its own
+module-level client -- and `_PanelProxy` is what supplies a different layout, so
+the rows land inside our box instead of at the top of the N-panel.
+
+**Nothing is vendored, and the licence is not the reason.** The bridge is MIT
+((c) 2023 Plastic Software, LLC), so bundling it would be permitted. It would
+also register the same classes the user's own copy does -- `wm.connect_button`,
+`wm.list`, `OBJECT_PT_plasticity_panel` and a dozen
+`bpy.types.Scene.prop_plasticity_*`, all fixed -- so whichever unregistered
+first would strip the other's scene properties out from under it: the
+"already registered as a subclass" restart-Blender failure `__init__.register`'s
+unwind exists to survive, walked into deliberately. And it would not buy the
+version safety it looks like it buys, because the protocol is negotiated with
+**Plasticity itself** at the handshake (the client fills `supported_messages`
+from what the server advertises). A frozen client is the one that stops
+speaking when Plasticity updates; the user's own, kept current, does not.
+
+**The version is reported, never enforced.** The contract this addon reads is
+`groups` / `face_ids`, and a bridge that keeps it works whatever its version
+says -- so `version_note` is silent on the tested version and on anything older
+within the same major, says "untested, not known to be wrong" for a newer one,
+and names the import contract for a newer *major*, which is what a patch
+landing on the wrong face would mean. A check that blocked would turn every
+bridge update into a broken addon, which is the failure it exists to warn about.
+The facet settings are deliberately **not** checked: this addon reads a
+triangulated and an n-gon export alike (`patch_data.group_report` reports which
+and requires neither), so a warning there would have no criterion behind it and
+would send people re-exporting to fix something that was never broken.
+
+**Every read goes through `getattr` with a default, and the draw cannot raise.**
+A panel draw that raises leaves a blank tab and a message in a console nobody
+has open, which is indistinguishable from a feature that does not work. So a
+renamed property comes back as a default, and `draw_bridge_panel` *returns* its
+exception as a sentence for the caller to print under the rows the bridge had
+already emitted. Detection matches `bl_info["name"] == "Plasticity"` **and** a
+`plasticity_client` attribute, never the folder name: that is
+`plasticity-blender-addon`, `-main`, or `bl_ext.*` depending on how it was
+installed, and this addon's own package name contains "plasticity" too. The
+lookup is memoised with a short TTL, since a panel draws on every mouse move
+across it and the answer changes only when an addon is enabled or disabled --
+which is also why the bridge appearing mid-session heals itself.
+`tests/test_bridge.py`.
 
 ## Keys (`keymap.py`, `prefs.py`)
 

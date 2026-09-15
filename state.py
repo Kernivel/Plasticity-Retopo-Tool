@@ -699,6 +699,12 @@ class RetopPatchState(bpy.types.PropertyGroup):
              'OUTLINER_COLLECTION', 3),
             ('KEYS', "Keybinds", "Keyboard and mouse bindings of the session", 'EVENT_A', 4),
             ('SYSTEM', "System", "Version and addon reloading", 'PREFERENCES', 5),
+            # Last, not first, although the bridge is where the pipeline starts:
+            # the tabs are drawn in list order, so putting it first would shift
+            # every existing one along and cost the muscle memory of everyone
+            # who already uses them. Move it if it earns the first slot.
+            ('BRIDGE', "Bridge", "The Plasticity bridge's own panel, drawn here",
+             'EVENT_P', 6),
         ],
         default='PATCH',
     )
