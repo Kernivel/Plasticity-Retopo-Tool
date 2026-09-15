@@ -25,10 +25,32 @@ and enable *Plasticity Retop*. Updating means installing the newer zip over it.
 
 ## Main features
 
+### Intuitive
+
+Intuitive view of the retopology with CAD edges, Isolate and overlaying options.
+
 ### Matching a neighbour
 
 Weld neighboor patches together.
 
-## Hand tweaks
+### Plasticity like controls
 
-Intuitive handling using Plasticity workflow when retopologizing and easy access to Blender bases edit tools to correct the topology mid-session.
+Intuitive handling using Plasticity workflow when retopologizing.
+
+### Easy access to edit mode
+
+Easy access to Blender bases edit tools to correct the topology mid-session.
+
+### Multi Select
+
+Group surfaces together to create a single patch
+
+### N gon Flat faces
+
+For patching faces that ate complex with holes but don't require spanning.
+
+### Edge flow channel
+
+Set up the grouping of edges used when creating the patch to control the edge flow.
+
+

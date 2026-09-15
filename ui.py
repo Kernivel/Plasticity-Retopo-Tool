@@ -785,12 +785,7 @@ def _draw_tab_keys(
     box.operator("retop.open_keymap_prefs", text="Edit Keybinds…",
                  icon='PREFERENCES')
     box.label(text="Also: Preferences > Keymap > Add-ons")
-    box.separator()
-    # Which keys are live when is the first thing anyone asks after a key of
-    # theirs stops working, so it is said here rather than only in the manual.
-    box.label(text="Keys are live only during a session", icon='INFO')
-    box.label(text="Outside one they fall through to Blender")
-    box.label(text="and to other addons (Hard Ops' Alt+X)")
+
 
 
 def _draw_patch_debug(
