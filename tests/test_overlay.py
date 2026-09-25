@@ -172,7 +172,7 @@ state.session_phase = 'ADJUST'
 state.ngon_mode = True
 ngon_binds = dict(overlay.keybinds_for(state))
 check("N-gon mode offers Ctrl+Scroll for detail, not for a span it has not got",
-      ngon_binds.get("Ctrl+Scroll") == "Detail +/-", ngon_binds)
+      ngon_binds.get("Ctrl+Scroll", "").startswith("Detail +/-"), ngon_binds)
 state.ngon_mode = False
 grid_binds = dict(overlay.keybinds_for(state))
 check("a grid offers it for the span", "Span" in grid_binds.get("Ctrl+Scroll", ""),

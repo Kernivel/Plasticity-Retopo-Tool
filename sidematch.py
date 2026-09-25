@@ -1076,6 +1076,60 @@ def applied_side_counts() -> dict[int, dict[int, int]]:
     return counts
 
 
+def ngon_group_key(run: "list[int]") -> str:
+    """The key an n-gon group's vertex count is stored under: its sides.
+
+    The sides themselves rather than the group number, so a count follows the
+    exact run it was set on. Regroup the sides and the old count simply stops
+    applying; put them back and it comes back with them.
+    """
+    return ",".join(str(index) for index in sorted(run))
+
+
+def ngon_group_counts(state: "state_mod.RetopPatchState") -> dict[str, int]:
+    """{group key: segments} the user set with Ctrl+wheel in n-gon mode."""
+    raw = getattr(state, "ngon_group_counts", "")
+    if not raw:
+        return {}
+    try:
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(stored, dict):
+        return {}
+    counts = {}
+    for key, value in stored.items():
+        try:
+            counts[str(key)] = max(1, int(value))
+        except (TypeError, ValueError):
+            continue
+    return counts
+
+
+def set_ngon_group_counts(
+    state: "state_mod.RetopPatchState", counts: dict[str, int]
+) -> None:
+    state.ngon_group_counts = (json.dumps(dict(sorted(counts.items())))
+                               if counts else "")
+
+
+def ngon_runs(
+    references: "list[SideReference] | list[SideSlot]",
+    state: "state_mod.RetopPatchState",
+) -> "list[list[int]]":
+    """The side runs an n-gon's vertex counts apply to.
+
+    The user's grouping when it is usable, one run per side otherwise: an
+    invalid grouping is kept and reported, exactly as on a grid, and the sides
+    stay individually adjustable in the meantime.
+    """
+    numbers = group_numbers(references, state)
+    at_fault, _message = group_problems(references, numbers)
+    if at_fault:
+        return [[reference.index] for reference in references]
+    return group_runs(references, numbers)
+
+
 def ngon_side_segments(
     prepared: "patchprep.PreparedPatch", matched_counts: dict[int, int]
 ) -> list[dict[int, int]]:

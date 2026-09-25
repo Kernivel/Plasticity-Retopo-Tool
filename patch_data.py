@@ -43,7 +43,7 @@ Neighbours = list[int | None]
 # vertex index -> position in the mesh's local space
 Positions = dict[int, "mathutils.Vector"]
 # What `mesh_fingerprint` returns -- compared, never inspected.
-Fingerprint = tuple[int, int, int, int, int, int]
+Fingerprint = tuple[int, int, int, int, int, int, int]
 
 
 @dataclass
@@ -119,6 +119,16 @@ COMPOSITE_ID_BASE = -1000
 # what the bridge writes `groups`/`face_ids` on -- a composite is a statement
 # about the same data those are.
 COMPOSITE_PROP = "retop_composites"
+# One point per surface of each composite, in mesh local space, parallel to its
+# surface list: {"-1000": [[x, y, z], ...]}. A face id is only a name, and
+# Plasticity renames faces -- a whole block of them shifted by a constant on a
+# real part, with no vertex moving -- so a composite that remembered nothing but
+# names could only be reported as lost. The position of a point inside each
+# surface is what survives a renumbering, and
+# `mesh_build.reanchor_composites` reads the surfaces back from it.
+# Kept apart from COMPOSITE_PROP so `mesh_fingerprint`, which reads that one,
+# is not invalidated by bookkeeping that changes nothing about the patches.
+COMPOSITE_ANCHORS_PROP = "retop_composite_anchors"
 
 
 def read_composites(mesh: "bpy.types.Mesh") -> dict[int, list[int]]:
@@ -158,6 +168,84 @@ def write_composites(
             {str(key): list(surfaces) for key, surfaces in sorted(composites.items())})
     elif mesh.get(COMPOSITE_PROP) is not None:
         del mesh[COMPOSITE_PROP]
+    _write_composite_anchors(mesh, composites)
+
+
+def read_composite_anchors(
+    mesh: "bpy.types.Mesh",
+) -> dict[int, list[tuple[float, float, float]]]:
+    """The anchors stored beside the composites: {composite id: [point per
+    surface]}, each list parallel to that composite's surface list."""
+    raw = mesh.get(COMPOSITE_ANCHORS_PROP)
+    if not raw:
+        return {}
+    try:
+        stored = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    anchors: dict[int, list[tuple[float, float, float]]] = {}
+    for key, points in (stored or {}).items():
+        try:
+            anchors[int(key)] = [(float(p[0]), float(p[1]), float(p[2])) for p in points]
+        except (TypeError, ValueError, IndexError):
+            continue
+    return anchors
+
+
+def surface_anchor_points(
+    mesh: "bpy.types.Mesh", surfaces: "Sequence[int]"
+) -> list[tuple[float, float, float]] | None:
+    """A point strictly inside each of `surfaces`, or None if one has no polygon.
+
+    A polygon *centre*, never the mean of the surface: the mean of a concave
+    face is outside it and the mean of an annulus is in its hole. The polygon
+    nearest that mean is on the surface by construction, and its centre is
+    inside the polygon rather than on an edge another surface shares -- which is
+    what lets the nearest-polygon lookup that reads it back be unambiguous.
+    """
+    face_id_of_poly, _declared = polygon_face_ids(mesh)
+    wanted = set(surfaces)
+    centres: dict[int, list[tuple[float, float, float]]] = {s: [] for s in wanted}
+    for poly in mesh.polygons:
+        face_id = face_id_of_poly[poly.index]
+        if face_id in wanted:
+            centres[face_id].append(tuple(poly.center))
+    points = []
+    for surface in surfaces:
+        own = centres.get(surface)
+        if not own:
+            return None
+        count = len(own)
+        mean = tuple(sum(c[i] for c in own) / count for i in range(3))
+        points.append(min(own, key=lambda c: sum((c[i] - mean[i]) ** 2 for i in range(3))))
+    return points
+
+
+def _write_composite_anchors(
+    mesh: "bpy.types.Mesh", composites: dict[int, list[int]]
+) -> None:
+    """Anchor every composite whose surfaces the mesh still declares.
+
+    One that no longer applies keeps the anchors it had: those are exactly what
+    will find its surfaces again, and recomputing them from surfaces that are
+    gone would have nothing to read.
+    """
+    previous = read_composite_anchors(mesh)
+    declared = set(mesh.get("face_ids") or ())
+    anchors: dict[int, list[tuple[float, float, float]]] = {}
+    for composite_id, surfaces in composites.items():
+        points = None
+        if declared.issuperset(surfaces):
+            points = surface_anchor_points(mesh, surfaces)
+        if points is None:
+            points = previous.get(composite_id)
+        if points is not None and len(points) == len(surfaces):
+            anchors[composite_id] = points
+    if anchors:
+        mesh[COMPOSITE_ANCHORS_PROP] = json.dumps(
+            {str(key): [list(p) for p in points] for key, points in sorted(anchors.items())})
+    elif mesh.get(COMPOSITE_ANCHORS_PROP) is not None:
+        del mesh[COMPOSITE_ANCHORS_PROP]
 
 
 def next_composite_id(composites: dict[int, list[int]]) -> int:
@@ -938,20 +1026,29 @@ def mesh_fingerprint(mesh: "bpy.types.Mesh") -> Fingerprint:
     return geometry_fingerprint(mesh) + (zlib.crc32(composites.encode("utf-8")),)
 
 
-def geometry_fingerprint(mesh: "bpy.types.Mesh") -> "tuple[int, int, int, int, int]":
+def geometry_fingerprint(mesh: "bpy.types.Mesh") -> "tuple[int, int, int, int, int, int]":
     """The same, minus the composites -- what the mesh's own surfaces depend on.
 
     Kept apart so that building a composite does not invalidate everything that
     describes the *model*: the B-rep edges and vertices `cad_display` draws are
     the same curves before and after, and rebuilding them on every Shift+click
     would be a full re-parse for a picture that did not change.
+
+    The ids the bridge wrote are part of it, not only their count: Plasticity
+    renames faces without moving a vertex (a whole block shifted by a constant,
+    on a real part), and a fingerprint blind to that kept handing back the
+    patches under their old names until something else invalidated the cache.
+    One entry per *face*, not per polygon, so it costs next to nothing.
     """
     count = len(mesh.vertices)
     coords = array.array("f", bytes(4 * 3 * count))
     if count:
         mesh.vertices.foreach_get("co", coords)
+    face_ids = mesh.get("face_ids") or ()
+    ids = array.array("q", face_ids)
+    ids.extend(mesh.get("groups") or ())
     return (count, len(mesh.polygons), len(mesh.loops),
-            len(mesh.get("face_ids") or ()), zlib.crc32(coords.tobytes()))
+            len(face_ids), zlib.crc32(coords.tobytes()), zlib.crc32(ids.tobytes()))
 
 
 # mesh name -> (fingerprint, MeshPatches). Keyed by name rather than by the

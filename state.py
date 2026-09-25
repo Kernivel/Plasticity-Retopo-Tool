@@ -574,6 +574,12 @@ class RetopPatchState(bpy.types.PropertyGroup):
     # clicks, then accept or cancel -- so it owes the user a way out that does
     # not commit the patch.
     side_groups_backup: bpy.props.StringProperty(name="Group Backup", default="")
+    # {group key: segments} as JSON, set with Ctrl+wheel over a side in n-gon
+    # mode. A group of sides is resampled evenly to that count, split over its
+    # sides by length so the corners inside it stay vertices. Per patch, like
+    # the grouping it is keyed on (see `sidematch.ngon_group_key`).
+    ngon_group_counts: bpy.props.StringProperty(
+        name="N-gon Side Counts", default="")
 
     # --- retop session (see operators.RETOP_OT_session) ---
     session_active: bpy.props.BoolProperty(name="Session Active", default=False)

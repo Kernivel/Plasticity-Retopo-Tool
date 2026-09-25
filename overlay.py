@@ -378,7 +378,7 @@ def keybinds_for(
     span_key = _pair_label("span_more", "span_less")
     if getattr(state, "ngon_mode", False):
         binds = [
-            (span_key, "Detail +/-"),
+            (span_key, "Detail +/- (on a side: its vertices)"),
             (key("ngon_mode"), "Back to grid"),
         ]
     else:

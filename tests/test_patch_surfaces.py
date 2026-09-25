@@ -20,6 +20,7 @@ Each of them asserts the single-surface behaviour too. A test that only said
 where gathering surfaces did nothing at all.
 """
 import importlib
+import inspect
 import os
 import sys
 
@@ -465,6 +466,70 @@ check("taking the patch off the mesh with it",
       patch_data.read_composites(mesh) == {}
       and state.pending_composite_id == -1)
 check("and leaving the session running", state.session_active)
+
+
+# ---------------------------------------------------------------------------
+# 10. The preview does not cover the pick
+#
+# The tint on the picked surfaces is depth-tested, and a solid preview lifted
+# over them hid it -- and with one surface picked, the hover kept laying a grid
+# over whichever surface the cursor crossed. While a pick is open the preview is
+# drawn as wire, and the hover leaves it alone.
+# ---------------------------------------------------------------------------
+_session_cls = pr.operators.RETOP_OT_session
+
+
+class _HoverSelf:
+    _set_hover = _session_cls._set_hover
+    _clear_hover = _session_cls._clear_hover
+    _hover_obj = None
+    _hover_face_id = None
+    _hover_committed = False
+    _hover_ngon = False
+
+
+preview = lambda: bpy.data.objects.get(pr.mesh_build.PREVIEW_OBJ_NAME)
+hover = _HoverSelf()
+state.session_phase = 'PATCH'
+check("no pick: the hover builds a preview",
+      hover._set_hover(bpy.context, obj, 10) and pr.mesh_build.has_preview())
+check("drawn solid", preview().display_type == 'TEXTURED', preview().display_type)
+
+operators.toggle_patch_surface(bpy.context, obj, 10)
+check("one surface picked: the preview is cleared", not pr.mesh_build.has_preview())
+hover._set_hover(bpy.context, obj, 11)
+check("and the hover does not lay a grid over the next surface",
+      not pr.mesh_build.has_preview())
+check("while still recording what is under the cursor", hover._hover_face_id == 11)
+
+operators.toggle_patch_surface(bpy.context, obj, 11)
+check("two picked: the preview is the patch they make", pr.mesh_build.has_preview())
+check("drawn as wire so the tint shows through",
+      preview().display_type == 'WIRE' and not preview().show_in_front,
+      (preview().display_type, preview().show_in_front))
+
+operators.discard_pending_composite(bpy.context)
+hover._clear_hover(bpy.context)
+check("dropping the pick draws the preview solid again",
+      preview().display_type == 'TEXTURED', preview().display_type)
+
+state.surface_hover_face_id = 12
+check("holding Shift over a surface counts as picking",
+      pr.mesh_build.surface_pick_open(state))
+state.surface_hover_face_id = -1
+state.session_phase = 'ADJUST'
+state.surface_selection = "10"
+check("and nothing outside the PATCH phase does",
+      not pr.mesh_build.surface_pick_open(state))
+state.surface_selection = ""
+state.session_phase = 'PATCH'
+
+# A click on empty space abandons the pick, the same as Esc.
+modal_source = inspect.getsource(_session_cls._modal)
+check("the modal drops a pick on a click over nothing",
+      "if self._hover_face_id is None:" in modal_source
+      and "discard_pending_composite(context)" in modal_source.split(
+          "if self._hover_face_id is None:", 1)[1].split("return", 1)[0])
 
 pr.operators.end_session(bpy.context)
 

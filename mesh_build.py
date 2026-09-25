@@ -78,6 +78,13 @@ COLLECTION_NAME = "Retop"
 # connection name), so mirroring starts *below* Inbox.
 INBOX_COLLECTION_NAME = "Inbox"
 SHARP_EDGE_ATTR = "sharp_edge"
+# What the addon last wrote into `sharp_edge`, and the user's own choice where
+# it differs. See `apply_result_shading`.
+SHARP_WRITTEN_ATTR = "retop_sharp_written"
+SHARP_USER_ATTR = "retop_sharp_user"
+SHARP_USER_NONE = 0
+SHARP_USER_ON = 1
+SHARP_USER_OFF = 2
 SOURCE_VID_ATTR = "retop_source_vid"
 BOUNDARY_ATTR = "retop_is_boundary"
 # Plasticity face ids arrive from the bridge as int32 (client.py decodes them
@@ -202,6 +209,7 @@ def register_patch_settings(
     span: int,
     generator_name: str,
     side_groups: str = "",
+    ngon_group_counts: str = "",
 ) -> None:
     """Record what a just-committed patch was built with, so re-selecting it
     later comes back with those exact spans rather than recomputed defaults.
@@ -223,6 +231,7 @@ def register_patch_settings(
         "span": span,
         "generator": generator_name,
         "side_groups": side_groups,
+        "ngon_group_counts": ngon_group_counts,
     }
     save_patch_settings_table(result_obj, table)
 
@@ -334,14 +343,18 @@ def is_patch_committed(source_obj: bpy.types.Object, face_id: int) -> bool:
 
 
 def _source_patch_lookup(
-    source_obj: bpy.types.Object, result_obj: bpy.types.Object
+    source_obj: bpy.types.Object,
+    to_source_local: mathutils.Matrix,
+    surfaces: bool = False,
 ) -> Callable[[mathutils.Vector], int | None] | None:
-    """Return f(co) -> Plasticity face id for a point of `result_obj`'s mesh,
-    by nearest source polygon, or None if the source has no usable geometry.
+    """Return f(co) -> patch id under a point, by nearest source polygon, or
+    None if the source has no usable geometry. `co` is mapped into the source's
+    local space by `to_source_local`.
 
-    This is how retopology that carries no patch id is matched back to the CAD
-    face it belongs to: the retopology sits on the surface, so the closest
-    source polygon to one of its points names the patch.
+    This is how a result face is matched back to the CAD face it sits on: the
+    retopology lies on the surface, so the closest source polygon to a point
+    inside it names the patch. With `surfaces` the answer is the raw Plasticity
+    surface, never a composite -- what re-finding a composite's surfaces needs.
     """
     from . import geometry
 
@@ -349,12 +362,10 @@ def _source_patch_lookup(
     if len(src_mesh.polygons) == 0:
         return None
 
-    face_id_of_poly = patch_data.analyse(src_mesh).face_id_of_poly
+    analysis = (patch_data.analyse_surfaces(src_mesh) if surfaces
+                else patch_data.analyse(src_mesh))
+    face_id_of_poly = analysis.face_id_of_poly
     bvh, tri_poly = geometry.build_bvh_with_polygon_map(src_mesh)
-    # The BVH is in the source object's local space; result geometry is stored
-    # in world space (i.e. under an identity object matrix, unless the user
-    # moved the result object since).
-    to_source_local = source_obj.matrix_world.inverted() @ result_obj.matrix_world
 
     def face_id_at(co: mathutils.Vector) -> int | None:
         hit = bvh.find_nearest(to_source_local @ co)
@@ -365,71 +376,445 @@ def _source_patch_lookup(
     return face_id_at
 
 
-def adopt_untracked_faces(source_obj: bpy.types.Object) -> int:
-    """Tag result faces that carry no patch id with the Plasticity face they
-    sit on, and return how many were tagged.
+def _result_to_source(
+    source_obj: bpy.types.Object, result_obj: bpy.types.Object
+) -> mathutils.Matrix:
+    # Result geometry is stored in world space (an identity object matrix,
+    # unless the user moved the result object since); the source's BVH is in
+    # its own local space, which carries the bridge's unit scale.
+    return source_obj.matrix_world.inverted() @ result_obj.matrix_world
 
-    Needed for result meshes committed before patch tracking existed (or by
-    hand): without a face id nothing links them to a patch, so re-picking that
-    patch can't know it already has geometry to replace.
 
-    Votes are collected from the face centre (weighted, it's the point most
-    safely *inside* the patch) plus its vertices, and a face is only *tagged* on
-    a strict majority -- a tag is permanent, so it had better be right.
-    Removing a patch for a re-edit uses the looser rule in
-    remove_patch_from_result: that one is visible on screen and undoable.
+# --- keeping the tracking true to the part ---
+#
+# A face id is a *name*, and Plasticity renames faces. Measured on a real part:
+# 50 of the 60 patch ids a result mesh carried were gone from the source, a
+# whole block of faces shifted by exactly -3506, with no vertex moving and no
+# re-import anyone asked for -- the bridge's Refresh simply delivered the new
+# names. Every face then read as never retopologized, and picking one built a
+# second grid over the first. So a tag is only ever trusted as far as the
+# geometry agrees with it, and the geometry is what puts it right.
+#
+# Two rules make the vote safe on a border. It samples points *inside* the face
+# -- the centre, and each corner pulled a share of the way towards it -- since a
+# vertex lying on the border between two surfaces is equally near both and its
+# answer is a coin toss. And a renamed patch is translated as a **whole**: every
+# face carrying the old id votes together and the majority names the new one,
+# so the few faces along its border are outvoted by the ones across it. Only a
+# face that belongs to no group -- untracked, or made by hand -- is decided on
+# its own, and only one the surface cannot decide is handed to its neighbours.
+
+# Share of the way from a face corner to the face centre that the vote samples
+# at. Anything above zero takes the sample off the border it may lie on.
+ADOPTION_PULL = 0.25
+ADOPTION_CENTRE_WEIGHT = 2
+# A tag the source still declares is re-read only when this small a share of
+# its own faces sit on it. Higher would start second-guessing patches whose
+# faces merely hang over a neighbour; this low, the tag is a coincidence -- an
+# old name some other face has since been given.
+KNOWN_TAG_MIN_SHARE = 0.25
+# Result object property: the source's signature (`source_signature`) as of the
+# last reconciliation. When it moves, the part was re-sent and every id --
+# face, vertex, composite surface -- is checked against the geometry once.
+SOURCE_SIGNATURE_PROP = "retop_source_signature"
+# How far a CAD corner may be from the source vertex it is re-attached to after
+# the source changed, as a share of the model's diagonal. A corner is an exact
+# copy of a source vertex, so after a renumbering the right one sits at
+# distance ~0; anything farther is a different vertex.
+SOURCE_ID_REMAP_RATIO = 1e-4
+
+
+def _vote_face(
+    face_at: Callable[[mathutils.Vector], int | None],
+    mesh: bpy.types.Mesh,
+    poly: bpy.types.MeshPolygon,
+    votes: dict[int, int],
+) -> None:
+    centre = poly.center
+    fid = face_at(centre)
+    if fid is not None:
+        votes[fid] = votes.get(fid, 0) + ADOPTION_CENTRE_WEIGHT
+    for vi in poly.vertices:
+        fid = face_at(mesh.vertices[vi].co.lerp(centre, ADOPTION_PULL))
+        if fid is not None:
+            votes[fid] = votes.get(fid, 0) + 1
+
+
+def _strict_winner(votes: dict[int, int]) -> int | None:
+    if not votes:
+        return None
+    best_id, best_votes = max(votes.items(), key=lambda kv: kv[1])
+    return best_id if best_votes * 2 > sum(votes.values()) else None
+
+
+def _adopt_from_neighbours(mesh: bpy.types.Mesh, tags: list[int], pending: list[int]) -> int:
+    """Give each face in `pending` the tag most of its edges share with tracked
+    faces, and return how many it decided.
+
+    For a face the surface under it cannot decide -- typically one filled in by
+    hand across the gap between two patches. In passes, each reading only what
+    the pass before decided, so the answer does not depend on the order faces
+    are visited in. Tagging it means re-editing that patch deletes it with the
+    rest, which is what a fill against that patch should do; left untracked, it
+    would stay floating over the new grid.
+    """
+    if not pending:
+        return 0
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for poly in mesh.polygons:
+        for key in poly.edge_keys:
+            edge_faces.setdefault(key, []).append(poly.index)
+
+    waiting = set(pending)
+    decided_total = 0
+    while waiting:
+        decided: dict[int, int] = {}
+        for index in waiting:
+            votes: dict[int, int] = {}
+            for key in mesh.polygons[index].edge_keys:
+                for other in edge_faces[key]:
+                    if other != index and other not in waiting and tags[other] != NO_PATCH:
+                        votes[tags[other]] = votes.get(tags[other], 0) + 1
+            winner = _strict_winner(votes)
+            if winner is not None:
+                decided[index] = winner
+        if not decided:
+            break
+        for index, winner in decided.items():
+            tags[index] = winner
+        waiting.difference_update(decided)
+        decided_total += len(decided)
+    return decided_total
+
+
+def _translate_patch_settings(
+    result_obj: bpy.types.Object, translations: dict[int, int]
+) -> None:
+    """Move each renamed patch's record to its new id, all at once.
+
+    At once, because a renumbering can hand an old name to a different face:
+    moving A to B and then B's own record to C one after the other would carry
+    A's record on to C. A record already under the new id wins -- that patch was
+    committed under the current name, most likely over the one being renamed.
+    """
+    table = get_patch_settings_table(result_obj)
+    moved = {key: value for key, value in table.items()
+             if not key.lstrip("-").isdigit() or int(key) not in translations}
+    for old, new in translations.items():
+        entry = table.get(str(old))
+        if entry is not None and str(new) not in moved:
+            moved[str(new)] = entry
+    if moved != table:
+        save_patch_settings_table(result_obj, moved)
+
+
+def adopt_untracked_faces(source_obj: bpy.types.Object, full: bool = False) -> int:
+    """Put every result face's patch id right, and return how many changed.
+
+    Three kinds of face are read against the geometry:
+
+    - **untracked** ones (NO_PATCH, or 0 when the source has no face 0: that is
+      what Blender gives a face made by hand in Edit Mode, and it names nothing);
+      each is decided on its own, then by its neighbours;
+    - faces whose id the source **no longer declares** -- a renamed patch -- as
+      one group per id, translated whole to where the majority of them sit;
+    - with `full`, faces whose id the source still declares but which mostly
+      sit elsewhere (`KNOWN_TAG_MIN_SHARE`): an old name reissued to another
+      face. Only asked when the source has just changed, since it votes every
+      face.
+
+    A tag is only written on a strict majority. Unclaimed faces are never
+    deleted, so a face nothing can decide stays untracked: a misread degrades to
+    a duplicate, never to a hole in a neighbour.
     """
     result_obj = bpy.data.objects.get(result_object_name_for(source_obj))
     if result_obj is None:
         return 0
     mesh = result_obj.data
-    if len(mesh.polygons) == 0:
+    count = len(mesh.polygons)
+    if count == 0:
         return 0
 
-    existing = _patch_ids_of_faces(mesh)
-    if existing and NO_PATCH not in existing:
-        return 0  # everything already tagged: nothing to do
-    if not existing:
-        existing = [NO_PATCH] * len(mesh.polygons)
+    tags = _patch_ids_of_faces(mesh) or [NO_PATCH] * count
+    known = set(patch_data.analyse(source_obj.data).patches)
+    zero_is_untracked = 0 not in known
 
-    face_id_at = _source_patch_lookup(source_obj, result_obj)
-    if face_id_at is None:
+    def untracked(tag: int) -> bool:
+        return tag == NO_PATCH or (tag == 0 and zero_is_untracked)
+
+    present = set(tags)
+    stale = {t for t in present if not untracked(t) and t not in known}
+    if not full and not stale and not any(untracked(t) for t in present):
+        return 0  # every face names a patch the source has: nothing to do
+
+    face_at = _source_patch_lookup(source_obj, _result_to_source(source_obj, result_obj))
+    if face_at is None:
         return 0
 
-    CENTRE_WEIGHT = 2
-    adopted = 0
-    for poly in mesh.polygons:
-        if existing[poly.index] != NO_PATCH:
+    groups: dict[int, list[int]] = {}
+    loose: list[int] = []
+    for index, tag in enumerate(tags):
+        if untracked(tag):
+            loose.append(index)
+        elif full or tag in stale:
+            groups.setdefault(tag, []).append(index)
+
+    new_tags = list(tags)
+    translations: dict[int, int] = {}
+    for tag, faces in groups.items():
+        votes: dict[int, int] = {}
+        for index in faces:
+            _vote_face(face_at, mesh, mesh.polygons[index], votes)
+        total = sum(votes.values())
+        if tag in known and (total == 0 or votes.get(tag, 0) >= KNOWN_TAG_MIN_SHARE * total):
             continue
+        winner = _strict_winner(votes)
+        if winner is not None and winner != tag:
+            translations[tag] = winner
+            for index in faces:
+                new_tags[index] = winner
+        elif tag not in known:
+            # No majority for the group as a whole: Plasticity split the face,
+            # or the patch was never one. Each face is decided on its own.
+            loose.extend(faces)
 
+    for index in loose:
         votes = {}
-        centre_id = face_id_at(poly.center)
-        if centre_id is not None:
-            votes[centre_id] = CENTRE_WEIGHT
-        for vi in poly.vertices:
-            fid = face_id_at(mesh.vertices[vi].co)
-            if fid is not None:
-                votes[fid] = votes.get(fid, 0) + 1
+        _vote_face(face_at, mesh, mesh.polygons[index], votes)
+        winner = _strict_winner(votes)
+        new_tags[index] = winner if winner is not None else NO_PATCH
+    _adopt_from_neighbours(mesh, new_tags, [i for i in loose if new_tags[i] == NO_PATCH])
 
-        if not votes:
-            continue
-        best_id, best_votes = max(votes.items(), key=lambda kv: kv[1])
-        if best_votes * 2 > sum(votes.values()):  # strict majority only
-            existing[poly.index] = best_id
-            adopted += 1
-
-    if adopted == 0:
+    changed = sum(1 for old, new in zip(tags, new_tags) if old != new)
+    if changed == 0:
         return 0
 
     attr = mesh.attributes.get(PATCH_ID_ATTR)
     if attr is None:
         attr = mesh.attributes.new(PATCH_ID_ATTR, 'INT', 'FACE')
-    attr.data.foreach_set("value", existing)
+    attr.data.foreach_set("value", new_tags)
     mesh.update()
     result_obj[ADOPTION_PROP] = 1
-    print(f"[Plasticity Retop] Adopted {adopted} pre-existing face(s) of "
-          f"'{result_obj.name}' into patch tracking")
-    return adopted
+    if translations:
+        _translate_patch_settings(result_obj, translations)
+    renamed = f", {len(translations)} renamed patch(es) followed" if translations else ""
+    print(f"[Plasticity Retop] Re-read the patch of {changed} face(s) of "
+          f"'{result_obj.name}'{renamed}")
+    return changed
+
+
+def source_signature(mesh: bpy.types.Mesh) -> str:
+    """What the source was as of a reconciliation, as a string an object
+    property can hold: its geometry *and* the ids it declares, since a
+    renumbering moves no vertex (`patch_data.geometry_fingerprint`)."""
+    return ":".join(str(v) for v in patch_data.geometry_fingerprint(mesh))
+
+
+def _world_diagonal(obj: bpy.types.Object) -> float:
+    corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
+    if not corners:
+        return 0.0
+    lo = mathutils.Vector((min(c[i] for c in corners) for i in range(3)))
+    hi = mathutils.Vector((max(c[i] for c in corners) for i in range(3)))
+    return (hi - lo).length
+
+
+def reanchor_composites(source_obj: bpy.types.Object, result_obj: bpy.types.Object) -> int:
+    """Find the surfaces of every composite that stopped applying, and return
+    how many were restored.
+
+    Its anchors first -- one point inside each surface, stored when it was built
+    -- and failing those, the result faces carrying its id: each one that sits
+    squarely on one surface names it. The composite keeps its id either way,
+    since that is what its committed faces carry. It is only rewritten when it
+    comes back with as many surfaces as it had, all distinct and claimed by no
+    other composite: a part whose faces were split or merged is a different
+    part, and guessing would lay one patch over the wrong area.
+    """
+    mesh = source_obj.data
+    stored = patch_data.read_composites(mesh)
+    if not stored:
+        return 0
+    applicable, dropped = patch_data.applicable_composites(mesh, mesh.get("face_ids") or ())
+    if not dropped:
+        return 0
+
+    declared = set(mesh.get("face_ids") or ())
+    claimed = {s for surfaces in applicable.values() for s in surfaces}
+    anchors = patch_data.read_composite_anchors(mesh)
+    at_anchor = _source_patch_lookup(source_obj, mathutils.Matrix.Identity(4), surfaces=True)
+    if at_anchor is None:
+        return 0
+    at_face = _source_patch_lookup(
+        source_obj, _result_to_source(source_obj, result_obj), surfaces=True)
+    tags = _patch_ids_of_faces(result_obj.data)
+
+    restored = 0
+    for composite_id in dropped:
+        old = list(dict.fromkeys(stored[composite_id]))
+        found: list[int | None] = []
+        points = anchors.get(composite_id)
+        if points and len(points) == len(stored[composite_id]):
+            found = list(dict.fromkeys(at_anchor(mathutils.Vector(p)) for p in points))
+        if len(found) != len(old) or None in found:
+            found = []
+            for index, tag in enumerate(tags):
+                if tag != composite_id:
+                    continue
+                votes: dict[int, int] = {}
+                _vote_face(at_face, result_obj.data, result_obj.data.polygons[index], votes)
+                winner = _strict_winner(votes)
+                if winner is not None and winner not in found:
+                    found.append(winner)
+        if (len(found) != len(old) or len(found) < 2 or None in found
+                or not declared.issuperset(found) or claimed.intersection(found)):
+            continue
+        stored[composite_id] = [int(s) for s in found]
+        claimed.update(found)
+        restored += 1
+
+    if restored:
+        patch_data.write_composites(mesh, stored)
+        print(f"[Plasticity Retop] Found the surfaces of {restored} multi-surface "
+              f"patch(es) of '{source_obj.name}' again")
+    return restored
+
+
+def remap_source_ids(
+    context: bpy.types.Context,
+    source_obj: bpy.types.Object,
+    result_obj: bpy.types.Object,
+) -> int:
+    """Re-attach every CAD corner to the source vertex at its position, carry
+    the span registry along, and return how many corners changed.
+
+    A corner id is a source vertex *index*, and a re-sent part is re-tessellated
+    and re-indexed: the corner is still exactly where it was, under another
+    number, and welding by the old one would pull the next patch onto whatever
+    vertex has it now. The one the vertex still names is kept whenever it is
+    also the nearest -- that is what keeps a corner nudged by hand itself --
+    otherwise the source vertex at its position takes over, and a corner with
+    none there loses its id, which is always the safe direction.
+
+    The registry is keyed by corner pairs, so it follows the same mapping; a
+    pair naming a corner no result vertex holds cannot be checked and goes.
+    """
+    mesh = result_obj.data
+    attr = mesh.attributes.get(SOURCE_VID_ATTR)
+    src_mesh = source_obj.data
+    source_count = len(src_mesh.vertices)
+    if attr is None or len(mesh.vertices) == 0 or source_count == 0:
+        return 0
+
+    vids = [NO_SOURCE] * len(mesh.vertices)
+    attr.data.foreach_get("value", vids)
+
+    src_matrix = source_obj.matrix_world
+    from mathutils.kdtree import KDTree
+    tree = KDTree(source_count)
+    for vertex in src_mesh.vertices:
+        tree.insert(src_matrix @ vertex.co, vertex.index)
+    tree.balance()
+
+    state = context.scene.plasticity_retop
+    weld = state_mod.to_blender_units(state, state.boundary_weld_distance)
+    reach = max(min(weld, _world_diagonal(source_obj) * SOURCE_ID_REMAP_RATIO),
+                _world_diagonal(source_obj) * 1e-7, 1e-9)
+
+    result_matrix = result_obj.matrix_world
+    mapping: dict[int, int] = {}
+    conflicted: set[int] = set()
+    changed = 0
+    for index, sid in enumerate(vids):
+        if sid == NO_SOURCE:
+            continue
+        world = result_matrix @ mesh.vertices[index].co
+        _co, nearest, distance = tree.find(world)
+        if nearest == sid:
+            new = sid
+        elif nearest is not None and distance <= reach:
+            new = nearest
+        else:
+            new = NO_SOURCE
+        if mapping.setdefault(sid, new) != new:
+            conflicted.add(sid)
+        if new != sid:
+            vids[index] = new
+            changed += 1
+
+    if changed:
+        attr.data.foreach_set("value", vids)
+        mesh.update()
+
+    registry = get_span_registry(result_obj)
+    if registry:
+        rekeyed: dict[str, int] = {}
+        for key, span in registry.items():
+            try:
+                a, b = (int(part) for part in key.rsplit("_", 1))
+            except ValueError:
+                continue
+            if a in conflicted or b in conflicted:
+                continue
+            na, nb = mapping.get(a, NO_SOURCE), mapping.get(b, NO_SOURCE)
+            if na != NO_SOURCE and nb != NO_SOURCE:
+                rekeyed[_span_key(na, nb)] = span
+        if rekeyed != registry:
+            save_span_registry(result_obj, rekeyed)
+    return changed
+
+
+def _forget_unknown_settings(
+    source_obj: bpy.types.Object, result_obj: bpy.types.Object
+) -> None:
+    """Drop patch records naming an id that neither the source nor any result
+    face carries any more: nothing can ever look one up again."""
+    table = get_patch_settings_table(result_obj)
+    if not table:
+        return
+    alive = set(patch_data.analyse(source_obj.data).patches)
+    alive.update(_patch_ids_of_faces(result_obj.data))
+    kept = {key: value for key, value in table.items()
+            if key.lstrip("-").isdigit() and int(key) in alive and int(key) != NO_PATCH}
+    if kept != table:
+        save_patch_settings_table(result_obj, kept)
+
+
+def reconcile_patch_tracking(
+    context: bpy.types.Context, source_obj: bpy.types.Object
+) -> tuple[int, int, int]:
+    """Bring `<Source>_Retop`'s bookkeeping back in line with the source, and
+    return (faces re-read, corners re-attached, composites restored).
+
+    Cheap when the source has not changed since the last call: its signature
+    matches and only untracked or unknown face ids are looked at. When it has --
+    or on a result mesh that predates the signature -- every face, corner,
+    registry key and composite is checked against the geometry once.
+    Writes mesh attributes and custom properties only, so it is safe wherever
+    `adopt_untracked_faces` already ran.
+    """
+    result_obj = bpy.data.objects.get(result_object_name_for(source_obj))
+    if result_obj is None:
+        return 0, 0, 0
+    signature = source_signature(source_obj.data)
+    if result_obj.get(SOURCE_SIGNATURE_PROP) == signature:
+        faces, corners, composites = adopt_untracked_faces(source_obj), 0, 0
+    else:
+        composites = reanchor_composites(source_obj, result_obj)
+        corners = remap_source_ids(context, source_obj, result_obj)
+        if corners:
+            clear_stray_source_ids(context, source_obj, result_obj)
+        faces = adopt_untracked_faces(source_obj, full=True)
+        _forget_unknown_settings(source_obj, result_obj)
+        result_obj[SOURCE_SIGNATURE_PROP] = signature
+
+    if faces or corners:
+        invalidate_boundary_cache()
+        invalidate_crack_cache()
+    if faces:
+        # A crease is a property of the border between two patch ids.
+        apply_result_shading(context, result_obj)
+    return faces, corners, composites
 
 
 # --- putting the bookkeeping back after a hand edit ---
@@ -655,7 +1040,8 @@ def remove_patch_from_result(
     targets = {i for i, fid in enumerate(ids) if fid == face_id}
     untagged = [i for i, fid in enumerate(ids) if fid == NO_PATCH]
     if untagged:
-        face_id_at = _source_patch_lookup(source_obj, result_obj)
+        face_id_at = _source_patch_lookup(
+            source_obj, _result_to_source(source_obj, result_obj))
         if face_id_at is not None:
             for i in untagged:
                 if face_id_at(mesh.polygons[i].center) == face_id:
@@ -868,13 +1254,91 @@ def apply_result_shading(
     smooth = state.result_shade_smooth
     mesh.polygons.foreach_set("use_smooth", [smooth] * len(mesh.polygons))
 
+    count = len(mesh.edges)
     flags = (_sharp_edge_flags(mesh, state.sharp_edge_angle) if smooth
-             else [False] * len(mesh.edges))
-    attr = mesh.attributes.get(SHARP_EDGE_ATTR)
-    if attr is None:
-        attr = mesh.attributes.new(SHARP_EDGE_ATTR, 'BOOLEAN', 'EDGE')
+             else [False] * count)
+    user = _sharp_user_choices(mesh)
+    if smooth:
+        # The user's own marks win over the computed ones, in both directions.
+        flags = [True if choice == SHARP_USER_ON
+                 else False if choice == SHARP_USER_OFF
+                 else flag
+                 for flag, choice in zip(flags, user)]
+
+    attr = _edge_attribute(mesh, SHARP_EDGE_ATTR, 'BOOLEAN')
     attr.data.foreach_set("value", flags)
+    _edge_attribute(mesh, SHARP_WRITTEN_ATTR, 'BOOLEAN').data.foreach_set("value", flags)
+    _edge_attribute(mesh, SHARP_USER_ATTR, 'INT').data.foreach_set("value", user)
     mesh.update()
+
+
+def _edge_attribute(
+    mesh: bpy.types.Mesh, name: str, data_type: str
+) -> bpy.types.Attribute:
+    attr = mesh.attributes.get(name)
+    if attr is not None and (attr.domain != 'EDGE' or attr.data_type != data_type):
+        mesh.attributes.remove(attr)
+        attr = None
+    if attr is None:
+        attr = mesh.attributes.new(name, data_type, 'EDGE')
+    return attr
+
+
+def _sharp_user_choices(mesh: bpy.types.Mesh) -> list[int]:
+    """Per edge, the sharpness the user set by hand, or SHARP_USER_NONE.
+
+    An edge whose `sharp_edge` no longer matches what this addon last wrote was
+    changed by the user -- Mark Sharp or Clear Sharp in Edit Mode -- and that
+    choice is recorded so the next re-shade keeps it rather than overwriting
+    it. New edges carry zeros in both layers, so they read as untouched.
+    """
+    count = len(mesh.edges)
+    user = [SHARP_USER_NONE] * count
+    stored = mesh.attributes.get(SHARP_USER_ATTR)
+    if stored is not None and stored.domain == 'EDGE' and stored.data_type == 'INT':
+        stored.data.foreach_get("value", user)
+
+    sharp_attr = mesh.attributes.get(SHARP_EDGE_ATTR)
+    written_attr = mesh.attributes.get(SHARP_WRITTEN_ATTR)
+    if written_attr is None or written_attr.domain != 'EDGE':
+        # A mesh shaded before the layer existed: nothing to compare against,
+        # so nothing can be called a hand edit yet.
+        return user
+    written = [False] * count
+    written_attr.data.foreach_get("value", written)
+    # Blender drops `sharp_edge` altogether when leaving Edit Mode with no
+    # sharp edge left, so a missing layer means every edge was cleared.
+    sharp = [False] * count
+    if sharp_attr is not None and sharp_attr.domain == 'EDGE':
+        sharp_attr.data.foreach_get("value", sharp)
+    for index, (now, before) in enumerate(zip(sharp, written)):
+        if now != before:
+            user[index] = SHARP_USER_ON if now else SHARP_USER_OFF
+    return user
+
+
+def reset_sharp_overrides(context: bpy.types.Context) -> int:
+    """Forget every hand-set sharp edge and re-shade. Returns how many there were."""
+    total = 0
+    for result_obj in iter_result_objects(context):
+        mesh = result_obj.data
+        attr = mesh.attributes.get(SHARP_USER_ATTR)
+        if attr is not None:
+            values = [SHARP_USER_NONE] * len(mesh.edges)
+            attr.data.foreach_get("value", values)
+            total += sum(1 for value in values if value != SHARP_USER_NONE)
+            mesh.attributes.remove(attr)
+        written = mesh.attributes.get(SHARP_WRITTEN_ATTR)
+        sharp = mesh.attributes.get(SHARP_EDGE_ATTR)
+        if written is not None:
+            # Treat what is on the mesh as the addon's own, so the removed
+            # choices are not read back as fresh hand edits.
+            values = [False] * len(mesh.edges)
+            if sharp is not None:
+                sharp.data.foreach_get("value", values)
+            written.data.foreach_set("value", values)
+        apply_result_shading(context, result_obj)
+    return total
 
 
 def refresh_result_shading(context: bpy.types.Context) -> None:
@@ -1173,6 +1637,7 @@ def refresh_preview_appearance(context: bpy.types.Context) -> None:
     if obj is None:
         return
     state = context.scene.plasticity_retop
+    picking = surface_pick_open(state)
     mat = _existing_material(PREVIEW_MATERIAL_NAME)
     if mat is not None:
         _apply_material_appearance(mat, tuple(state.preview_color), state.preview_alpha)
@@ -1182,7 +1647,18 @@ def refresh_preview_appearance(context: bpy.types.Context) -> None:
     # any other object. Alt+X answers it for both, or the preview would keep
     # floating in front while the retopology it belongs to is being checked
     # against the surface.
-    obj.show_in_front = state.result_see_through
+    obj.show_in_front = state.result_see_through and not picking
+    # While surfaces are being gathered the tint on them is the thing to read,
+    # and a solid preview lifted over them hides it. Wire keeps the shape of
+    # the patch they make visible without covering them.
+    obj.display_type = 'WIRE' if picking else 'TEXTURED'
+
+
+def surface_pick_open(state: "state_mod.RetopPatchState") -> bool:
+    """Whether Shift+click surfaces are being gathered, or about to be."""
+    return (getattr(state, "session_phase", "") == 'PATCH'
+            and (bool(getattr(state, "surface_selection", ""))
+                 or getattr(state, "surface_hover_face_id", -1) != -1))
 
 
 def ensure_result_object(

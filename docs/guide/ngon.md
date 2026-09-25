@@ -28,6 +28,24 @@ normal, against **N-gon Flatness Tolerance** (5° by default).
 
 When not using matching, this can be helpful to drive the details of the n-gon.
 
+## Vertices on one side
+
+Point at a side and <kbd>Ctrl</kbd>+wheel sets how many vertices that side
+gets. The side is then divided evenly, and the other sides keep following the
+detail angle. The side highlight (<kbd>M</kbd>) has to be on for the side to
+be picked up.
+
+Group sides first to set them together. <kbd>Ctrl</kbd>+click a side opens the
+group editor, as on a grid. Over a grouped side the wheel sets the count for the
+whole group, shared out by length. The corners inside the group stay vertices,
+so neighbours still weld to them.
+
+A side matched to a neighbour keeps the neighbour's vertices. Click it to
+release the match before changing its count.
+
+The counts are saved with the patch and come back when you re-edit it.
+**Reset Side Counts** in the panel drops them.
+
 
 ## Related settings
 

@@ -10,6 +10,7 @@ opens the page — or find them under
 | Key | Action |
 |---|---|
 | <kbd>Ctrl</kbd> + wheel | Span up/down (or N-gon detail angle) |
+| <kbd>Ctrl</kbd> + wheel over a side | N-gon: vertices on that side, or on its group |
 | <kbd>0</kbd>–<kbd>9</kbd>, <kbd>Backspace</kbd> | Type a span directly |
 | <kbd>Tab</kbd> | Switch U/V (quad and wedge patches) |
 | <kbd>N</kbd> | N-gon mode |
@@ -30,6 +31,7 @@ opens the page — or find them under
 | <kbd>Shift</kbd> + click | Add a surface to the next patch, or take it back out |
 | Click a picked surface | Open all the picked surfaces as one patch |
 | <kbd>Tab</kbd> | Hand-edit the mesh |
+| Click on empty space | Drop the picked surfaces |
 | <kbd>Esc</kbd> | Drop the picked surfaces, then leave the object |
 
 ## Any phase

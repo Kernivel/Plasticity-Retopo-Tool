@@ -232,11 +232,12 @@ def _draw_dropped_composites(
 ) -> None:
     """Say so when a patch built from several surfaces no longer applies here.
 
-    A re-export renumbers every Plasticity face id even when no vertex moves,
-    so one recorded before it names surfaces that are gone. Silently ignoring
-    it looks exactly like an addon that forgot, and the retopology that comes
-    out is a patch per surface again -- correct geometry answering a question
-    nobody asked.
+    Plasticity renames faces -- a plain Refresh through the bridge is enough to
+    deliver the new names -- so one recorded before names surfaces that are
+    gone. Entering the object looks for them again by position
+    (`mesh_build.reanchor_composites`); what reaches this panel is what that
+    could not find, i.e. a part whose faces were really split, merged or
+    removed. Silently ignoring it looks exactly like an addon that forgot.
     """
     dropped = patch_data.analyse(obj.data).dropped_composites
     if not dropped:
@@ -245,8 +246,9 @@ def _draw_dropped_composites(
     warn.alert = True
     warn.label(text=f"{len(dropped)} multi-surface patch(es) no longer apply",
                icon='ERROR')
-    for line in _wrapped("Their surfaces are gone from this mesh — most likely it "
-                         "was re-exported, which renumbers every face id. Pick them "
+    for line in _wrapped("Their surfaces could not be found on this mesh any more: "
+                         "the part's faces were split, merged or removed since. "
+                         "Starting a session on it retries; otherwise pick them "
                          "again."):
         warn.label(text=line)
 
@@ -375,6 +377,11 @@ def _draw_active_patch(
         # in the settings tab, so having them here too made the patch block
         # look as though the mode changed more than it does.
         box.prop(state, "ngon_angle")
+        hint = box.column(align=True)
+        hint.label(text=f"{overlay._pair_label('span_more', 'span_less')} over a side: "
+                        "set its vertices", icon='INFO')
+        if state.ngon_group_counts:
+            hint.operator("retop.reset_ngon_counts", icon='LOOP_BACK')
         if state.num_loops > 1:
             holes = state.num_loops - 1
             box.label(text=f"{holes} hole{'s' if holes > 1 else ''} bridged "
@@ -762,6 +769,8 @@ def _draw_tab_output(
     sub_sharp = body.column()
     sub_sharp.enabled = state.result_shade_smooth
     sub_sharp.prop(state, "sharp_edge_angle")
+    sub_sharp.label(text="Sharp edges you set by hand are kept", icon='INFO')
+    sub_sharp.operator("retop.reset_sharp_edges", icon='LOOP_BACK')
 
     body = layout.box().column()
     body.label(text="Collections", icon='OUTLINER_COLLECTION')

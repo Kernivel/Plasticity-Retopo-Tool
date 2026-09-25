@@ -467,9 +467,57 @@ Two boundary loops does **not** by itself mean Ring: see the band invariant.
   (weighted) plus its verts. Without it those patches read as "never retopped"
   and re-editing silently doubled them up. On anything short of a strict
   majority the face keeps `NO_PATCH`: unclaimed faces are never deleted, so a
-  misread degrades to a duplicate, never to a hole in a neighbour. One pass per
-  result mesh, marked by `retop_patch_adoption`. Removal for a re-edit uses a
-  looser rule (face centre only) since it's visible and reversible.
+  misread degrades to a duplicate, never to a hole in a neighbour. Removal for
+  a re-edit uses a looser rule (face centre only) since it's visible and
+  reversible.
+- **A face id is a name, and Plasticity renames faces -- so no tag is trusted
+  further than the geometry agrees with it.** Measured on a real part
+  (`UTR45.blend`, object `Grip`): 51 of the 60 ids its result mesh carried were
+  gone from the source, a whole block shifted by exactly -3506, **no vertex
+  moved and nobody re-imported anything** -- the bridge's plain Refresh
+  delivered the new names. Every patch then read as never retopped and picking
+  one built a second grid over the first. `mesh_build.reconcile_patch_tracking`
+  (from `enter_session_object` and `set_active_patch`, replacing the bare
+  adoption call) is the answer: it stores `source_signature` on the result
+  object, and when that moves it re-reads *everything* once -- every face
+  (`adopt_untracked_faces(full=True)`), every corner id and registry key
+  (`remap_source_ids`), every composite (`reanchor_composites`) -- and
+  otherwise only looks at untracked or unknown tags. On that part: 253 of 278
+  faces re-read, 47 renamed patches followed, ~100 ms once.
+  **A renamed patch is translated whole, never face by face.** All faces with
+  the old id vote together (centre ×2, plus each corner pulled
+  `ADOPTION_PULL` towards the centre -- a vertex *on* a border between two
+  surfaces is equally near both), and a strict majority names the new id. So
+  the faces along a border are outvoted by the ones across the patch, and the
+  settings table follows in one simultaneous move (`_translate_patch_settings`),
+  because a renumbering can reissue an old name to another face: A→B and B→C
+  applied one after the other carries A's record to C. That reissue is also
+  why the full pass votes on ids the source *does* still declare, and re-reads
+  one when under `KNOWN_TAG_MIN_SHARE` of its faces sit on it --
+  `tests/test_reconcile.py` swaps two faces' names to pin exactly that.
+  **Blender gives a face made by hand the value 0, not `NO_PATCH`**, so 0 counts
+  as untracked whenever the source declares no face 0; 13 such faces were
+  sitting on that part. An untracked face is decided on its own, and one the
+  surface cannot decide goes to the tag most of its edges share
+  (`_adopt_from_neighbours`, in passes so the order faces are visited in cannot
+  matter) -- a fill between two patches then goes with the one it hangs off.
+  **Corner ids are indices, so they are re-attached by position**: the one a
+  vertex names is kept whenever it is also the nearest source vertex (that is
+  what keeps a hand-nudged corner itself), else the source vertex within
+  `SOURCE_ID_REMAP_RATIO` of the diagonal takes over, else the id goes. The
+  span registry follows the same map; a key naming a corner no result vertex
+  holds cannot be checked and is dropped.
+  **A composite carries an anchor per surface** (`COMPOSITE_ANCHORS_PROP`, a
+  polygon centre inside each, written by `write_composites` and kept for a
+  composite that stopped applying, since those are what find it again). Failing
+  anchors, its committed faces name its surfaces. It is only rewritten when it
+  comes back with as many distinct surfaces as it had: a part whose faces were
+  really split or merged is a different part. What cannot be found stays in the
+  panel's warning, which no longer blames a re-import.
+  **And `geometry_fingerprint` now reads the ids, not only their count.** A
+  renaming moves no vertex, so the parse cache kept serving patches under their
+  old names for as long as nothing else invalidated it -- which the test hit
+  before any of the above could run. One entry per face, so it costs nothing.
 - **Corners come from two tests that miss opposite things.** The angle test
   (`detect_corners`) is geometric and swallows anything gentle: a 30° chamfer
   reads as a smooth stretch, lands mid-side, and every generator paves across
@@ -900,6 +948,19 @@ Two boundary loops does **not** by itself mean Ring: see the band invariant.
   first: sharpness is a property of the border *between* patches, so a new
   neighbour changes the shading of an edge that already existed. It only writes
   mesh attributes, so it's safe from a property callback.
+- **A sharp edge set by hand is the user's, and re-shading keeps it.**
+  `apply_result_shading` writes what it decided into `retop_sharp_written`
+  beside `sharp_edge`; on the next run an edge whose `sharp_edge` differs from
+  that layer was changed by the user (Mark/Clear Sharp), and the choice goes
+  into `retop_sharp_user` (1 on, 2 off), which wins over the angle from then
+  on. Comparing against what was *written* rather than against the computed
+  flag is what lets a user undo their own mark: that is a change too. Both are
+  plain edge attributes, so they ride through the commit's BMesh round trip
+  and the mirror apply. **Blender drops `sharp_edge` entirely when Edit Mode
+  exits with no sharp edge left**, so a missing layer reads as all cleared, not
+  as "nothing to compare". Shade Smooth off still writes all False and keeps
+  the choices for when it comes back on. `reset_sharp_overrides` (panel
+  button) forgets them. `tests/test_sharp_overrides.py`.
 - **There is no per-object wireframe opacity in Blender.** `show_wire` is drawn
   by the viewport overlay and its strength is that overlay's
   `wireframe_opacity`, so `result_wire_opacity` writes to every 3D viewport
@@ -1156,6 +1217,19 @@ compares the hover against -- clicking the patch locks it in, clicking anything
 else abandons it. The way back from a patch already opened is
 `retop.split_patch`, a panel button on it.
 
+**The preview may not cover the pick.** The tint is depth-tested and the
+preview is lifted over the surface, so a solid preview hid exactly what was
+being chosen. While `mesh_build.surface_pick_open` (PATCH phase, and a
+selection or a Shift candidate) the preview is drawn as `WIRE` and not in
+front; `refresh_preview_appearance` decides it, so every change to the
+selection, the Shift hover or the phase calls it. `_set_hover` holds the
+preview for *any* selection, not only a pending composite: with one surface
+picked it used to lay a grid over whichever surface the cursor crossed. Moving
+off the mesh with a pick open forgets the hover but keeps the preview, and
+**a click on empty space drops the pick** like `Esc`. Clicking another surface
+with one picked rebuilds the held hover before opening it, or the click would
+open that patch with the previous hover's generator and no preview.
+
 **Deleting such a patch takes it apart as well as emptying it.**
 `RETOP_OT_delete_patch` ends with `dissolve_composite`, and that is not tidying
 up: nothing carries the id once the faces go, and a composite left on the mesh
@@ -1363,6 +1437,25 @@ Single-loop span patches only, and that is not a restriction so much as where
 the question arises: a ring is chosen by having two loops and pairs them
 itself, an n-gon follows its boundary whatever its sides are called. Neither is
 refused; the numbering is simply not read for them.
+
+**An n-gon reads the grouping too, but only to aim the wheel.** The group
+count does not pick anything there, so `_side_groups_for` still returns None
+for it. What the grouping does in n-gon mode is say which sides one
+Ctrl+wheel step moves: over a side (`hovered_side`, so the side highlight has
+to be on), `nudge_ngon_side` sets a count on the run holding it
+(`sidematch.ngon_runs` -- each side alone while the grouping is at fault), and
+away from the sides the wheel still drives `ngon_angle`. Counts are stored in
+`state.ngon_group_counts` keyed by the run's **side indices**
+(`ngon_group_key`), not the group number, so a regrouping simply stops a count
+applying instead of moving it to other sides. `ngon_forced_segments` turns
+them into forced per-side counts with `allocate_group_segments` (a matched
+sub-side is a pin; a lone matched side keeps its match), and it is shared by
+generation and `register_spans_for` for the usual reason. The first step
+starts from `_ngon_allocation`, what the last generation actually put on those
+sides. The counts go into the patch record beside `side_groups`, and
+`load_patch_choices` puts both back -- from `set_active_patch` and from the
+hover, so the preview a click opens already carries them and a new patch never
+inherits the last one's (`tests/test_ngon_side_counts.py`).
 
 **The corner inside a merged group must stay a mesh vertex**, because a
 neighbouring patch welds to it. Handing the generator the concatenated polyline

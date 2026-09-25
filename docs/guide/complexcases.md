@@ -21,7 +21,10 @@ In some case the Isoparam cuts (<kbd>Ctrl+R</kbd> by default) can work just like
 ## 3. Save & Refresh
 
 Save your changes in the Plasticity file then in Blender use the Refresh button from the Plasticity Bridge addon to refresh the mesh.
-The Plasticity Retopo plugin should be able to handle small changes like these, but patches groups or mirroring might need to be rebuilt.
+
+A Refresh can give the part's faces new ids, even when you changed nothing. The addon checks its committed patches against the surface they sit on whenever you start a session on the object, so they are still recognised and re-editing replaces them instead of stacking a new grid on top.
+
+A patch built from several surfaces is found again the same way. If the surfaces under it were really split or merged, the panel says so and you pick them again. Mirroring might also need to be set up again.
 
 ## 4. Repeat
 

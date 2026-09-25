@@ -81,6 +81,10 @@ Shading is re-applied after **every** commit and every delete, not just the
 first: sharpness is a property of the border *between* patches, so a new
 neighbour changes the shading of an edge that already existed.
 
+Edges you mark or clear sharp yourself are kept. Re-shading only changes the
+edges you have not touched. **Reset Hand-Set Sharp Edges** forgets your
+changes, so every crease follows the angle again.
+
 ## Keybinds
 
 A button that opens the addon preferences page, where Blender's own keymap rows

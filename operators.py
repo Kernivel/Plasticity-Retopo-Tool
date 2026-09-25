@@ -131,9 +131,9 @@ def register_spans_for(
         # boundary into the hole.
         # Same substitution the preview was built with, or the registry would
         # advertise a curvature count on a side that was matched to a neighbour.
-        forced = sidematch.ngon_side_segments(
-            prepared,
-            sidematch.apply_side_matches(context, source_obj, prepared, generators.NGON.name)[0])
+        matched = sidematch.apply_side_matches(
+            context, source_obj, prepared, generators.NGON.name)[0]
+        forced = ngon_forced_segments(state, prepared, matched)
         for loop_i, (corner_ids, loop_sides) in enumerate(
                 zip(prepared.loops_corner_ids, prepared.loops_sides)):
             if corner_ids:
@@ -369,6 +369,103 @@ def _joined(subsides: "list[list[mathutils.Vector]]") -> "list[mathutils.Vector]
     return points
 
 
+# Segments per side of the n-gon last generated, by flat side index. What
+# Ctrl+wheel over a side starts from, so the first step moves one vertex from
+# what is on screen rather than jumping to a number nobody saw.
+_ngon_allocation: dict[int, int] = {}
+
+
+def ngon_forced_segments(
+    state: "state_mod.RetopPatchState",
+    prepared: "patchprep.PreparedPatch",
+    matched: dict[int, int],
+) -> "list[dict[int, int]]":
+    """Per loop, {side in loop: segments} for the n-gon fill.
+
+    The matched sides first, then the counts set with Ctrl+wheel. A count set on
+    a group is shared out over its sides by length
+    (`patchprep.allocate_group_segments`), so the corner inside the group stays
+    a vertex a neighbour can weld to. A matched side inside it is a pin on that
+    share; a lone matched side keeps its match, since it carries a neighbour's
+    own vertices.
+
+    Shared by generation and the commit path, so the registry advertises the
+    counts the mesh actually got.
+    """
+    forced = sidematch.ngon_side_segments(prepared, matched)
+    counts = sidematch.ngon_group_counts(state)
+    if not counts:
+        return forced
+    slots = sidematch.side_slots(prepared)
+    slot_of = {slot.index: slot for slot in slots}
+    for run in sidematch.ngon_runs(slots, state):
+        total = counts.get(sidematch.ngon_group_key(run))
+        if total is None:
+            continue
+        if len(run) == 1 and run[0] in matched:
+            continue
+        loop = slot_of[run[0]].loop
+        if loop >= len(forced):
+            continue
+        subsides = [prepared.loops_sides[loop][slot_of[i].in_loop] for i in run]
+        pins = {position: matched[i] for position, i in enumerate(run) if i in matched}
+        floor = sum(pins.values()) + len(run) - len(pins)
+        allocation = patchprep.allocate_group_segments(
+            subsides, max(total, floor), pins)
+        for index, count in zip(run, allocation):
+            forced[loop][slot_of[index].in_loop] = count
+    return forced
+
+
+def _remember_ngon_allocation(
+    state: "state_mod.RetopPatchState",
+    prepared: "patchprep.PreparedPatch",
+    forced: "list[dict[int, int]]",
+) -> None:
+    _ngon_allocation.clear()
+    index = 0
+    for loop_i, loop_sides in enumerate(prepared.loops_sides):
+        allocation = generators.ngon.loop_allocation(
+            loop_sides, state.ngon_angle,
+            forced[loop_i] if loop_i < len(forced) else None)
+        for count in allocation:
+            _ngon_allocation[index] = count
+            index += 1
+
+
+def nudge_ngon_side(
+    context: bpy.types.Context, index: int, delta: int
+) -> tuple[bool, str]:
+    """Add or remove vertices on the n-gon group holding side `index`.
+
+    Returns (changed, message).
+    """
+    state = context.scene.plasticity_retop
+    references = sidematch.active_sides()
+    if not (0 <= index < len(references)):
+        return False, "No side under the cursor"
+    run = next((run for run in sidematch.ngon_runs(references, state) if index in run),
+               [index])
+    matched = {i: len(references[i].applied_points) - 1
+               for i in run if references[i].applied and references[i].applied_points}
+    if len(run) == 1 and index in matched:
+        return False, ("This side copies its neighbour's vertices. "
+                       "Click it to release the match first")
+
+    key = sidematch.ngon_group_key(run)
+    counts = sidematch.ngon_group_counts(state)
+    current = counts.get(key)
+    if current is None:
+        current = sum(_ngon_allocation.get(i, 1) for i in run)
+    floor = sum(matched.values()) + len(run) - len(matched)
+    wanted = max(floor, current + (1 if delta > 0 else -1))
+    counts[key] = wanted
+    sidematch.set_ngon_group_counts(state, counts)
+    regenerate_active_preview(context)
+    what = "side" if len(run) == 1 else f"group of {len(run)} sides"
+    return True, f"{wanted} segments on this {what}"
+
+
 def _span_for_group(spans: dict[str, int], generator_name: str, position: int) -> int:
     """How many segments group `position` carries, read off the resolved spans
     through the same key the matching uses -- two ideas of which span drives a
@@ -551,8 +648,9 @@ def _generate_for_face(
         # disagree and there is nothing to resolve first.
         matched, _ = sidematch.apply_side_matches(context, obj, prepared, generator.name,
                                         winners=winners)
-        settings = {"ngon_angle": state.ngon_angle,
-                    "side_segments": sidematch.ngon_side_segments(prepared, matched)}
+        forced = ngon_forced_segments(state, prepared, matched)
+        _remember_ngon_allocation(state, prepared, forced)
+        settings = {"ngon_angle": state.ngon_angle, "side_segments": forced}
         if prepared.has_holes:
             # Each hole bridged into the face around it with two edges, giving
             # one more n-gon per hole (a Blender n-gon can't carry a hole on
@@ -1205,6 +1303,7 @@ def toggle_patch_surface(
         selection.remove(face_id)
         set_surface_selection(state, selection)
         refresh_pending_composite(context, obj)
+        mesh_build.refresh_preview_appearance(context)
         return True, (f"Dropped surface {face_id} — {len(selection)} selected"
                       if selection else "Surface selection cleared")
 
@@ -1249,6 +1348,7 @@ def toggle_patch_surface(
     selection.append(face_id)
     set_surface_selection(state, selection)
     refresh_pending_composite(context, obj)
+    mesh_build.refresh_preview_appearance(context)
     return True, f"{len(selection)} surfaces selected"
 
 
@@ -1319,6 +1419,7 @@ def discard_pending_composite(context: bpy.types.Context) -> None:
     obj = bpy.data.objects.get(state.session_object_name)
     _drop_pending_composite(context, obj)
     state.surface_selection = ""
+    mesh_build.refresh_preview_appearance(context)
 
 
 def build_composite(
@@ -1431,6 +1532,26 @@ def composite_surfaces(obj: bpy.types.Object | None, face_id: int) -> list[int]:
     return list(patch_data.analyse(obj.data).composites.get(face_id, []))
 
 
+def load_patch_choices(
+    state: "state_mod.RetopPatchState", obj: bpy.types.Object, face_id: int
+) -> None:
+    """Put back the per-patch choices `face_id` was committed with, or clear
+    them: the side grouping and the n-gon side counts.
+
+    Both name sides by index, so carried over from the last patch they would
+    reshape whichever sides of this one happen to share those numbers. Called
+    when a patch is opened, and by the hover before it previews one, so the
+    preview and the click agree.
+    """
+    stored_settings = mesh_build.lookup_patch_settings(obj, face_id) or {}
+    state.side_groups = str(stored_settings.get("side_groups", "") or "")
+    state.ngon_group_counts = str(stored_settings.get("ngon_group_counts", "") or "")
+    state.group_warning = ""
+    state.corner_edit = False
+    state.side_groups_backup = ""
+    state.hovered_bubble = -1
+
+
 def set_active_patch(
     context: bpy.types.Context, obj: bpy.types.Object, face_id: int
 ) -> tuple[str | None, int | None, list[str] | None]:
@@ -1456,22 +1577,18 @@ def set_active_patch(
     # Here rather than inside `_generate_for_face`, because the restore is
     # about *opening* a patch -- doing it on every regeneration would undo the
     # user's next change to the grouping.
-    stored_settings = mesh_build.lookup_patch_settings(obj, face_id) or {}
-    state.side_groups = str(stored_settings.get("side_groups", "") or "")
-    state.group_warning = ""
-    state.corner_edit = False
-    state.side_groups_backup = ""
-    state.hovered_bubble = -1
+    load_patch_choices(state, obj, face_id)
     # Which patch this one copied from, and which way round. Per patch, for the
     # same reason a pin is: carried over, the first click on the *next* patch
     # would come back swapped.
     state.copy_source_face_id = -1
     state.copy_source_swapped = False
 
-    # Same reason as in enter_session_object: claim untracked pre-existing
-    # retopology before deciding whether this patch is a re-edit. Cheap no-op
-    # once every face carries its patch id.
-    mesh_build.adopt_untracked_faces(obj)
+    # Same reason as in enter_session_object: put the tracking right before
+    # deciding whether this patch is a re-edit. Here too, and not only on entry,
+    # because the bridge can re-send the part mid-session (Refresh, Live Link)
+    # and rename its faces under us. A signature compare when nothing changed.
+    mesh_build.reconcile_patch_tracking(context, obj)
 
     # Generate first, remove second: _generate_for_face reads the result mesh to
     # decide this is a re-edit and to recover the spans it was committed with.
@@ -1634,11 +1751,12 @@ def enter_session_object(
     # Create the preview here too, rather than on the first hover: that keeps
     # every datablock this session needs inside the single undo step below.
     mesh_build.ensure_preview_object(context)
-    # Retopology committed before per-face patch tracking existed has to be
-    # claimed once, here, or its patches read as "never retopped": picking one
-    # would quietly build a second grid on top of the first instead of
-    # re-editing it.
-    mesh_build.adopt_untracked_faces(obj)
+    # Faces whose patch id is missing -- committed before tracking existed, made
+    # by hand -- or no longer names anything, because Plasticity renamed the
+    # face since: either way the patch reads as "never retopped", and picking
+    # it would quietly build a second grid on top of the first instead of
+    # re-editing it. The geometry says which patch each one sits on.
+    mesh_build.reconcile_patch_tracking(context, obj)
     # Snapshots left by a re-edit that was undone, crashed or reloaded out from
     # under us: they carry a fake user, so nothing else would ever collect them.
     mesh_build.purge_stale_snapshots(keep_name=state.reedit_backup_mesh)
@@ -1839,10 +1957,12 @@ class RETOP_OT_session(bpy.types.Operator):
         # make, and a hover must not overwrite it with a grid over whichever
         # one the cursor is crossing. The hovered id is still recorded, because
         # the click reads it -- only the geometry is left alone.
-        if context.scene.plasticity_retop.pending_composite_id != -1:
+        state = context.scene.plasticity_retop
+        if state.pending_composite_id != -1 or surface_selection(state):
             self._hover_obj = obj
             self._hover_face_id = face_id
             return True
+        load_patch_choices(state, obj, face_id)
         preview = _generate_for_face(context, obj, face_id)
         if preview is None:
             return False
@@ -1889,6 +2009,7 @@ class RETOP_OT_session(bpy.types.Operator):
         state.pending_composite_id = -1
         set_surface_selection(state, [])
         state.session_phase = 'ADJUST'
+        mesh_build.refresh_preview_appearance(context)
         self._set_typed("")
         self._apply_phase_ui(context)
         # A datablock changed, so it gets its own step: Ctrl+Z takes the patch
@@ -2291,6 +2412,7 @@ class RETOP_OT_session(bpy.types.Operator):
                 state.surface_hover_face_id = -1
             self._cursor_in_viewport = None
             self._apply_phase_ui(context)
+            mesh_build.refresh_preview_appearance(context)
 
         # Before the TIMER check, not after: leaving Edit Mode by the mode
         # dropdown fires no event of its own, so the timer is what notices.
@@ -2428,9 +2550,12 @@ class RETOP_OT_session(bpy.types.Operator):
             # Drawn whether or not that surface can be taken: an indicator that
             # appears only over a valid target makes a refusal look like a
             # target that was never there, and the click says which it is.
+            was_picking = mesh_build.surface_pick_open(state)
             state.surface_hover_face_id = (
                 surface_under_cursor(context, event, obj, face_id)
                 if event.shift else -1)
+            if mesh_build.surface_pick_open(state) != was_picking:
+                mesh_build.refresh_preview_appearance(context)
 
             if obj is not None and face_id is not None:
                 if face_id != self._hover_face_id or obj != self._hover_obj:
@@ -2438,7 +2563,13 @@ class RETOP_OT_session(bpy.types.Operator):
                         if not self._set_hover(context, obj, face_id):
                             self._clear_hover(context)
             elif self._hover_face_id is not None:
-                self._clear_hover(context)
+                if surface_selection(state):
+                    # The preview is the patch the picked surfaces make, not a
+                    # hover: moving off the mesh must not wipe it.
+                    self._hover_obj = None
+                    self._hover_face_id = None
+                else:
+                    self._clear_hover(context)
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
@@ -2462,6 +2593,11 @@ class RETOP_OT_session(bpy.types.Operator):
                 return {'RUNNING_MODAL'}
 
             if self._hover_face_id is None:
+                # A click on empty space abandons a pick, like Esc does.
+                if surface_selection(state):
+                    discard_pending_composite(context)
+                    self._clear_hover(context)
+                    self.report({'INFO'}, "Surface selection cleared")
                 return {'RUNNING_MODAL'}
 
             # A gathered set of surfaces is opened by clicking any one of
@@ -2486,8 +2622,15 @@ class RETOP_OT_session(bpy.types.Operator):
                     return {'RUNNING_MODAL'}
             elif surface_selection(state):
                 # One surface picked and something else clicked: the same
-                # abandonment, with nothing written to the mesh to undo.
+                # abandonment, with nothing written to the mesh to undo. The
+                # hover was held while the pick was open, so rebuild it.
                 set_surface_selection(state, [])
+                mesh_build.refresh_preview_appearance(context)
+                if (self._hover_obj is None
+                        or not self._set_hover(context, self._hover_obj,
+                                               self._hover_face_id)):
+                    self._clear_hover(context)
+                    return {'RUNNING_MODAL'}
 
             state.active_face_id = self._hover_face_id
             state.generator_name = self._hover_generator_name
@@ -2640,7 +2783,8 @@ class RETOP_OT_commit_patch(bpy.types.Operator):
 
         mesh_build.register_patch_settings(
             source_obj, face_id, state.span_u, state.span_v, state.span,
-            state.generator_name, state.side_groups)
+            state.generator_name, state.side_groups,
+            state.ngon_group_counts if ngon_committed else "")
         if prepared is not None:
             register_spans_for(context, source_obj, prepared)
 
@@ -2883,7 +3027,8 @@ class RETOP_OT_toggle_corner(bpy.types.Operator):
         refresh_group_warning(context)
         counts = sidematch.loop_group_counts(
             references, sidematch.group_numbers(references, state))
-        self.report({'INFO'}, state.group_warning or _corner_report(counts))
+        self.report({'INFO'}, state.group_warning
+                    or _corner_report(counts, state.ngon_mode))
         return {'FINISHED'}
 
 
@@ -2904,13 +3049,17 @@ def refresh_group_warning(context: bpy.types.Context) -> None:
     state.group_warning = message
 
 
-def _corner_report(counts: dict[int, int]) -> str:
+def _corner_report(counts: dict[int, int], ngon: bool = False) -> str:
     """What the grouping now amounts to -- the generator it would pick.
 
     The count is the whole point of the gesture: it is what `find_generator`
     reads, so saying "4 groups" without saying "Quad" would report the input
     and withhold the answer.
     """
+    if ngon:
+        total = sum(counts.values())
+        return (f"{total} groups -- "
+                f"{overlay._pair_label('span_more', 'span_less')} over one sets its vertices")
     if len(counts) == 1:
         groups = next(iter(counts.values()))
         generator = generators.find_generator(groups)
@@ -3737,6 +3886,13 @@ class RETOP_OT_nudge_span(bpy.types.Operator):
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
         state.typed_span = ""  # scrolling takes over from a half-typed number
+        if state.ngon_mode and state.hovered_side != -1:
+            # Over a side, the wheel sets that side's vertex count -- or its
+            # group's, when the side was grouped with others in the corner
+            # editor. Away from the sides it still drives the detail angle.
+            changed, message = nudge_ngon_side(context, state.hovered_side, self.delta)
+            self.report({'INFO'} if changed else {'WARNING'}, message)
+            return {'FINISHED'} if changed else {'CANCELLED'}
         if state.ngon_mode:
             # An n-gon has no span to step, but it does have a density, and
             # that is `ngon_angle` -- *inverted*, since it is degrees of
@@ -3778,6 +3934,45 @@ class RETOP_OT_toggle_span_axis(bpy.types.Operator):
             return {'CANCELLED'}
         state.span_axis = 'V' if state.span_axis == 'U' else 'U'
         state.typed_span = ""  # the number being typed applied to the other span
+        return {'FINISHED'}
+
+
+class RETOP_OT_reset_ngon_counts(bpy.types.Operator):
+    """Drop the vertex counts set on the n-gon's sides."""
+    bl_idname = "retop.reset_ngon_counts"
+    bl_label = "Reset Side Counts"
+    bl_description = ("Forget the vertex counts set with Ctrl+Scroll over the n-gon's sides, so "
+                      "every side follows the detail angle again")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        state = context.scene.plasticity_retop
+        return _in_phase(context, 'ADJUST') and bool(state.ngon_group_counts)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        state = context.scene.plasticity_retop
+        state.ngon_group_counts = ""
+        regenerate_active_preview(context)
+        self.report({'INFO'}, "Side counts reset")
+        return {'FINISHED'}
+
+
+class RETOP_OT_reset_sharp_edges(bpy.types.Operator):
+    """Forget the sharp edges marked or cleared by hand."""
+    bl_idname = "retop.reset_sharp_edges"
+    bl_label = "Reset Hand-Set Sharp Edges"
+    bl_description = ("Sharp edges you mark or clear yourself are kept when the retopology is "
+                      "re-shaded. This forgets them, so every crease follows the angle again")
+    bl_options = {'REGISTER'}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        if context.mode != 'OBJECT':
+            self.report({'WARNING'}, "Leave Edit Mode first")
+            return {'CANCELLED'}
+        count = mesh_build.reset_sharp_overrides(context)
+        push_undo("Retop: reset hand-set sharp edges")
+        self.report({'INFO'}, f"Reset {count} hand-set edge(s)")
         return {'FINISHED'}
 
 
@@ -4289,6 +4484,8 @@ CLASSES = (
     RETOP_OT_nudge_span,
     RETOP_OT_toggle_span_axis,
     RETOP_OT_toggle_ngon,
+    RETOP_OT_reset_ngon_counts,
+    RETOP_OT_reset_sharp_edges,
     RETOP_OT_toggle_match_mode,
     RETOP_OT_toggle_cad_edges,
     RETOP_OT_toggle_surface_flow,
