@@ -1,36 +1,15 @@
 """Hand-correcting the committed retopology, in Blender's own Edit Mode.
 
-The generators get a patch's boundary right most of the time; when they don't
--- a side whose neighbour could not be matched, two boundaries that ended up
-one vertex apart, a merge that did not take -- the fix is a handful of vertex
-moves and one extra edge, and every tool for that already exists in Blender.
-Merge by distance, vertex snapping, knife, loop cut and connect-vertex-path are
-all **Edit Mode** operators, so there is no version of this that stays in
-Object Mode: an object-mode reimplementation would be a worse knife and a worse
-snap, written twice.
+`Tab` in the `PATCH` or `OBJECT` phase selects `<Source>_Retop`, sets up the
+tool settings for manual retopology and enters Edit Mode. `Tab` again comes
+back. The addon owns the two ends of that trip:
 
-So the session hands the viewport over instead. `Tab` from the patch-picking
-phase selects `<Source>_Retop`, configures the tool settings that make manual
-retopology work (vertex snapping, auto-merge at a threshold you can set),
-enters Edit Mode and stops listening; `Tab` again comes back. What the addon
-owns is the two ends of that round trip:
+- the setup: vertex snapping onto the same mesh, auto-merge;
+- the repair on the way out (`mesh_build.repair_manual_edits`): faces with no
+  patch id and vertices with a copied corner id.
 
-- **the setup**, so the mode is usable the moment it opens rather than after
-  four trips to the snapping popover, and
-- **the repair**, because Blender does not know about this addon's bookkeeping.
-  A knife cut makes faces carrying no patch id and vertices carrying a *copied*
-  source-vertex id, and both of those are read later on: an untagged face is
-  invisible to re-editing (the patch reads as "never retopped", so a re-edit
-  builds a second grid on top of it), and a vertex falsely claiming to be CAD
-  corner N gets welded onto that corner by identity by the next commit that
-  touches it. `mesh_build.repair_manual_edits` puts both right on the way out.
-
-Only from the `PATCH` phase, and that is deliberate: a re-edit has the patch's
-faces *out* of the result mesh with only a snapshot to put them back, and
-anything written to a mesh Blender holds in Edit Mode is discarded on exit --
-the patch would be gone for good. That is the same rule
-`RETOP_OT_session._leave_for_other_mode` already enforces, said from the other
-side.
+Never from `ADJUST`: a re-edit's faces are out of the result mesh, and edits
+made while Blender holds it in Edit Mode would lose them.
 """
 import json
 
@@ -40,12 +19,9 @@ from . import mesh_build
 from . import state as state_mod
 
 
-# Tool settings this mode overwrites, and therefore has to put back. Read and
-# written by name through getattr/setattr: `snap_elements` and friends have
-# been renamed and split more than once across Blender versions (4.x added
-# `snap_elements_base` and FACE_NEAREST), and an addon that hard-requires one
-# spelling breaks on the next release for no gain. A name that isn't there is
-# skipped both ways, so the snapshot and the restore stay symmetrical.
+# Tool settings this mode overwrites, and has to put back. Accessed by name
+# through getattr/setattr, since they get renamed across Blender versions.
+# A missing name is skipped both ways.
 _SNAPSHOT_KEYS = (
     "use_snap",
     "snap_elements",
@@ -62,22 +38,12 @@ _SNAPSHOT_KEYS = (
 def _wanted_settings(
     state: "state_mod.RetopPatchState",
 ) -> dict[str, object]:
-    """What a manual retopology pass wants, as opposed to what modelling wants.
+    """The tool settings a manual retopology pass wants.
 
-    The two that matter:
-
-    - VERTEX snapping with `use_snap_self` on. The whole point is dragging a
-      vertex onto its twin in the *same* mesh -- the seam a failed match left --
-      and Blender's default (snap to other objects only) makes exactly that
-      impossible.
-    - auto-merge. Merge by distance is the fix, but reaching for `M` after
-      every move is the sort of step that gets forgotten once and leaves a
-      crack nobody sees until the mesh is exported. With auto-merge on, a
-      vertex dropped within the threshold of another simply *is* merged.
-
-    FACE_NEAREST is added on top when `tweak_snap_surface` is on, so a vertex
-    being dragged stays on the CAD surface instead of floating off it -- the
-    same job reprojection does for a generated patch.
+    - VERTEX snapping with `use_snap_self`, to drag a vertex onto its twin in
+      the same mesh.
+    - Auto-merge, so a seam closes without a separate Merge by Distance.
+    - FACE_NEAREST when `tweak_snap_surface` is on, to stay on the CAD surface.
     """
     elements = {'VERTEX'}
     if state.tweak_snap_surface:
@@ -132,22 +98,15 @@ def apply_tool_settings(
         try:
             setattr(tool_settings, key, _from_jsonable(value))
         except (TypeError, ValueError):
-            # An enum item this Blender doesn't have (FACE_NEAREST before 4.0,
-            # say). Better a mode with one fewer snap target than a session
-            # that refuses to open one.
+            # An enum item this Blender doesn't have: skip it.
             pass
 
 
 def _session_source(context: bpy.types.Context) -> bpy.types.Object | None:
     """The object whose retopology Tab should open.
 
-    The session's own while one is entered. In the `OBJECT` phase there is none
-    -- the session is between objects -- and Tab there used to fall through to
-    Blender, which put the CAD *source* into Edit Mode: the one mesh nothing in
-    this addon ever wants edited by hand. So the selection answers instead,
-    resolved the way `operators.resolve_session_object` resolves it (pointing
-    at `<X>_Retop` means X), and the active object is asked before the rest of
-    the selection because that is what "the object I am looking at" means.
+    The session's object while one is entered. Otherwise the selection,
+    active object first, where `<X>_Retop` means X.
     """
     state = context.scene.plasticity_retop
     entered = bpy.data.objects.get(state.session_object_name)
@@ -182,17 +141,13 @@ def _result_object_for_session(
 def can_tweak(context: bpy.types.Context) -> str | None:
     """The reason Tab would refuse right now, or None if it would open.
 
-    Used by the panel as well as the modal, so the button and the key give the
-    same answer instead of one of them silently doing nothing.
+    Shared by the panel and the modal, so both give the same answer.
     """
     state = context.scene.plasticity_retop
     if not state.session_active:
         return "No retop session is running"
     if state.session_phase not in ('PATCH', 'OBJECT'):
-        # ADJUST owns Tab (it is U/V there) and a patch is open on the result
-        # mesh: a re-edit has its faces *out* of it with only a snapshot to put
-        # them back, and anything written to a mesh Blender holds in Edit Mode
-        # is discarded on exit. TWEAK is already inside the trip.
+        # Never from ADJUST: a re-edit's faces are out of the result mesh.
         return "Commit or discard the patch first"
     if context.mode != 'OBJECT':
         return "Blender is not in Object Mode"
@@ -204,9 +159,7 @@ def enter_tweak(context: bpy.types.Context) -> str | None:
     """Open Edit Mode on the session's result mesh. Returns an error message
     when it could not, else None (and the phase is left on 'TWEAK').
 
-    Creates no datablock, so it is safe between undo steps: the result mesh is
-    already there -- having geometry to correct is the precondition -- and
-    Blender pushes its own step for the mode change.
+    Creates no datablock, so it is safe between undo steps.
     """
     state = context.scene.plasticity_retop
     if context.mode != 'OBJECT':
@@ -216,19 +169,14 @@ def enter_tweak(context: bpy.types.Context) -> str | None:
     if error is not None or result is None:
         return error
 
-    # A result mesh hidden behind Local View or an outliner eye can't be
-    # entered, and "the operator failed" is a poor answer to "let me fix this
-    # vertex". Per-view-layer flags only: no ID is touched.
+    # A hidden object cannot enter Edit Mode. Per-view-layer flags only.
     result.hide_viewport = False
     try:
         result.hide_set(False)
     except RuntimeError:
         pass  # not in this view layer; the select below reports it properly
 
-    # The preview holds the last hovered patch. Empty it before opening Edit
-    # Mode, so what you land in is the committed mesh and nothing else -- an
-    # orange grid floating over the thing you came to fix is worse than no
-    # preview at all, and the session is not adjusting anything here.
+    # Empty the preview: only the committed mesh should be on screen.
     mesh_build.clear_preview_object()
 
     previous_active = context.view_layer.objects.active
@@ -242,22 +190,16 @@ def enter_tweak(context: bpy.types.Context) -> str | None:
         return f"'{result.name}' is not in the current view layer"
     context.view_layer.objects.active = result
 
-    # Which object this trip is about, and where to go back to. In the OBJECT
-    # phase neither is derivable afterwards: the session holds no object, and
-    # `repair_manual_edits` -- the whole reason Tab is ours rather than
-    # Blender's -- needs one to re-adopt the faces a knife cut left untracked.
+    # Which object this trip is about, and which phase to return to.
+    # `repair_manual_edits` needs the object on the way out.
     state.tweak_source_object = source.name
     state.tweak_return_phase = state.session_phase
 
     state.tweak_saved_tool_settings = json.dumps(snapshot_tool_settings(context))
     apply_tool_settings(context, _wanted_settings(state))
 
-    # Draw the retopology over the CAD surface for the trip. Set here, on the
-    # object, rather than through refresh_result_appearance: that one also
-    # assigns materials, which writes to mesh data, and by the time this
-    # matters Blender owns the mesh in Edit Mode. `refresh_result_appearance`
-    # knows about the TWEAK phase too, so a redraw triggered mid-edit by some
-    # other setting agrees with this instead of undoing it.
+    # Draw the retopology in front for the trip. Set on the object directly:
+    # refresh_result_appearance writes mesh data, which Edit Mode would own.
     if state.tweak_draw_in_front:
         result.show_in_front = True
 
@@ -274,9 +216,8 @@ def enter_tweak(context: bpy.types.Context) -> str | None:
 def restore_tool_settings(context: bpy.types.Context) -> None:
     """Put back whatever `enter_tweak` overwrote, and forget the snapshot.
 
-    Separate from `exit_tweak` because entering can fail *after* the settings
-    were applied, and leaving a user's snapping configuration rewritten by a
-    mode that never opened is the rudest possible failure.
+    Separate from `exit_tweak`: entering can fail after the settings were
+    applied.
     """
     state = context.scene.plasticity_retop
     raw = state.tweak_saved_tool_settings
@@ -294,10 +235,8 @@ def exit_tweak(context: bpy.types.Context) -> tuple[int, int]:
     """Leave Edit Mode, restore the tool settings and repair the bookkeeping
     the hand edits invalidated. Returns (faces adopted, source ids cleared).
 
-    Safe to call when Blender has already left Edit Mode by another route --
-    the mode dropdown, an undo, a script -- which is exactly why the modal
-    calls it from its timer as well as from Tab: the repair has to happen once
-    per round trip, whichever way the trip ended.
+    Safe when Blender already left Edit Mode by another route. The repair runs
+    once per trip, however it ended.
     """
     state = context.scene.plasticity_retop
     if context.mode != 'OBJECT':
@@ -315,8 +254,7 @@ def exit_tweak(context: bpy.types.Context) -> tuple[int, int]:
     if source is not None:
         repaired = mesh_build.repair_manual_edits(context, source)
 
-    # Back to the object the session is about, so the panel keeps describing
-    # the same thing and a second Tab opens the same round trip again.
+    # Reselect the object the session is about.
     returning = bpy.data.objects.get(state.tweak_return_object) or source
     state.tweak_return_object = ""
     if returning is not None:
@@ -326,13 +264,9 @@ def exit_tweak(context: bpy.types.Context) -> tuple[int, int]:
         except RuntimeError:
             pass
 
-    # Back to the phase the trip started from: a Tab taken in the OBJECT phase
-    # was never a choice of object, so landing in PATCH would claim the session
-    # had entered one.
+    # Back to the phase the trip started from.
     state.session_phase = state.tweak_return_phase or 'PATCH'
     state.tweak_return_phase = ""
-    # Back in Object Mode, so this is free to touch materials again: it puts
-    # `show_in_front` back under `result_see_through`, where it belongs outside
-    # a hand-edit.
+    # Back in Object Mode: `show_in_front` follows `result_see_through` again.
     mesh_build.refresh_result_appearance(context)
     return repaired

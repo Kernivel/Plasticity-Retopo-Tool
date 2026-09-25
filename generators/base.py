@@ -24,32 +24,24 @@ class GenerationResult:
         corner_local_indices: list[int] | None = None,
         boundary_local_indices: list[int] | None = None,
     ) -> None:
-        # How many segments each side got, per boundary loop -- only the Ring
-        # generator sets it (it spreads one "around" count over the sides
-        # itself, so the commit path can't recompute it from a single span).
-        # A Ring reports one list per loop; an N-gon a single flat list of its
-        # sides' segment counts (both loops' concatenated, for a holed one).
+        # Segments per side, for generators the commit path cannot recompute
+        # from a span. A Ring gives one list per loop, an N-gon one flat list
+        # (all loops concatenated).
         self.side_allocation: tuple[list[int], list[int]] | list[int] | None = None
         self.verts = verts  # list[Vector], local/object space
         self.faces = faces  # list[tuple[int, ...]]
         self.uvs = uvs if uvs is not None else [(0.0, 0.0)] * len(verts)  # list[(u, v)], one per vert
-        # local vert index of each patch corner, in boundary-walk order (one
-        # per side). Corners are always exact, un-resampled source mesh
-        # vertices, so they are the only points safe to weld by identity
-        # across neighboring patches (see mesh_build.commit_preview_to_result).
+        # Local vert index of each patch corner, in boundary-walk order.
+        # Corners are exact source vertices: the only points welded by identity.
         self.corner_local_indices = corner_local_indices or []
-        # local vert index of every point lying on ANY boundary side (corners
-        # included). With propagation keeping spans equal on both sides of a
-        # shared edge, these coincide almost exactly between neighboring
-        # patches -- safe to weld by proximity (unlike interior/reprojected
-        # points, which are never included here).
+        # Local vert index of every boundary point, corners included.
+        # These are welded to neighbours by proximity. Interior points never are.
         self.boundary_local_indices = boundary_local_indices or []
 
 
 class Generator:
     """A generator is identified by `name` (see constants) and selected by
-    `matches`, never by a declared side count -- Ring and N-gon are reached
-    directly, and the rest answer for a range.
+    `matches`. Ring and N-gon are reached directly.
     """
 
     name: str = "base"
@@ -82,11 +74,8 @@ def resolve_side_points(
 ) -> list[list[mathutils.Vector]]:
     """Convert vertex-index sides into Vector-point sides.
 
-    Copies every point: `positions` is the per-mesh table cached by
-    `patch_data.analyse`, shared by every caller, and a generator is free to
-    hand its input straight through into a preview mesh -- `resample_polyline_
-    by_arclength` returns the very objects it was given when the count already
-    matches. Without the copy, generating one patch could move a vertex the
-    next hover still believes is where the CAD put it.
+    Copies every point: `positions` is the shared, read-only table cached by
+    `patch_data.analyse`, and a generator may pass its input straight into a
+    preview mesh.
     """
     return [[positions[vi].copy() for vi in side] for side in sides]

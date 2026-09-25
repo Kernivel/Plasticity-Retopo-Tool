@@ -3,14 +3,11 @@ keybind hints (mirroring how Plasticity shows its own modal keybinds), the
 N-gon vertex dots, the side highlight, and the CAD structure of the source
 surface (see cad_display).
 
-Two separate draw handlers, because they draw in different spaces: the hints
-and every kind of dot are 2D (POST_PIXEL), the lines are in the scene
-(POST_VIEW).
+Two draw handlers: the hints and every dot in 2D (POST_PIXEL), the lines in
+the scene (POST_VIEW).
 
-Both are read-only by construction. A draw handler that created a datablock
-would crash the next Ctrl+Z -- see the note in mesh_build. Everything expensive
-they show is computed and cached elsewhere for the same reason: a redraw is not
-a place to walk a mesh.
+Both are read-only. A draw handler must never create a datablock (it would
+crash Ctrl+Z) or walk a mesh: everything is cached elsewhere.
 """
 import math
 from typing import TYPE_CHECKING
@@ -21,8 +18,7 @@ import gpu
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
-# Safe to import: all three are loaded before this module (see __init__.py) and
-# none imports it back. operators is the one that can't be reached from here.
+# Never import `operators` from here: it imports this module back.
 from . import cad_display
 from . import constants
 from . import keymap
@@ -31,8 +27,7 @@ from . import patch_data
 from . import sidematch
 
 if TYPE_CHECKING:
-    # Annotations only: the overlay runs inside a draw handler and must never
-    # widen what it pulls in at import time.
+    # Annotations only: never widen what a draw handler imports.
     import mathutils
 
     from . import state as state_mod
@@ -42,51 +37,22 @@ _points_handle: object | None = None
 
 # --- N-gon vertex dots ---
 #
-# A span grid shows its own topology: the preview's quads *are* the spans. An
-# n-gon is one face, so its boundary vertices are invisible -- and they are the
-# only thing there is to judge in that mode (is the chamfer picked up? is the
-# curve dense enough?). Hence dots, and only in n-gon mode.
+# An n-gon is one face, so its boundary vertices are shown as dots.
 VERT_COLOR = (1.0, 0.85, 0.2, 1.0)
 VERT_OUTLINE_COLOR = (0.05, 0.05, 0.05, 0.9)
 VERT_SIZE = 11.0          # fallback when the scene property isn't there yet
 VERT_OUTLINE_RATIO = 1.45  # dark disc behind the bright one
 
-# Drawn as screen-space geometry rather than GL points. `gpu.state.point_size_set`
-# is a no-op whenever the backend runs with program point size enabled -- the
-# shader has to write gl_PointSize then, and the builtin UNIFORM_COLOR one does
-# not -- which came out as 1px dots that ignored the size setting entirely. A
-# fan of triangles per dot always honours the pixels asked for.
-#
-# A fan rather than the two triangles it started as: a square dot reads as a
-# handle you can grab, which none of these are -- they mark where a vertex is.
-# Twelve segments is where a dot this size stops looking like a polygon, and it
-# is divisible by four so the disc still measures exactly 2*half across, which
-# is what keeps the size setting checkable.
+# Every dot is screen-space geometry, never a GL point: `gpu.state.point_size_set`
+# is ignored with program point size on.
+# Keep this a multiple of four, so a disc measures exactly 2*half across.
 DOT_SEGMENTS = 12
 
 # --- side reference picker (M in ADJUST) ---
 #
-# Matching is binary -- a side reproduces the neighbour across it or it does
-# not -- so the colours answer that one question, and the states are what it
-# can return.
-#
-# Green is a side being matched. **Red is the failure**, and it is deliberately
-# narrow: a side bordering a committed neighbour that is *not* reproducing it,
-# because it lost a span collision, because the span was typed over since, or
-# because it was released by hand. That is where a crack will actually be, and
-# it used to draw the same grey as a side with nothing across it -- the one
-# state worth acting on, hidden among the ones that are simply normal.
-# Painting *every* unmatched side red was the alternative, and it says the
-# wrong thing: on the first patch of a model nothing is committed anywhere, so
-# the whole patch would come up red with nothing wrong at all.
-#
-# Grey is that normal: no committed neighbour along this side, nothing to
-# match, nothing to fix.
-#
-# Hover brightens a side's *own* colour instead of replacing it: a single hover
-# colour hid the one thing worth knowing before clicking -- whether this side
-# can be matched at all -- and turned a refusal into a surprise. It is never
-# green, or hovering an unmatched side would look like matching it.
+# Green: matched. Red: borders a committed patch and is not matched (a crack).
+# Grey: nothing to match. Never paint every unmatched side red.
+# Hover brightens a side's own colour, never turns it green.
 SIDE_MATCHED_COLOR = (0.25, 0.95, 0.45, 0.95)
 SIDE_MATCHED_HOVER_COLOR = (0.60, 1.0, 0.75, 1.0)
 SIDE_UNMATCHED_COLOR = (0.90, 0.28, 0.24, 0.95)      # borders a committed patch, unmatched
@@ -99,11 +65,7 @@ SIDE_HOVER_WIDTH = 6.0
 
 # --- the patch a Ctrl+click would copy a density from -----------------------
 #
-# Amber, which the side colours gave up when matching became binary: it is not
-# a state of *this* patch at all, so it must not land anywhere on the
-# matched/unmatched scale. Its own outline rather than a fill -- the patch is
-# finished geometry, and tinting it would compete with the preview being
-# adjusted, which is the thing actually being worked on.
+# Amber, off the matched/unmatched scale. An outline, never a fill.
 COPY_SOURCE_COLOR = (1.0, 0.72, 0.25, 0.95)
 COPY_SOURCE_REFUSED_COLOR = (0.75, 0.45, 0.30, 0.7)
 COPY_SOURCE_WIDTH = 3.0
@@ -112,49 +74,31 @@ TOOLTIP_COPY = (1.0, 0.82, 0.5, 1.0)
 
 # --- the surfaces gathered for the next patch ------------------------------
 #
-# Cyan, which nothing else here uses: a gathered surface is not matched,
-# unmatched, copied from or cracked, and borrowing any of those colours would
-# put it on a scale it has no business being on.
+# Cyan, which nothing else here uses.
 SURFACE_SELECTED_COLOR = (0.30, 0.90, 1.0, 0.95)
 SURFACE_SELECTED_WIDTH = 3.0
-# The surface itself, tinted. An outline alone picks one out only if you can
-# already see which border is which, and on a part with hundreds of them you
-# cannot -- least of all for the small surfaces this exists to gather up.
-# Faint, because several of them tint a large area and the CAD surface under
-# them is what is being judged.
+# The surface itself, faintly tinted.
 SURFACE_FILL_COLOR = (0.30, 0.90, 1.0, 0.22)
-# The one under the cursor while Shift is held: the same blue, lighter, and
-# with no outline. Two levels rather than two colours -- "taken" and "this is
-# what the click would take" are the same kind of thing at different strengths,
-# and a second hue would read as a third state. On a surface already picked the
-# two stack, which is what says the click there would take it back out.
+# The surface under the cursor while Shift is held: the same blue, lighter,
+# no outline.
 SURFACE_CANDIDATE_COLOR = (0.30, 0.90, 1.0, 0.10)
 
 
 # --- cracked borders -------------------------------------------------------
 #
-# Same red as an unmatched side, because it is the same failure seen later: the
-# side picker says it while the patch is open, this says it once the patch has
-# been committed and the session has moved on. Dashed, and that is the whole
-# reason it is legible -- the CAD edge overlay draws a solid line along the
-# very same curve, so a solid red one would read as another piece of structure
-# rather than as a warning. Dimmer than a side, too: it is a standing report on
-# work already done, not the thing under the cursor.
+# The same red as an unmatched side. Dashed, since the CAD edge overlay draws a
+# solid line along the same curve.
 CRACK_ALPHA = 0.85
 CRACK_WIDTH = 2.5
 CRACK_HOVER_WIDTH = 4.5
-# Dash length in *world* units, as a share of the model extent: a dash pattern
-# in pixels would need the view matrix on every redraw, and one in absolute
-# units is either invisible on a small part or a solid line on a large one.
+# Dash length as a share of the model extent.
 CRACK_DASH_RATIO = 0.004
 # How near the cursor has to be, in pixels, to name a cracked border.
 CRACK_HOVER_PIXELS = 12.0
 
 # --- the tooltip on the hovered side ---
 #
-# Colour alone cannot say *why* a side is grey, and the panel is the wrong
-# place to read it: the pointer is already on the side, in the viewport, about
-# to click. Two lines by the cursor -- what the side is doing, and why.
+# Two lines by the cursor: what the side is doing, and why.
 TOOLTIP_BG = (0.10, 0.10, 0.11, 0.90)
 TOOLTIP_TEXT = (0.95, 0.95, 0.95, 1.0)
 TOOLTIP_DETAIL = (0.72, 0.74, 0.76, 1.0)
@@ -162,18 +106,9 @@ TOOLTIP_MATCHED = (0.45, 1.0, 0.60, 1.0)
 TOOLTIP_PAD = 8
 TOOLTIP_OFFSET = 18   # from the cursor, so the pointer never covers the text
 
-# --- the vertices a match would actually take ---
+# --- the corner editor's groups ---
 #
-# Knowing a side *can* be matched is only half of it. Which vertices it would
-# land on is the half that shows a match going to the wrong neighbour, or
-# stopping short, or picking up a run that wanders off the shared edge -- and
-# none of that is visible from a coloured line lying on the boundary. Drawn for
-# the side under the cursor and for every side already pinned.
-# The corner editor's own vocabulary, deliberately off the matched/unmatched
-# scale: while it is open the side colours and the copy outline are suppressed,
-# so these mean groups and nothing else. No green and no red among them -- the
-# eye reads those two as "welds" and "cracks" everywhere else in this overlay,
-# and a group is neither.
+# Never green or red: those mean welds and cracks everywhere else.
 CORNER_GROUP_COLORS = (
     (0.40, 0.66, 1.00, 0.95),   # blue
     (0.80, 0.55, 1.00, 0.95),   # violet
@@ -183,38 +118,27 @@ CORNER_GROUP_COLORS = (
     (0.70, 0.75, 0.82, 0.95),   # slate
 )
 CORNER_GROUP_WIDTH = 5.0
-# A corner still acting as a side boundary, one that has been turned off, and
-# whichever is under the cursor. The off one is drawn small and dark rather
-# than not at all: it is still a vertex of the mesh, and a corner that vanished
-# would read as geometry lost rather than as a boundary given up.
-# One bubble per side, carrying its group number -- what you click to change
-# which group the side is in. Screen-space geometry like every other dot here:
-# `gpu.state.point_size_set` is ignored whenever program point size is on,
-# which is what made these 1px once before.
+# One bubble per side, carrying its group number. Clicking it changes the group.
 GROUP_BUBBLE_SIZE = 26.0
 GROUP_BUBBLE_OUTLINE = (0.05, 0.05, 0.05, 0.95)
 GROUP_BUBBLE_OUTLINE_RATIO = 1.16
 GROUP_BUBBLE_TEXT = (0.06, 0.06, 0.08, 1.0)
 GROUP_BUBBLE_FONT = 15.0
-# The hovered bubble is lifted rather than recoloured: its colour *is* its
-# group, and replacing it would hide the one thing the bubble is there to say.
+# The hovered bubble is enlarged, never recoloured: its colour is its group.
 GROUP_BUBBLE_HOVER_RATIO = 1.18
 GROUP_BUBBLE_HOVER_RING = (1.00, 1.00, 1.00, 1.0)
 GROUP_BUBBLE_HOVER_RING_RATIO = 1.34
-# A bubble the grouping cannot use: a number that appears in two separate
-# places, or a boundary left with one group. Red, like a side that will crack
-# and like a cracked border -- three places, one meaning, and the only one of
-# the three that is about a choice the user can take back in a click.
+# A bubble the grouping cannot use (`sidematch.group_problems`).
 GROUP_BUBBLE_FAULT_RING = (0.95, 0.25, 0.22, 1.0)
 GROUP_BUBBLE_FAULT_RATIO = 1.40
-# A dot is 12 segments and reads as round at 9 pixels; a bubble is nearly three
-# times that across, where 12 reads as the dodecagon it is. The count alone was
-# not enough, though -- see `_feathered_disc` for why a jagged circle is not a
-# facet problem.
+# More segments than a dot, since a bubble is larger. See `_feathered_disc`.
 GROUP_BUBBLE_SEGMENTS = 48
 GROUP_WARNING_TEXT = (1.0, 0.72, 0.68, 1.0)
 GROUP_WARNING_BACKDROP = (0.10, 0.04, 0.04, 0.88)
 
+# --- the vertices a match would take ---
+#
+# Drawn for the side under the cursor and for every pinned side.
 MATCH_DOT_COLOR = (0.35, 1.0, 0.55, 1.0)         # from a committed neighbour
 MATCH_DOT_OUTLINE = (0.05, 0.05, 0.05, 0.9)
 MATCH_DOT_SIZE = 9.0
@@ -222,10 +146,7 @@ MATCH_DOT_OUTLINE_RATIO = 1.5
 
 # --- the CAD structure under the triangles ---
 #
-# See cad_display: the Plasticity edges are recovered exactly, the surface flow
-# is derived from each face's boundary. Both are drawn without depth testing,
-# for the same reason the side highlight is -- they lie *on* the surface, so
-# testing them against it is a coin flip per pixel.
+# See cad_display.
 BREP_DOT_COLOR = (1.0, 1.0, 1.0, 1.0)
 BREP_DOT_OUTLINE = (0.05, 0.05, 0.05, 0.9)
 BREP_DOT_SIZE = 7.0
@@ -243,23 +164,15 @@ KEY_TEXT_COLOR = (1.0, 1.0, 1.0, 1.0)
 KEY_BG_COLOR = (0.28, 0.28, 0.30, 0.85)
 TYPED_COLOR = (1.0, 0.72, 0.25, 1.0)
 
-# From `constants`, not from `operators`: the draw handler must never pull in
-# the operators module, which imports this one back.
+# From `constants`: never import `operators` here.
 TWO_SPAN_GENERATOR_NAMES = constants.TWO_SPAN_GENERATORS
 
-# The digits being typed are echoed from `state.typed_span`, not a module
-# global: the keys that clear it (U/V, N-gon, the span wheel) are real
-# operators now, and an operator cannot reach the running modal's attributes.
-
-# Where the pointer was when the modal last looked, in window coordinates, or
-# None when it is not over the viewport. The tooltip needs it and a draw
-# handler has no event to read it from -- same arrangement as
-# `hover_committed` below.
+# The pointer in window coordinates, or None off the viewport. Written by the
+# modal: a draw handler has no event.
 cursor_window: "tuple[float, float] | None" = None
 
-# Set by the session modal when the patch under the cursor has already been
-# committed, so the hint reads "Re-edit patch" -- clicking it reopens it with
-# the spans it was built with instead of starting a fresh one.
+# Set by the modal when the hovered patch is committed, so the hint reads
+# "Re-edit patch".
 hover_committed: bool = False
 
 
@@ -268,71 +181,45 @@ def keybinds_for(
 ) -> list[list[tuple[str, str]]]:
     """[(key, action), ...] for the session's current phase, bottom line last.
 
-    Every key here is looked up in the keymap table rather than written out, so
-    a remapped binding changes the hint with it. A hint line that says `E` when
-    the key is now `Ctrl+E` is worse than no hint line at all -- it is the one
-    place a user checks before deciding the feature is broken.
+    Keys are read from the live keymap, never written out, so a remap shows.
     """
     phase = state.session_phase
 
     def key(action_id: str) -> str:
-        # Read off the live KeyMapItem, so a remapped key changes the hint with
-        # it. A hint that says `E` when the key is now `Ctrl+E` is worse than
-        # no hint at all -- it is the one place a user checks before deciding
-        # the feature is broken.
         return keymap.describe(action_id)
 
-    # The retopo x-ray is offered in every phase: it is the binding that
-    # answers "is the retopology where I think it is", and that comes up at any
-    # point. It sits on `V`, off the `X` the mirror and the patch delete share:
-    # Shift+X came out as `object.delete`'s confirmation popup in practice.
+    # The x-ray, mirror and CAD edges are offered in every phase.
     see_through = (key("see_through"), "Retopo X-Ray: "
                    + ("on" if getattr(state, "result_see_through", True) else "off"))
-    # Which axes are currently mirrored lives on the modifier, not in state,
-    # and a draw handler has no business reaching for an object to find out --
-    # so the hint names the key and the panel names the state.
+    # The mirrored axes live on the modifier: the panel shows them, not this.
     mirror = (key("mirror"), "Mirror X/Y/Z")
-    # Same reasoning as the x-ray: the CAD structure is read in every phase,
-    # and most of all while deciding which surface to pick next.
     cad_edges = (key("cad_edges"), "Plasticity edges: "
                  + ("on" if getattr(state, "show_cad_edges", False) else "off"))
 
     if phase == 'OBJECT':
         return [
             ("Click", "Enter object"),
-            # Tab is the session's here too: it opens the *selected* object's
-            # retopology in Edit Mode. Advertised even though it can refuse
-            # (nothing selected has any retopology yet), because the modal
-            # consumes it either way -- letting it through would put the CAD
-            # object into Edit Mode, which is the one thing nobody wants.
+            # Opens the selected object's retopology in Edit Mode.
             (key("hand_edit"), "Hand-edit mesh"),
             cad_edges,
             see_through,
             (key("back"), "End session"),
         ]
     if phase == 'TWEAK':
-        # Blender's keys, not ours: the session is only holding the door open.
-        # Listed anyway because the whole point of the round trip is that you
-        # do not have to remember which mode you are in to fix a seam.
+        # Blender's own keys, listed as a reminder.
         return [
             ("K", "Knife"),
             ("Ctrl+R", "Loop cut"),
             ("J", "Connect vertices"),
             ("G", "Move (snapped, auto-merge)"),
             ("M", "Merge by distance"),
-            # Blender's own Tab, not the table's: the modal consumes it in this
-            # phase whatever hand_edit is bound to, because getting *out* of a
-            # mode Blender put you in has to be the key Blender uses.
+            # Blender's own Tab: the way out of Edit Mode.
             ("Tab", "Back to Retop"),
         ]
 
     if phase == 'PATCH':
-        # Building one patch from several surfaces is behind a modifier on a
-        # click, which is exactly the kind of gesture nobody finds on their own
-        # -- so it is named here whether or not anything is gathered yet. Once
-        # something is, the entry carries the count: the tinted surfaces say
-        # *which*, and this says how many and that a plain click on one of them
-        # is what opens them as a patch.
+        # Always advertised: a modified click is hard to discover. Carries the
+        # count once something is gathered.
         gathered = len(patch_data.parse_surface_selection(
             getattr(state, "surface_selection", "")))
         surfaces = (key("add_surface"),
@@ -342,11 +229,7 @@ def keybinds_for(
             ("Click", "Re-edit patch" if hover_committed else "Pick surface"),
             surfaces,
             (key("hand_edit"), "Hand-edit mesh"),
-            # Ctrl+Z is deliberately *not* listed. It is Blender's own key and
-            # reaching for it is automatic; what the session does is make one
-            # step mean one committed patch, which is a property of the undo
-            # stack rather than a binding to advertise. The line is short and
-            # every entry on it has to earn its width.
+            # Ctrl+Z is not listed: it is Blender's own key.
             mirror,
             cad_edges,
             see_through,
@@ -354,27 +237,20 @@ def keybinds_for(
         ]
 
     # ADJUST
-    # getattr: this runs inside a draw handler, which can fire in the middle of
-    # a reload when the scene still carries the previous property group.
+    # getattr: a draw handler can fire mid-reload.
     commit_label = "Replace patch" if getattr(state, "editing_committed", False) else "Commit"
 
-    # The corner editor has taken the click, Enter and Esc, so the hints have
-    # to say so: leaving the patch's line up while its keys mean something else
-    # is the one thing a hint must never do.
+    # The corner editor owns the click, Enter and Esc while open.
     if getattr(state, "corner_edit", False):
         return [
-            ("Click", "Merge side into the group before it"),
+            (key("corner_toggle"), "Next group number"),
+            (key("corner_toggle_back"), "Previous group number"),
             cad_edges,
             (keymap.describe_all("corners_accept")[0], "Keep corner set"),
             (key("corners_cancel"), "Cancel"),
         ]
 
-    # N-gon mode has no spans at all, so advertising span keys there would be
-    # advertising keys that do nothing.
-    # The two span keys are one hint, since they are a pair and the line has no
-    # room for both -- "Ctrl+Wheel Up/Down" collapses to "Ctrl+Scroll" whenever
-    # they really are the two directions of one wheel, and spells both out when
-    # somebody has bound them to something else.
+    # The two span keys are one hint (`_pair_label`).
     span_key = _pair_label("span_more", "span_less")
     if getattr(state, "ngon_mode", False):
         binds = [
@@ -396,17 +272,12 @@ def keybinds_for(
     binds.append((key("match_mode"), "Side highlight: "
                   + ("on" if getattr(state, "match_mode", True) else "off")))
     binds.append((key("pin_neighbour"), "Match a side, else " + commit_label.lower()))
-    # Only on a generator that has spans to copy: an n-gon's density is its
-    # angle, and there is nothing in the record for the click to take.
+    # Not in n-gon mode: there are no spans to copy.
     if not getattr(state, "ngon_mode", False):
         binds.append((key("copy_spans"), "Copy a patch's density"))
-    # Same key as the copy, separated by what is under the cursor -- so the
-    # hint names the side, which is the half a user has to aim at.
+    # Same key as the copy: a side opens the editor, a patch is copied.
     binds.append((key("corners_edit"), "Edit corners (on a side)"))
-    # Every way of committing, not just the first: right-click and Enter are
-    # both worth knowing (the right-click is the Plasticity-style affordance
-    # people arrive expecting), and this is the one action where the second
-    # binding is as much a habit as the first.
+    # Every commit binding, not just the first.
     for label in keymap.describe_all("commit"):
         binds.append((label, commit_label))
     binds.append((key("back"), "Discard"))
@@ -416,11 +287,8 @@ def keybinds_for(
 def _pair_label(up_action: str, down_action: str) -> str:
     """One label for two opposite actions, e.g. "Ctrl+Scroll" for a wheel pair.
 
-    They are always used together and the hint line is one row across the
-    bottom of the screen, so spending two entries on "more" and "less" costs
-    more than it says. Collapsed only when they really are the two directions
-    of one wheel with the same modifiers; anything else is spelled out, because
-    a user who moved one of them needs to see what they moved it to.
+    Collapsed only for the two directions of one wheel with the same modifiers;
+    otherwise both are spelled out.
     """
     up = keymap.describe(up_action)
     down = keymap.describe(down_action)
@@ -480,12 +348,9 @@ def _draw() -> None:
 
     scale = max(0.5, getattr(state, "overlay_scale", 1.0))
     _draw_side_tooltip(state, region, scale)
-    # Only when the side picker has not already spoken: a side under the cursor
-    # is the patch being worked on, and two boxes at one pointer is neither.
+    # One tooltip at a time: the side picker's first.
     if not _side_tooltip_shown(state):
-        # The copy source wins over the crack report: the cursor is on a patch
-        # the user has deliberately moved onto, and what a click there does now
-        # is the more immediate question.
+        # Then the copy source, then the crack report.
         if not _draw_copy_tooltip(context, state, region, scale):
             _draw_crack_tooltip(context, state, region, scale)
 
@@ -502,9 +367,7 @@ def _draw() -> None:
     if not binds:
         return
 
-    # Laid out in a row, wrapped onto as many rows as it takes, and centred at
-    # the bottom. A column down one side is what a docked panel covers -- and
-    # every corner of a 3D view has something docked in it.
+    # Rows centred at the bottom, wrapped as needed.
     entries = []
     for key, action in binds:
         key_w, _ = blf.dimensions(font_id, key)
@@ -516,8 +379,7 @@ def _draw() -> None:
     row_width = 0.0
     for entry in entries:
         width = entry[2] + KEY_GAP + entry[3]
-        # Never leave a row empty: one entry wider than the viewport still has
-        # to go somewhere.
+        # Never leave a row empty.
         if rows[-1] and row_width + item_gap + width > available:
             rows.append([])
             row_width = 0.0
@@ -555,10 +417,8 @@ def _draw() -> None:
 
 
 def _preview_vertex_coords() -> "list[mathutils.Vector] | None":
-    """World-space vertices of the preview object, or None when there is
-    nothing to draw. Read from the *base* mesh, like commit does: the Preview
-    Offset is a Displace modifier, so evaluating it would put the dots where
-    the geometry isn't going to be committed.
+    """World-space vertices of the preview object, or None.
+    From the base mesh, like commit: the offset is a modifier.
     """
     obj = bpy.data.objects.get(mesh_build.PREVIEW_OBJ_NAME)
     if obj is None or obj.type != 'MESH' or not obj.data.vertices:
@@ -580,7 +440,7 @@ def _draw_side_references(state: "state_mod.RetopPatchState") -> None:
     shader.uniform_float("viewportSize", (viewport[2], viewport[3]))
 
     gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('NONE')  # same reason as the dots: they lie on the surface
+    gpu.state.depth_test_set('NONE')  # they lie on the surface
 
     # Hovered side last, so it draws over its neighbours rather than under them.
     for reference in sorted(references, key=lambda ref: ref.index == hovered):
@@ -598,9 +458,7 @@ def _draw_side_references(state: "state_mod.RetopPatchState") -> None:
 def _draw_corner_groups(state: "state_mod.RetopPatchState") -> None:
     """The active patch's sides, coloured by the group each belongs to.
 
-    A group is what a generator will be handed as one side, so this is the
-    whole answer to "what have I made this patch into": five sides in four
-    colours is a quad, and the count is what `find_generator` reads.
+    Five sides in four colours is a quad.
     """
     references = sidematch.active_sides()
     if not references:
@@ -616,12 +474,9 @@ def _draw_corner_groups(state: "state_mod.RetopPatchState") -> None:
     shader.uniform_float("lineWidth", CORNER_GROUP_WIDTH)
 
     gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('NONE')  # they lie on the surface; same as the dots
+    gpu.state.depth_test_set('NONE')  # they lie on the surface
 
-    # Coloured by the *number*, not by position in the walk: two runs carrying
-    # the same number come out the same colour, which is what makes "group 2 is
-    # in two places" visible as a colour appearing twice rather than only as a
-    # line of text.
+    # Coloured by group number, so a number used twice shows as one colour twice.
     for index, reference in by_index.items():
         if len(reference.points) < 2:
             continue
@@ -641,16 +496,9 @@ def _feathered_disc(
 ) -> "tuple[list[tuple[float, float]], list[tuple[float, float, float, float]], list[tuple[int, int, int]]]":
     """A disc whose last pixel fades to nothing, as (vertices, colours, indices).
 
-    Raising the segment count does not fix a jagged circle and it was the
-    obvious thing to try: the facets were never the problem, the *edge* was.
-    There is no multisampling on these draws, so a `TRIS` disc has a hard
-    boundary and every step of it shows. So the rim is a second ring of the
-    same geometry, one pixel out and at zero alpha, drawn through
-    `SMOOTH_COLOR` -- the interpolation across that ring is the antialiasing,
-    computed by the rasteriser rather than asked for.
-
-    A fringe rather than a wider disc: the opaque part still measures exactly
-    the radius asked for, so nothing that lines up with a bubble moves.
+    These draws have no multisampling. A second ring at zero alpha, drawn
+    through `SMOOTH_COLOR`, antialiases the edge.
+    The opaque part still measures exactly `radius`.
     """
     x, y = centre[0], centre[1]
     clear = (colour[0], colour[1], colour[2], 0.0)
@@ -686,15 +534,7 @@ def _draw_group_bubbles(
 ) -> None:
     """POST_PIXEL: one numbered bubble per side, saying which group it is in.
 
-    The number is the whole interface: colour alone says "these two sides are
-    together" only if you can tell two hues apart at a glance across a part,
-    and it cannot say *which* group without a legend. A bubble carrying `2`
-    says it outright, and it is the thing you click.
-
-    Anchored through `sidematch.side_midpoint`, the same helper the hit test
-    uses -- two implementations of "the middle of this side" would drift apart
-    on a curved boundary, and a bubble you cannot click where you see it is
-    worse than no bubble.
+    Anchored through `sidematch.side_midpoint`, shared with the hit test.
     """
     if state.session_phase != 'ADJUST' or not getattr(state, "corner_edit", False):
         return
@@ -714,9 +554,7 @@ def _draw_group_bubbles(
     scale = max(0.5, getattr(state, "overlay_scale", 1.0))
     half = GROUP_BUBBLE_SIZE * scale / 2.0
 
-    # Gathered first so the discs go out as a few batches rather than one per
-    # bubble, and so the hovered one draws last -- over its neighbours, which
-    # is what it means for it to be under the pointer.
+    # Gathered first, so the hovered one draws last.
     bubbles = []
     for reference in references:
         anchor = sidematch.side_midpoint(reference.points)
@@ -733,16 +571,13 @@ def _draw_group_bubbles(
         return
     bubbles.sort(key=lambda entry: entry[3])
 
-    # SMOOTH_COLOR rather than UNIFORM_COLOR: the fringe of each disc carries
-    # its own alpha, and that per-vertex interpolation is what smooths the rim.
+    # SMOOTH_COLOR: the fringe carries its own alpha (`_feathered_disc`).
     shader = gpu.shader.from_builtin('SMOOTH_COLOR')
     gpu.state.blend_set('ALPHA')
     shader.bind()
 
     for screen, _number, colour, is_hovered, is_at_fault in bubbles:
         radius = half * (GROUP_BUBBLE_HOVER_RATIO if is_hovered else 1.0)
-        # Outermost first: each disc is drawn whole, so a later one covers the
-        # middle of the one before and what is left of it is a ring.
         rings = [(GROUP_BUBBLE_OUTLINE, radius * GROUP_BUBBLE_OUTLINE_RATIO),
                  (colour, radius)]
         if is_at_fault:
@@ -751,11 +586,8 @@ def _draw_group_bubbles(
         if is_hovered:
             rings.insert(0, (GROUP_BUBBLE_HOVER_RING,
                              radius * GROUP_BUBBLE_HOVER_RING_RATIO))
-        # Largest first, whatever order they were added in: each disc is drawn
-        # whole, so a smaller one lands on top and what is left of the one
-        # under it is a ring. Added out of order -- the fault ring is wider
-        # than the hover ring -- and sorting is the only thing that keeps both
-        # visible on a bubble that is both.
+        # Largest first: each smaller disc covers the middle of the one under it,
+        # leaving a ring.
         for ring_colour, ring_radius in sorted(rings, key=lambda ring: -ring[1]):
             vertices, colours, indices = _feathered_disc(
                 screen, ring_radius, ring_colour, segments=GROUP_BUBBLE_SEGMENTS)
@@ -781,14 +613,7 @@ def _draw_group_warning(
 ) -> None:
     """POST_PIXEL: what is wrong with the grouping, while the editor is open.
 
-    The red rings say *which* bubbles; this says what the rule is and what to
-    do about it. Both halves are needed -- a rule with no bubbles named cannot
-    be acted on, and ringed bubbles with no rule are a colour nobody can
-    interpret.
-
-    Read off `state.group_warning` rather than recomputed: the panel shows the
-    same string, and two draws reaching their own conclusion about one grouping
-    is how they come to disagree.
+    Reads `state.group_warning`, the string the panel shows too.
     """
     if region is None:
         return
@@ -833,11 +658,7 @@ def _side_appearance(
 ) -> "tuple[tuple[float, float, float, float], float]":
     """(colour, line width) for one side of the picker.
 
-    Green is a side whose vertices the preview is *actually* reproducing, red
-    one that borders a committed neighbour and is not, grey one with nothing
-    across it to match. Only the red is a problem, which is the whole reason it
-    is red: "could be matched but is not" and "has nothing to match" used to
-    draw the same grey, and only the tooltip told them apart.
+    Green: applied. Red: available but not applied. Grey: nothing to match.
     """
     if reference.applied:
         return ((SIDE_MATCHED_HOVER_COLOR if hovered else SIDE_MATCHED_COLOR),
@@ -849,8 +670,7 @@ def _side_appearance(
             SIDE_HOVER_WIDTH if hovered else SIDE_WIDTH)
 
 
-# Red, like the border it names and like an unmatched side: three places, one
-# meaning.
+# Red, like an unmatched side.
 TOOLTIP_CRACK = (1.0, 0.55, 0.5, 1.0)
 
 
@@ -859,9 +679,7 @@ def _draw_side_tooltip(
 ) -> None:
     """What the side under the cursor is doing, said by the cursor.
 
-    Two lines: whether it is selected for surface matching, and why. Drawn from
-    the POST_PIXEL handler, next to the pointer rather than in a corner -- the
-    question is asked with the mouse already on the side.
+    Two lines next to the pointer, from `sidematch.status_of`.
     """
     if state.session_phase != 'ADJUST' or not getattr(state, "match_mode", False):
         return
@@ -891,9 +709,7 @@ def _draw_tooltip_box(
 ) -> None:
     """Two lines in a box by the cursor.
 
-    Shared, not copied: the side picker and the cracked-border report both
-    speak from the pointer, and two boxes drawn by two functions end up
-    disagreeing about padding the first time either is touched.
+    Shared by every tooltip.
     """
     if cursor_window is None:
         return
@@ -910,8 +726,7 @@ def _draw_tooltip_box(
 
     x = cursor_window[0] - region.x + TOOLTIP_OFFSET * scale
     y = cursor_window[1] - region.y + TOOLTIP_OFFSET * scale
-    # Kept inside the region: a tooltip half off the edge of the viewport is
-    # exactly the half you needed to read.
+    # Kept inside the region.
     x = min(max(0.0, x), max(0.0, region.width - width))
     y = min(max(0.0, y), max(0.0, region.height - height))
 
@@ -933,12 +748,7 @@ def _crack_under_cursor(
 ) -> "tuple[int, int] | None":
     """The two patches of the cracked border under the pointer, if any.
 
-    Screen space, like the side picker and for the same reason: the line lies
-    exactly on the surface, so a raycast hits the surface beside it as often as
-    the line itself.
-
-    Walked only when there *are* cracks, which is the exceptional case -- on
-    retopology that welded, this returns after one empty list.
+    In screen space: a raycast would hit the surface beside the line.
     """
     obj = _crack_source(state)
     if obj is None or cursor_window is None:
@@ -974,12 +784,7 @@ def _draw_crack_tooltip(
     region: bpy.types.Region,
     scale: float,
 ) -> None:
-    """Name the two patches of the crack under the cursor, and what to do.
-
-    The dashes say *where*; only this says which two patches disagree, and a
-    seam you cannot attribute is one you cannot fix -- the border looks the
-    same from both sides.
-    """
+    """Name the two patches of the crack under the cursor, and what to do."""
     if not getattr(state, "show_cracks", True):
         return
     pair = _crack_under_cursor(context, state, region)
@@ -1002,9 +807,6 @@ def _draw_copy_tooltip(
     """What Ctrl+click on the patch under the cursor would take. Returns
     whether anything was drawn.
 
-    The outline says *which* patch; only this says what would come across, and
-    a density you cannot read before taking it is a click you have to undo to
-    find out about.
     """
     face_id = getattr(state, "copy_hover_face_id", -1)
     if state.session_phase != 'ADJUST' or face_id == -1:
@@ -1028,20 +830,15 @@ def _side_tooltip_shown(state: "state_mod.RetopPatchState") -> bool:
 
 
 def _draw_points() -> None:
-    """POST_VIEW: the side highlight, which is genuinely 3D geometry.
-
-    The vertex dots are *not* here -- they are drawn in screen space by
-    `_draw_vertex_dots`, from the POST_PIXEL handler.
+    """POST_VIEW: every line drawn in the scene. The dots are in `_draw`.
     """
     context = bpy.context
     state = getattr(context.scene, "plasticity_retop", None)
-    # getattr throughout: a draw handler can fire mid-reload, when the scene
-    # still carries the previous property group.
+    # getattr throughout: a draw handler can fire mid-reload.
     if state is None or not state.session_active:
         return
 
-    # Drawn in every phase, unlike the side highlight: the CAD structure is what
-    # you read *while choosing* a surface, not only while adjusting one.
+    # In every phase, unlike the side highlight.
     _draw_cad_structure(context, state)
     _draw_cracked_borders(context, state)
     _draw_copy_source(context, state)
@@ -1049,9 +846,7 @@ def _draw_points() -> None:
 
     if state.session_phase != 'ADJUST':
         return
-    # One or the other, never both: the corner editor has taken over the same
-    # lines the side picker paints, and two colour schemes on one polyline is
-    # neither of them.
+    # The corner editor or the side picker, never both.
     if getattr(state, "corner_edit", False):
         _draw_corner_groups(state)
     elif getattr(state, "match_mode", False):
@@ -1063,9 +858,8 @@ def _match_dot_sets(
 ) -> "list[tuple[list[mathutils.Vector], tuple[float, float, float, float]]]":
     """[(world points, colour)] the match overlay should draw right now.
 
-    The hovered side shows what clicking it would take; a pinned side shows
-    what it did take, so a pin that landed on the wrong neighbour stays visible
-    after the click rather than only during the hover.
+    The hovered side shows what a click would take; a pinned side shows what it
+    took.
     """
     references = sidematch.active_sides()
     if not references:
@@ -1081,9 +875,7 @@ def _match_dot_sets(
             sets.append((reference.match_world, MATCH_DOT_COLOR))
         elif (reference.index == hovered and reference.match_world
               and kind in (None, sidematch.PIN_EXCLUDED)):
-            # Nothing being matched here: preview what a click would take.
-            # Including a side released by hand -- the dots are what clicking
-            # it again would bring back.
+            # Preview what a click would take, released sides included.
             sets.append((reference.match_world, MATCH_DOT_COLOR))
     return sets
 
@@ -1135,9 +927,7 @@ def _draw_copy_source(
 ) -> None:
     """POST_VIEW: outline the committed patch a Ctrl+click would copy from.
 
-    Its B-rep edges, which `cad_display` already has cached per patch -- a
-    hover may not walk a mesh, and this one fires on every mouse move while a
-    patch is open.
+    Its cached B-rep edges (`cad_display.edge_segments`).
     """
     face_id = getattr(state, "copy_hover_face_id", -1)
     if state.session_phase != 'ADJUST' or face_id == -1:
@@ -1150,10 +940,7 @@ def _draw_copy_source(
     if not segments:
         return
 
-    # Dimmed when the two generators disagree: the outline still says "there is
-    # something here", and the tooltip says why the click will refuse. Drawn
-    # either way, because an outline that appears only on a valid target makes
-    # a refusal look like a target that was never there.
+    # Dimmed, never hidden, when the copy would be refused.
     title, _detail = mesh_build.copy_source_status(state, obj, face_id)
     matches = title.startswith("Copy")
 
@@ -1171,9 +958,7 @@ def _draw_surface_selection(
 ) -> None:
     """POST_VIEW: tint and outline the surfaces Shift+click has gathered.
 
-    Their B-rep edges, which `cad_display` already has cached per patch -- this
-    redraws on every mouse move while the selection stands, and a draw handler
-    may not walk a mesh.
+    From `cad_display`'s cached edges and triangles.
     """
     if state.session_phase != 'PATCH':
         return
@@ -1185,11 +970,7 @@ def _draw_surface_selection(
     if obj is None or obj.type != 'MESH':
         return
 
-    # From the second surface on, the picked ones *are* a patch on the mesh, so
-    # what gets drawn is that patch: one outline growing rather than a set of
-    # borders sitting next to each other. Its own ids no longer resolve --
-    # their polygons answer with the patch now -- so this is not a preference
-    # between two drawings, it is which one there is.
+    # From the second surface on, the pick is a pending composite: draw that.
     pending = getattr(state, "pending_composite_id", -1)
     face_ids = ([pending] if pending != -1
                 else patch_data.parse_surface_selection(raw))
@@ -1200,10 +981,7 @@ def _draw_surface_selection(
         outline.extend(cad_display.edge_segments(obj.data, face_id))
         fill.extend(cad_display.patch_triangles(obj.data, face_id))
 
-    # The candidate is a *surface*, which a composite may already have
-    # swallowed -- so it is looked up among the mesh's own, not among the
-    # patches. Without that it would stop lighting up the moment the second
-    # surface was picked, i.e. the moment the gesture was in use.
+    # The candidate is a raw surface, which a composite may have absorbed.
     candidate_fill = (cad_display.patch_triangles(obj.data, candidate, surfaces=True)
                       if candidate != -1 else [])
     if not outline and not fill and not candidate_fill:
@@ -1212,18 +990,13 @@ def _draw_surface_selection(
     matrix = obj.matrix_world
     rv3d = context.region_data
     gpu.state.blend_set('ALPHA')
-    # Depth-tested, unlike the copy-source outline: this is a tint *on* a
-    # surface, and drawn through the model the far side of a curved part paints
-    # over the near side -- which is the same reason `cad_display_xray` is off
-    # by default. The nudge is what keeps it from z-fighting with the very
-    # surface it lies on, exactly as the depth-tested CAD lines do.
+    # Depth-tested, and nudged towards the viewer (`_towards_viewer`).
     gpu.state.depth_test_set('LESS_EQUAL')
 
     def place(points: "list[mathutils.Vector]") -> "list[mathutils.Vector]":
         return _towards_viewer([matrix @ point for point in points], rv3d)
 
-    # Fills first, outline over them: the border is the exact statement of
-    # where the surface ends, and a translucent fill must never soften it.
+    # Fills first, outline over them.
     _draw_tri_batch(place(candidate_fill), SURFACE_CANDIDATE_COLOR)
     _draw_tri_batch(place(fill), SURFACE_FILL_COLOR)
     _draw_line_batch(place(outline), SURFACE_SELECTED_COLOR, SURFACE_SELECTED_WIDTH)
@@ -1252,11 +1025,7 @@ def _draw_cracked_borders(
 ) -> None:
     """POST_VIEW: the borders two committed patches failed to close.
 
-    Drawn in every phase and through the model unconditionally. Both are
-    deliberate: a crack is a defect in finished work, so it has to be visible
-    while picking the next patch -- which is when it can still be acted on --
-    and one hidden behind the part it is in is a warning that only reaches
-    somebody already looking at it.
+    In every phase, always through the model.
     """
     if not getattr(state, "show_cracks", True):
         return
@@ -1285,9 +1054,8 @@ def _cad_display_target(
 ) -> "tuple[bpy.types.Object | None, bpy.types.Mesh | None, int | None]":
     """(object, mesh, face id or None) the CAD overlay should describe.
 
-    None for the face id means the whole object. A scope of ACTIVE with nothing
-    picked yet falls back to the whole object rather than drawing nothing --
-    "pick a surface" is exactly the moment the model's layout is worth seeing.
+    None for the face id means the whole object, also for ACTIVE with nothing
+    picked.
     """
     obj = bpy.data.objects.get(getattr(state, "session_object_name", ""))
     if obj is None or obj.type != 'MESH' or not obj.data.get("face_ids"):
@@ -1308,8 +1076,7 @@ def _draw_line_batch(
 ) -> None:
     """One LINES batch for a whole list of point pairs.
 
-    One batch, not one per edge: a CAD part has hundreds of edges, and a draw
-    call each is what turns an overlay into a stutter.
+    Never one draw call per edge.
     """
     if len(points) < 2:
         return
@@ -1326,12 +1093,7 @@ def _draw_tri_batch(
     points: "list[mathutils.Vector]",
     color: tuple[float, float, float, float],
 ) -> None:
-    """One TRIS batch for a whole list of triangle corners.
-
-    Corners rather than indices: what this draws is a patch's own polygons,
-    which come out of `cad_display` already fanned, and an index buffer would
-    mean building a vertex table per redraw to save nothing.
-    """
+    """One TRIS batch for a whole list of triangle corners."""
     if len(points) < 3:
         return
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
@@ -1340,11 +1102,8 @@ def _draw_tri_batch(
     batch_for_shader(shader, 'TRIS', {"pos": points}).draw(shader)
 
 
-# How far a depth-tested CAD line is nudged towards the viewer, as a share of
-# its distance to the viewpoint. Proportional rather than absolute for the same
-# reason the raycast's step past a hit is: a fixed epsilon is either too small
-# to clear the surface at range or large enough to lift a line off a small part
-# visibly. Small enough that the line still reads as lying *on* the surface.
+# How far a depth-tested line is nudged towards the viewer, as a share of its
+# distance to the viewpoint. Proportional, never absolute.
 DEPTH_NUDGE = 0.002
 
 
@@ -1353,17 +1112,11 @@ def _towards_viewer(
 ) -> list["mathutils.Vector"]:
     """Lift world-space points off the surface, towards the viewpoint.
 
-    Only needed when the CAD display is depth-tested: the lines lie exactly on
-    the surface they describe, so testing them against it without this is a
-    coin flip per pixel and they come out as a stipple. One view direction for
-    the whole batch rather than a per-point eye vector -- at a nudge this small
-    the difference at the edge of the frame is far below a pixel, and a draw
-    handler should not be normalising a vector per point.
+    Without it, depth-tested lines on the surface come out as a stipple.
+    One view direction for the whole batch.
     """
     if rv3d is None or not points:
         return points
-    # Everything here comes out of the region's own matrix, so the draw handler
-    # still imports nothing it didn't already.
     inverse = rv3d.view_matrix.inverted()
     towards = inverse.col[2].to_3d().normalized()  # camera +Z: back at the viewer
     origin = inverse.translation
@@ -1387,11 +1140,8 @@ def _draw_cad_structure(
     matrix = obj.matrix_world
     gpu.state.blend_set('ALPHA')
 
-    # Drawn through the model by default -- that is what makes the structure of
-    # a whole part readable at a glance. Turned off, they are occluded like
-    # real geometry, so the far side of a curved or enclosed shape stops
-    # showing through the near side; the nudge is what keeps them from
-    # z-fighting with the very surface they lie on.
+    # Through the model when `cad_display_xray` is on; otherwise depth-tested
+    # and nudged towards the viewer.
     xray = getattr(state, "cad_display_xray", True)
     rv3d = context.region_data
     if xray:
@@ -1403,8 +1153,7 @@ def _draw_cad_structure(
         world = [matrix @ point for point in points]
         return world if xray else _towards_viewer(world, rv3d)
 
-    # Flow first, edges over it: the edges are the exact thing and should never
-    # be hidden by the derived one.
+    # Flow first, edges over it.
     if want_flow:
         colour = tuple(getattr(state, "flow_color", (0.65, 0.45, 1.0)))
         _draw_line_batch(
@@ -1430,8 +1179,7 @@ def _draw_brep_vertices(
 ) -> None:
     """The junctions between CAD edges, as screen-space dots.
 
-    Tied to the edge display: a B-rep vertex is where two edges meet, and dots
-    with no edges to sit on say nothing.
+    Only with the edge display on.
     """
     if not getattr(state, "show_cad_edges", False):
         return
@@ -1472,10 +1220,8 @@ def _discs_around(
 ) -> tuple[list[tuple[float, float]], list[tuple[int, int, int]]]:
     """A triangle fan per centre, as (vertices, indices) for a TRIS batch.
 
-    Round rather than square: these mark where a vertex *is*, and a square dot
-    reads as a handle to grab. `segments` stays a multiple of four so the disc
-    measures exactly 2*half across and 2*half tall -- the size setting has to
-    stay something a test can measure.
+    Round, never square. `segments` stays a multiple of four so the disc
+    measures exactly 2*half across.
     """
     vertices = []
     indices = []
@@ -1526,8 +1272,7 @@ def _draw_vertex_dots(
     gpu.state.blend_set('ALPHA')
     shader.bind()
 
-    # Dark disc behind the bright one, so a dot stays readable over both a
-    # pale CAD surface and the dark background.
+    # Dark disc behind the bright one, for contrast.
     for half, color in ((size * VERT_OUTLINE_RATIO * 0.5, VERT_OUTLINE_COLOR),
                         (size * 0.5, VERT_COLOR)):
         vertices, indices = _discs_around(projected, half)
@@ -1541,15 +1286,10 @@ def _draw_vertex_dots(
 # ---------------------------------------------------------------------------
 #  The patch data debug display
 # ---------------------------------------------------------------------------
-# What the bridge actually wrote, on the surface it wrote it about: the face id
-# of each patch, and the `[loop_start, loop_count]` range that names it.
+# Each patch's face id and `[loop_start, loop_count]`, on its surface.
 #
-# Its own handler rather than the session's, and deliberately so: the question
-# it answers -- "which CAD face is this, and does the mesh still agree with the
-# groups?" -- is asked of a freshly imported object, before any session exists.
-# The callback early-outs on the toggle, so it is installed once and left there;
-# a handler armed and disarmed by a property update is a handler that is missing
-# after a file load, which looks exactly like an overlay that does not work.
+# Its own handler, installed once for the life of the addon: it works with no
+# session. The callback early-outs on the toggle.
 DEBUG_LABEL_COLOR = (1.0, 0.95, 0.55, 1.0)
 DEBUG_DETAIL_COLOR = (0.72, 0.80, 0.95, 1.0)
 DEBUG_BG = (0.08, 0.08, 0.10, 0.78)
@@ -1557,18 +1297,14 @@ DEBUG_FONT_SIZE = 12
 DEBUG_PAD = 5
 DEBUG_LINE_GAP = 2
 
-# A backstop, not a policy. Under Hover -- the default -- one label is drawn and
-# this is never reached; under All, on a part of a few hundred faces, the text
-# stopped being readable long before it stopped being affordable.
+# A backstop for the All scope.
 MAX_DEBUG_LABELS = 250
 
 _debug_handle: object | None = None
 
 # (object name, face id) under the cursor, or None. Written by
-# `operators.RETOP_OT_patch_hover`, which is the only thing that sees an event;
-# a module global rather than a scene property because a property written on
-# every mouse move marks the file as modified, and reading a mesh should not.
-# Empty after a reload and after a file load, which this must cope with.
+# `operators.RETOP_OT_patch_hover`. A module global, never a scene property:
+# writing one on every mouse move would mark the file modified.
 debug_hover: tuple[str, int] | None = None
 
 
@@ -1582,12 +1318,8 @@ def _patch_debug_target(
 ) -> "bpy.types.Object | None":
     """The object whose patch data to write out.
 
-    Under Hover that is whatever the cursor found, which may be neither the
-    active object nor the session's -- pointing at a patch is the whole of the
-    question being asked, so nothing else gets to override it. Otherwise the
-    active object when it carries face ids, so this works with no session at
-    all, and the session's object failing that, since during one the active
-    object may well be the preview or the result mesh.
+    Under Hover, whatever the cursor found. Otherwise the active object when
+    it has face ids, else the session's object.
     """
     if scope == 'HOVER':
         if debug_hover is None:
@@ -1613,16 +1345,13 @@ def _facing_away(
 ) -> bool:
     """Whether a patch's own normal points away from the viewpoint.
 
-    The labels are screen-space text and so have no depth to be tested against
-    -- which is what keeps them legible over the surface they describe, and also
-    what would otherwise write the back of a closed part over its front.
+    Labels have no depth test, so back faces are culled by normal.
     """
     inverse = rv3d.view_matrix.inverted()
     if rv3d.is_perspective:
         eye = anchor - inverse.translation
     else:
-        # Ortho: every point is seen along the same axis, and the camera's
-        # translation is not on it.
+        # Orthographic: one view axis for every point.
         eye = -inverse.col[2].to_3d()
     return normal.dot(eye) > 0.0
 
@@ -1657,9 +1386,7 @@ def _draw_patch_debug() -> None:
 
     matrix = obj.matrix_world
     rotation = matrix.to_3x3()
-    # A hovered patch is the one the cursor is on, so it is in front by
-    # construction; culling it can only ever hide the answer (a back face seen
-    # through an open shell is still the face being pointed at).
+    # Never cull the hovered patch: the cursor is on it.
     cull = getattr(state, "debug_patch_cull", True) and scope != 'HOVER'
     detail = getattr(state, "debug_patch_detail", True)
     scale = max(0.5, getattr(state, "overlay_scale", 1.0))
@@ -1696,7 +1423,7 @@ def _draw_patch_debug() -> None:
         _draw_filled_rect(x - pad, y - pad, width + 2 * pad, height + 2 * pad,
                           DEBUG_BG)
 
-        # Bottom-up, so the id reads first from the top.
+        # Bottom-up, so the id is on top.
         cursor = y
         for text, colour, text_w, text_h in reversed(measured):
             blf.color(font_id, *colour)
@@ -1707,8 +1434,8 @@ def _draw_patch_debug() -> None:
 
 
 def enable_patch_debug() -> None:
-    """Install the debug handler. Idempotent, and left installed for the life of
-    the addon -- see the note above."""
+    """Install the debug handler. Idempotent; left installed for the life of
+    the addon."""
     global _debug_handle
     if _debug_handle is None:
         _debug_handle = bpy.types.SpaceView3D.draw_handler_add(
@@ -1725,16 +1452,9 @@ def disable_patch_debug() -> None:
 # ---------------------------------------------------------------------------
 #  The mirror's axis picker
 # ---------------------------------------------------------------------------
-# Alt+X arms `RETOP_OT_mirror` and it then waits for X, Y or Z. That prompt
-# lived in the status bar alone, which is at the bottom of the *window* -- the
-# one place nobody is looking while their hand is on the keyboard and their eyes
-# are on the part. Hard Ops puts its axis choice under the cursor, and this is
-# the same idea: three keys, each showing whether that axis is mirrored right
-# now, drawn where the question was asked.
-#
-# It has its own handler rather than riding the session's, because the mirror is
-# a GLOBAL key: with `global_keys_outside_session` on it is armed with no
-# session running and no session overlay installed.
+# Alt+X arms `RETOP_OT_mirror`, which waits for X, Y or Z. This draws the three
+# axes under the cursor, lit when mirrored.
+# Its own handler: the mirror can be armed with no session running.
 MIRROR_AXES = ("X", "Y", "Z")
 MIRROR_BOX = 34          # side of one axis square, before UI scale
 MIRROR_GAP = 6
@@ -1748,8 +1468,7 @@ MIRROR_TITLE = (0.88, 0.89, 0.91, 1.0)
 
 _mirror_handle = None
 # (window x, window y) of the pointer, and which axes are on. Written by the
-# mirror operator; a draw handler has no event to read a cursor from and no
-# business reaching for a modifier on an object.
+# mirror operator.
 mirror_cursor: "tuple[int, int] | None" = None
 mirror_state: tuple[bool, bool, bool] = (False, False, False)
 
@@ -1762,9 +1481,7 @@ def _draw_mirror_gizmo() -> None:
     if region is None or region.type != 'WINDOW':
         return
 
-    # The panel's own overlay scale, read defensively: this handler can be
-    # installed with no session and the scene property is the only thing that
-    # says how big the user wants the addon's overlays.
+    # getattr: this can run with no session.
     state = getattr(bpy.context.scene, "plasticity_retop", None)
     scale = max(0.5, getattr(state, "overlay_scale", 1.0))
     box = MIRROR_BOX * scale
@@ -1812,9 +1529,7 @@ def enable_mirror_gizmo() -> None:
 def disable_mirror_gizmo() -> None:
     """Drop the handler *and* the state it draws from.
 
-    Every exit path of the mirror modal calls this -- an axis pressed, Esc, a
-    click, a key that isn't an axis -- because a draw handler nobody owns is
-    the one kind of leak the version string cannot report.
+    Every exit path of the mirror modal must call this.
     """
     global _mirror_handle, mirror_cursor
     mirror_cursor = None

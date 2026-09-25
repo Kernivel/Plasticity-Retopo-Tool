@@ -11,17 +11,12 @@ Both are filled the same way -- a ring of quads running around the patch
 "across"). Unlike the other generators this one is never chosen by side count;
 `operators` picks it when a patch turns out to have two boundary loops.
 
-How the two loops are paired against each other is what decides whether the
-rungs run straight across the band or all lean by the same small angle; see
-the note above `phase_align`.
+How the two loops are paired decides whether the rungs run straight across;
+see the note above `phase_align`.
 
-Two things it deliberately does NOT do yet, both inherited from the single
-shared span model: the loops are matched by arc length, not by pairing their
-corners, so a hole shaped very differently from the outer boundary gives a
-distorted band (splitting the face in Plasticity is the better answer there);
-and spans are not propagated *into* a ring from its neighbours, since "around"
-is one number for the whole loop rather than a per-side one. Spans are still
-propagated *out* of it, per side (see operators' commit path).
+Not done yet: the loops are paired by arc length, not by their corners, so a
+hole shaped very differently from the outer boundary distorts the band. Spans
+propagate out of a ring, not into it.
 """
 import math
 from typing import TYPE_CHECKING, Any
@@ -50,21 +45,11 @@ def allocate_segments(
     """Split `total` segments among sides proportionally to `lengths`, with at
     least one segment per side (largest-remainder rounding).
 
-    `total` is raised to the number of sides if it is smaller -- a side can't
-    have zero segments, and both loops of a ring must end up with exactly the
-    same number of points.
+    `total` is raised to the number of sides if smaller.
 
-    `pinned` names sides that already know their count: a side handed a
-    committed neighbour's own vertices has to come out with exactly as many
-    segments as it was given, or the resample moves the very points the match
-    existed to land on. Only the remainder is shared out among the rest.
-
-    A pin set that cannot fit -- its total, plus one segment for every free
-    side, exceeding `total` -- is dropped **whole**. Keeping some of it would
-    hand part of the loop a neighbour's vertices and resample the rest onto a
-    number nobody asked for, which is the half-welded crack this exists to
-    prevent; and the loop's total is not negotiable, since both rims of a band
-    must come out with the same point count.
+    `pinned` gives sides an exact count (a matched side must keep its own
+    vertices). Only the remainder is shared among the other sides.
+    A pin set that cannot fit is dropped whole: half of one is a crack.
     """
     n = len(lengths)
     if n == 0:
@@ -96,13 +81,12 @@ def allocate_segments(
     diff = total - sum(alloc)
 
     if diff > 0:
-        # hand the leftovers to the sides with the largest dropped fraction
+        # Leftovers go to the sides with the largest dropped fraction.
         order = sorted(free, key=lambda i: raw[i] - math.floor(raw[i]), reverse=True)
         for k in range(diff):
             alloc[order[k % len(free)]] += 1
     while diff < 0:
-        # only a free side may give a segment back: a pinned one is reproducing
-        # a neighbour's vertices and has no spare.
+        # Only a free side may give a segment back.
         reducible = [index for index in free if alloc[index] > 1]
         if not reducible:
             break
@@ -118,14 +102,9 @@ def ring_from_sides(
 ) -> tuple[list[mathutils.Vector], list[int], list[int]]:
     """Resample a loop's sides into exactly `total` points walking around it.
 
-    Returns (points, corner_indices, alloc): `corner_indices` are the positions
-    in `points` of each side's first point, i.e. the patch corners -- those are
-    untouched source-mesh vertices, so they stay weldable by identity.
-
-    `pinned` is passed straight to `allocate_segments`: a matched side asked
-    for exactly its own count gets its polyline handed back untouched, since
-    `resample_polyline_by_arclength` returns what it was given when the count
-    already matches.
+    Returns (points, corner_indices, alloc). `corner_indices` are the positions
+    of the patch corners in `points`.
+    `pinned` is passed to `allocate_segments`. A matched side keeps its points.
     """
     alloc = allocate_segments([polyline_length(side) for side in sides], total,
                               pinned)
@@ -140,26 +119,16 @@ def ring_from_sides(
     return points, corner_indices, alloc
 
 
-# "This corner has no vertex": emitted for a phased rim, whose points land
-# nowhere near the source vertex the loop started at. `mesh_build` skips a
-# negative local index rather than stamping an id onto a point that moved.
+# "This corner has no vertex": emitted for a phased rim, whose points moved off
+# the source vertices. `mesh_build` skips it.
 NO_CORNER = -1
 
 # --- is this really a band? --------------------------------------------------
 #
-# Two boundary loops is a *topological* annulus, and this generator fills any
-# annulus. Whether it should is another question. A washer, a tube wall, a
-# fillet running all the way round a boss: the gap between the two loops is
-# roughly the same everywhere, and a ring of quads across it is exactly right.
-# A 200x100 plate with a 5mm hole is also an annulus, and filling it as a band
-# is a disaster -- both loops must end up with the same number of points, so
-# either the hole gets a hundred of them or the plate's outline gets twelve,
-# and every quad is stretched the width of the plate.
-#
-# The two are told apart by how *even* the gap is, and by how far apart the two
-# perimeters are. Both limits are deliberately generous: a band whose hole is a
-# different shape from its outer boundary is still a band, and the cost of
-# calling one a plate is worse than the cost of the reverse.
+# Two loops do not always make a band: a plate with a small hole is not one.
+# A band has an even gap between its loops and comparable perimeters.
+# Both limits are generous on purpose. See "Two boundary loops is not the same
+# thing as a band" in CLAUDE.md.
 BAND_GAP_SPREAD = 4.0       # widest gap over narrowest, sampled around the loop
 BAND_PERIMETER_RATIO = 6.0  # outer perimeter over inner
 
@@ -176,9 +145,7 @@ def band_gaps(loops: list[Loop], samples: int = 16) -> list[float]:
 
 
 def is_band(loops: list[Loop]) -> bool:
-    """True when the two loops sit at a comparable distance all the way round,
-    i.e. when a ring of quads across them is the right fill. See above.
-    """
+    """True when the two loops sit at a comparable distance all the way round."""
     if len(loops) != 2:
         return False
 
@@ -187,10 +154,8 @@ def is_band(loops: list[Loop]) -> bool:
         return False
     widest = max(gaps)
     if widest <= 1e-12:
-        return True  # the two loops coincide: degenerate either way, and a
-        # zero-width band is at least what the geometry says it is.
-    # Floored, so one sample landing on a point the two loops share cannot make
-    # an otherwise even band look infinitely uneven.
+        return True  # the two loops coincide
+    # Floored, so one sample on a point both loops share is not infinitely uneven.
     narrowest = max(min(gaps), widest * 1e-3)
     if widest > narrowest * BAND_GAP_SPREAD:
         return False
@@ -206,18 +171,9 @@ def loop_point_count(sides: list[list[mathutils.Vector]],
                      pinned: dict[int, int] | None = None) -> int:
     """How many distinct points a loop's sides already hold.
 
-    Each side repeats its neighbour's first point, so a side of k+1 points
-    contributes k -- the same arithmetic `ring_from_sides` does when it drops
-    every side's last point. This is what a *matched* loop's count has to be:
-    its points are a committed neighbour's own vertices, and resampling them to
-    any other number would move them off it.
-
-    `pinned` overrides the sides a match replaced. On a rim of one cornerless
-    side the two agree, which is why this went unnoticed: `len(side) - 1` of a
-    substituted polyline *is* the matched count. On a rim cut into several --
-    isoparms, or a corner the angle test found -- only the matched sides carry
-    the neighbour's vertices, and the rest are still the CAD tessellation.
-    Taking the pin per side is what keeps the two apart.
+    A side of k+1 points contributes k. This is the count a matched loop must
+    keep.
+    `pinned` gives the count of each side a match replaced.
     """
     pins = pinned or {}
     return sum(pins.get(index, max(1, len(side) - 1))
@@ -227,34 +183,21 @@ def loop_point_count(sides: list[list[mathutils.Vector]],
 def around_count(loops: list[Loop], span_u: int) -> int:
     """Points around the ring for a given "around" span.
 
-    Both loops must come out with exactly the same count, and neither can have
-    fewer points than it has sides, so the two side counts are a floor here.
-    The commit path needs the same number to re-derive how the ring split its
-    span per side, hence one definition shared by both.
+    Both loops get the same count, never fewer than either loop's side count.
+    Shared with the commit path.
     """
     return max(int(span_u), len(loops[0]), len(loops[1]), 3)
 
 
 # --- pairing the two loops --------------------------------------------------
 #
-# Every rung of the band runs from outer[i] to inner[i], so how the two loops
-# are indexed against each other *is* the shape of the quads. Two things have
-# to be recovered: the direction (a hole winds the opposite way from the face's
-# outer boundary) and where inner[0] sits.
+# Every rung runs from outer[i] to inner[i], so how the loops are indexed
+# against each other is the shape of the quads.
 #
-# `align_rings` searches whole indices, which is all it can do once both loops
-# are resampled -- and that leaves up to half a step of rotation unaccounted
-# for. On an annulus that residue is not noise: it is a *constant* skew, the
-# same small angle on every rung, which is precisely the "the edges aren't
-# straight across" look. Half a step of 64 is about 2.8 degrees.
-#
-# `phase_align` fixes it by choosing where the inner loop is *sampled from*
-# rather than which sample to start at, so the residue goes to zero. It is only
-# safe on a loop with no corners of its own: a corner is an untouched source
-# vertex welded by identity, and moving one while keeping its name would make a
-# later patch reuse a vertex that is no longer there. A cornerless rim has no
-# such name to keep -- its start is wherever the half-edge walk happened to
-# begin, which nothing else in the model agrees on anyway.
+# `align_rings` searches whole index offsets, which leaves up to half a step of
+# constant skew. `phase_align` removes it by choosing where the other loop is
+# sampled from. Only on a cornerless rim: corners are welded by identity and
+# must not move. See "A band's rungs must run straight across it" in CLAUDE.md.
 
 
 def closed_points(side: list[mathutils.Vector]) -> list[mathutils.Vector]:
@@ -267,9 +210,7 @@ def closed_points(side: list[mathutils.Vector]) -> list[mathutils.Vector]:
 def loop_area_vector(points: list[mathutils.Vector]) -> mathutils.Vector:
     """Newell's normal for a closed polyline: which way round it runs.
 
-    Its *direction* is the answer being asked for -- two orderings of the same
-    loop give area vectors pointing opposite ways -- so nothing here needs the
-    loop to be planar or the magnitude to mean anything.
+    Only its direction is meaningful.
     """
     normal = mathutils.Vector((0.0, 0.0, 0.0))
     n = len(points)
@@ -311,8 +252,7 @@ def rotate_closed(
 ) -> list[mathutils.Vector]:
     """The same closed polyline, starting `distance` along it.
 
-    Resampling anchors on the first point, so rotating the input is how a
-    phase is applied -- there is nothing to add to `resample_polyline_by_arclength`.
+    Resampling anchors on the first point, so this is how a phase is applied.
     """
     lengths = _segment_lengths(points)
     total = sum(lengths)
@@ -328,8 +268,7 @@ def rotate_closed(
             factor = remainder / lengths[i] if lengths[i] > 1e-12 else 0.0
             start = points[i].lerp(points[(i + 1) % n], factor)
             rest = [points[(i + 1 + k) % n] for k in range(n)]
-            # Drop a wrapped point that lands on the new start, or the resample
-            # sees a zero-length segment where the seam used to be.
+            # Drop a wrapped point on the new start: no zero-length segment.
             if rest and (rest[-1] - start).length < 1e-9:
                 rest = rest[:-1]
             return [start] + rest
@@ -345,16 +284,9 @@ def phase_align(
 ) -> list[mathutils.Vector]:
     """Resample `inner_loop` into `count` points, each facing its outer partner.
 
-    The phase is read off the geometry rather than searched: for each outer
-    point, the arc-length of the nearest point on the inner loop says where
-    that rung *wants* to land, and the offset it implies is
-    `t_i - i * L / count`. Those offsets agree to within noise on a real band,
-    so their circular mean is the phase -- circular because they live on a
-    loop, where 0 and L are the same answer and a plain average of values
-    either side of the seam lands halfway round.
-
-    Both directions are tried: a hole winds the opposite way from the outer
-    boundary, and the nearest-point map cannot tell which way round it is.
+    Each outer point's nearest arc length on the inner loop implies an offset.
+    The phase is the circular mean of those offsets (0 and L are the same
+    offset). Both directions are tried.
     """
     if len(inner_loop) < 3 or count < 3:
         return []
@@ -375,9 +307,7 @@ def phase_align(
             accumulated += mathutils.Vector((math.cos(angle), math.sin(angle)))
 
         if accumulated.length < 1e-9:
-            # The offsets cancelled out: no phase is better than another, which
-            # means this is not a band the map can read. Leave it at zero and
-            # let the cost below decide between the two directions.
+            # The offsets cancelled out: leave the phase at zero.
             phase = 0.0
         else:
             phase = (math.atan2(accumulated.y, accumulated.x)
@@ -399,11 +329,8 @@ def align_rings(
 ) -> tuple[list[mathutils.Vector], dict[int, int]]:
     """Re-index `inner` so that inner[i] faces outer[i].
 
-    A hole's boundary winds the opposite way from the face's outer boundary,
-    and neither has a meaningful start point, so both the direction and the
-    starting offset have to be recovered -- otherwise the band comes out
-    twisted or turned inside out. Every (direction, offset) candidate is scored
-    on a subsample of the ring, which keeps this O(n) rather than O(n^2).
+    Recovers both the direction and the starting offset. Each candidate is
+    scored on a subsample of the ring.
 
     Returns (aligned_points, position_of_original_index).
     """
@@ -469,33 +396,23 @@ class RingGenerator(Generator):
 
         across = max(1, int(span_settings.get("span_v", 1)))
 
-        # A *locked* loop carries a committed neighbour's own vertices, put
-        # there by the side matching. It is the fixed thing in the band: its
-        # points have to come out exactly as they went in, and the other loop
-        # is what gets aligned onto them. Before this, the band was always led
-        # by loops[0] and the other rim was phase-*resampled* onto it -- so a
-        # match landing on that other rim was thrown away and the two rims came
-        # back half a step apart. Which rim is which is decided by extent
-        # (`sort_loops_outer_first`), and on a tube the two are equal, so the
-        # same match worked or didn't depending on nothing the user can see.
+        # A locked loop carries a matched neighbour's vertices. It leads the
+        # band, and the other loop is aligned onto it. See "A matched rim leads
+        # the band" in CLAUDE.md.
         locked = {index for index in span_settings.get("locked_loops", ()) or ()
                   if index in (0, 1)}
-        # {loop: {side within the loop: segments}} for every side a match
-        # replaced. A *loop* being locked says only that something on it was
-        # matched; which sides, and how many segments each was handed, is what
-        # a rim cut into several sides needs -- see `loop_point_count`.
+        # {loop: {side within the loop: segments}} for every matched side.
         matched = span_settings.get("matched_sides") or {}
         pins_for = {index: dict(matched.get(index, {}) or {}) for index in (0, 1)}
         around = around_count(loops, span_settings.get("span_u", 1))
         for index in sorted(locked):
-            # At most one count can be honoured, and `sidematch._honours` has
-            # already dropped any match that disagrees with the resolved span.
+            # One count only. `sidematch._honours` already dropped disagreeing
+            # matches.
             around = max(loop_point_count(loops[index], pins_for[index]),
                          len(loops[0]), len(loops[1]), 3)
             break
 
-        # Which loop leads: the locked one, else the outer -- which is what it
-        # always was.
+        # The locked loop leads, else the outer one.
         lead_index = 1 if (1 in locked and 0 not in locked) else 0
         free_index = 1 - lead_index
         lead_sides, free_sides = loops[lead_index], loops[free_index]
@@ -507,14 +424,8 @@ class RingGenerator(Generator):
         if n < 3:
             raise ValueError("Ring patch boundary is degenerate")
 
-        # A rim with corners of its own has to keep them: they are untouched
-        # source vertices, welded to neighbouring patches by identity. A
-        # cornerless one has no such name -- its start is wherever the
-        # half-edge walk began -- so it is free to be sampled from wherever
-        # makes the rungs run straight across. See the note above phase_align.
-        # A locked rim is never phased either, for a different reason: its
-        # points are not a sample of a boundary at all, they are a neighbour's
-        # vertices.
+        # Only a cornerless, unlocked rim is phased (see the note above
+        # phase_align).
         free_cornerless = len(free_sides) == 1 and free_index not in locked
         phased = (phase_align(lead, closed_points(free_sides[0]), n)
                   if free_cornerless else [])
@@ -530,12 +441,8 @@ class RingGenerator(Generator):
                 raise ValueError("Ring patch boundary is degenerate")
             free, free_position_of = align_rings(lead, free)
 
-        # `align_rings` re-indexes the free loop, so its corners have to be
-        # looked up through the map it returns -- the lead loop is untouched
-        # and maps to itself. Getting this wrong stamps a loop's corner ids
-        # onto whichever vertices happen to sit at those positions, and a
-        # corner welds by *identity*: the neighbouring patches then weld to
-        # points on the far side of the band.
+        # `align_rings` re-indexed the free loop: always look its corners up
+        # through the map it returns.
         lead_position_of = {i: i for i in range(n)}
         if lead_index == 0:
             outer, outer_corners, outer_alloc = lead, lead_corners, lead_alloc
@@ -552,18 +459,10 @@ class RingGenerator(Generator):
         uvs = []
         for r in range(across + 1):
             t = r / across
-            # Annulus UVs: the ring closes on itself in UV space too, so the
-            # seam column isn't stretched the way a flat u=i/n layout would be.
+            # Annulus UVs, closed in UV space too.
             radius = 1.0 - 0.6 * t
-            # Boundary rows are normally left exactly where the loops put them:
-            # they are samples of the real boundary, and moving them would move
-            # them off whatever a neighbouring patch welds to. A *phased* rim
-            # is the exception. Its points no longer land on source vertices --
-            # that is the whole point of the phase -- so on a curved rim every
-            # one of them sits mid-chord, a sagitta inside the true surface.
-            # They are not shared with anything either (their corner id was
-            # dropped for the same reason), so they get the same reprojection
-            # the interior does.
+            # Boundary rows stay where the loops put them, except a phased rim,
+            # which is off the surface and gets reprojected like the interior.
             reproject = (0 < r < across
                          or (inner_phased and r == across)
                          or (outer_phased and r == 0))
@@ -582,16 +481,9 @@ class RingGenerator(Generator):
         def index_of(r: int, i: int) -> int:
             return r * n + (i % n)
 
-        # Which way the outer row ends up running decides which way every quad
-        # faces, and the two loops of a patch wind *opposite* ways -- an outer
-        # boundary one way, a hole the other -- so pairing them straight across
-        # means one of them is reversed. It used to be the hole, always,
-        # because the outer loop always led. Once a matched hole leads instead,
-        # it is the outer row that comes back reversed and every normal of the
-        # band flips: that is the retopology turning inside out the moment a
-        # side is matched. Emitting the quads the other way round when that
-        # happens keeps the band facing whichever way the CAD boundary says,
-        # matched or not.
+        # The band faces the way the outer loop winds. Flip the quads when the
+        # outer row came back reversed. See "Which way the band faces" in
+        # CLAUDE.md.
         flipped = (loop_area_vector(outer).dot(
             loop_area_vector([point for side in outer_sides
                               for point in side[:-1]])) < 0.0)
@@ -603,15 +495,9 @@ class RingGenerator(Generator):
                         index_of(r + 1, i + 1), index_of(r + 1, i))
                 faces.append(quad[::-1] if flipped else quad)
 
-        # Corners first of the outer loop then of the hole, matching the order
-        # operators._prepare_patch collects their source vertex ids in.
-        # A phased rim's points sit wherever the alignment put them, so none of
-        # them *is* the source vertex its loop started at. Its corner is
-        # emitted as NO_CORNER rather than dropped: the caller zips this list
-        # against corner_source_ids positionally, and the outer loop's ids come
-        # first, so shortening the outer half would stamp an outer id onto the
-        # hole's vertex. A point with no id welds by proximity like every other
-        # boundary point, which is what a moved one should do.
+        # Outer loop corners first, then the hole's, as the caller expects.
+        # A phased rim's corner is NO_CORNER, never dropped: the caller zips
+        # this list with corner_source_ids by position.
         corner_local_indices = [
             NO_CORNER if outer_phased else index_of(0, outer_position_of[c])
             for c in outer_corners]
@@ -622,7 +508,6 @@ class RingGenerator(Generator):
         boundary_local_indices += [index_of(across, i) for i in range(n)]
 
         result = GenerationResult(verts, faces, uvs, corner_local_indices, boundary_local_indices)
-        # Kept for the commit path: propagating a ring's spans to its neighbours
-        # is per side, and only the generator knows how it split "around" up.
+        # Per-side counts, for the commit path to register.
         result.side_allocation = (outer_alloc, inner_alloc)
         return result

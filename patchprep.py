@@ -1,14 +1,9 @@
 """Turning one Plasticity face into something a generator can fill.
 
-The step between `patch_data` (which says where a patch's boundary is) and
-`generators` (which fills what it is handed): resolve the boundary's corners,
-split it into sides, and answer the two questions the pipeline asks about a
-patch before choosing anything -- how many boundary loops it has, and whether
-it is flat.
+Resolves a boundary's corners, splits it into sides, counts its loops and
+tells whether the patch is flat.
 
-Kept out of `operators` because nothing here needs a session, an operator or a
-preview object. It reads a mesh and returns a value, which is also what makes
-it the part worth testing directly.
+A leaf module: needs no session, operator or preview object.
 """
 import math
 from typing import TYPE_CHECKING
@@ -30,15 +25,9 @@ LoopSides = list[list[mathutils.Vector]]
 class PreparedPatch:
     """A patch's boundary, split into sides, one entry per boundary loop.
 
-    Most patches have a single loop. Two loops means a band: a face with a hole
-    in it, or a tube-like face with two rims -- see generators/ring.py.
-
-    More than two is several holes, and only the n-gon fill can take them
-    (`generators.ngon.generate_holed`, which bridges each one into the face
-    around it). Every span generator paves a single outline, so for those the
-    holes are dropped at the preparation -- `keep_holes` is which of the two is
-    being prepared, and `num_loops` counts what the patch really has either
-    way, since that is what the panel warns from.
+    Two loops is a band (generators/ring.py). More than two is several holes,
+    which only the n-gon fill takes. For a span generator the holes are dropped
+    (`keep_holes`). `num_loops` always counts every loop the patch has.
     """
 
     __slots__ = ("patch", "loops_sides", "loops_corner_ids", "num_loops",
@@ -54,23 +43,18 @@ class PreparedPatch:
         corner_warning: str = "",
         loops_corners_arbitrary: list[bool] | None = None,
     ) -> None:
-        # Per loop: whether its corners are the four quarter points of a circle
-        # rather than anything the boundary actually states. Only that case is
-        # flagged -- see sides.synthesise_corners_detail. `sidematch` is
-        # allowed to cut such a loop somewhere else entirely, which is what
-        # lets a disc take the vertices of the ring committed around it.
+        # Per loop: whether its corners are arbitrary (the quarter points of a
+        # circle). `sidematch` may move those.
         self.loops_corners_arbitrary = list(loops_corners_arbitrary or [])
-        # Why this patch's side count should not be trusted, or "". Set when
-        # the angle test flagged *every* boundary vertex, which means the
-        # threshold is doing nothing useful here -- see sides.corners_are_uniform.
+        # Why this patch's side count should not be trusted, or "".
+        # See sides.corners_are_uniform.
         self.corner_warning = corner_warning
         self.patch = patch
         self.loops_sides = loops_sides  # [[side_points, ...], ...], outer loop first
         self.loops_corner_ids = loops_corner_ids  # source vertex id per corner, same order
         self.num_loops = num_loops
-        # Face id across each *side*, per loop -- which patch the picker names
-        # when you point at a boundary. Not the same list as
-        # patch.boundary_neighbours, which is per boundary segment.
+        # Face ids across each side, per loop (`side_neighbours`). Not
+        # patch.boundary_neighbours, which is per segment.
         self.loops_neighbours = loops_neighbours or []
 
     @property
@@ -79,9 +63,8 @@ class PreparedPatch:
 
     @property
     def has_holes(self) -> bool:
-        """Whether anything is enclosed by the outer boundary -- what the n-gon
-        fill branches on. Not `is_ring`: a ring is exactly two loops, and an
-        n-gon takes any number of them."""
+        """Whether the outer boundary encloses any hole. Not `is_ring`, which
+        is exactly two loops."""
         return len(self.loops_sides) > 1
 
     @property
@@ -107,25 +90,20 @@ def prepare_patch(
     """Split patch `face_id`'s boundary into sides. Returns a PreparedPatch, or
     None if the patch has no usable boundary.
 
-    `keep_holes` asks for every boundary loop, which only the n-gon fill can
-    use; without it a face with several holes comes back as its outer boundary
-    alone, which is all a span generator can pave.
+    `keep_holes` keeps every boundary loop (n-gon fill only). Without it, a face
+    with several holes comes back as its outer boundary alone.
     """
     analysis = patch_data.analyse(mesh)
     patch = analysis.patches.get(face_id)
     if patch is None or not patch.boundary_loops:
         return None
 
-    # Shared with every other caller this frame -- read it, never write to it.
-    # `resolve_side_points` copies each point it takes out of here.
+    # Shared and read-only: never write to it.
     positions = analysis.positions
-    # The neighbour list is per loop, in the loop order the patch stores, so it
-    # has to be reordered with the loops -- sorting one and not the other would
-    # hand a hole's neighbours to the outer boundary.
+    # Neighbours are per loop: they must be reordered with the loops.
     neighbours_of_loop = {id(loop): n for loop, n
                           in zip(patch.boundary_loops, patch.boundary_neighbours)}
-    # Outer loop first: which loop comes out of compute_boundary_loops first is
-    # hash order, so without this a holed face can be retopped on its hole.
+    # Outer loop first: loop order out of compute_boundary_loops is random.
     loops = patch_data.sort_loops_outer_first(patch.boundary_loops, positions)
     num_loops = len(loops)
     if num_loops > 2 and not keep_holes:
@@ -141,11 +119,7 @@ def prepare_patch(
         corners, arbitrary = sides_mod.resolve_corners_detail(
             loop, positions, angle_threshold=angle_threshold,
             neighbour_ids=segment_neighbours, method=corner_method,
-            # Only a single-loop patch needs corners invented for it: that
-            # is the one that would otherwise have no generator at all. A
-            # ring goes straight to its own generator and pairs its two
-            # loops itself, so corners it never asked for only get in the
-            # way -- see resolve_corners.
+            # Only a single-loop patch gets corners invented for it.
             allow_synthesis=(len(loops) == 1))
         loops_arbitrary.append(arbitrary)
         if not corner_warning and sides_mod.corners_are_uniform(
@@ -170,24 +144,11 @@ def group_side_points(
 ) -> "list[mathutils.Vector]":
     """One polyline for a group, carrying exactly `total` segments.
 
-    A group is several of the patch's real sides in a row, and the corner
-    *between* two of them is still a B-rep vertex that a neighbouring patch
-    welds to. Handing the generator the concatenated polyline and letting it
-    resample evenly would slide the grid straight past that corner: our patch
-    would have no vertex where the neighbour has one, which is a T-junction on
-    a shared edge -- the very thing `nside`'s midpoints were taken off the
-    boundary to stop doing.
+    Each sub-side is resampled to its own count, then concatenated, so the
+    corner between two sub-sides stays a vertex a neighbour can weld to.
+    Never resample the whole group evenly: that leaves a T-junction.
 
-    So the span is allocated to the sub-sides as integers first, each is
-    resampled to its own share, and the results are concatenated. The corner
-    between two of them is then a grid vertex by construction. The generator
-    changes nothing afterwards: `resample_polyline_by_arclength` hands back the
-    points it was given when the count already matches, which is the same thing
-    that makes a matched side work.
-
-    `counts` is the allocation, computed once by the caller: the spans the
-    matching is checked against have to be the very numbers the polyline is
-    built from, and two calls to the allocator could only ever agree by luck.
+    `counts` comes from `allocate_group_segments`, called once by the caller.
     """
     points: list = []
     for sub, count in zip(subsides, counts):
@@ -204,16 +165,10 @@ def allocate_group_segments(
 ) -> list[int]:
     """`total` segments shared out over the sub-sides, by arc length.
 
-    At least one each, because a sub-side with none has lost its end corner,
-    which is the whole reason this exists.
+    At least one each, so every sub-side keeps its end corner.
 
-    `pinned` fixes a sub-side's count: that is a side carrying a committed
-    neighbour's own vertices, which may not be resampled off them. The caller
-    floors the group's span at `sum(pinned) + free`, so a pin set normally
-    fits; when it cannot -- the span was typed down since -- the pins are
-    dropped **whole**, exactly as `ring.allocate_segments` does and for the
-    same reason: half a pin set is half a weld, which is a crack down a
-    boundary that had just been arranged to close.
+    `pinned` fixes a sub-side's count (a matched side). A pin set that cannot
+    fit is dropped whole: half of one is a crack.
     """
     count = len(subsides)
     if count == 0:
@@ -237,9 +192,8 @@ def allocate_group_segments(
     for index, value in pinned.items():
         counts[index] = value
 
-    # Largest remainder: floor each share, then hand the leftover segments to
-    # whichever sub-sides were cut shortest by the flooring. Anything else
-    # gives the last one in the list every rounding error.
+    # Largest remainder: floor each share, then give the leftovers to the
+    # sub-sides that lost the most to the flooring.
     shares = {i: remaining * lengths[i] / free_length for i in free}
     for i in free:
         counts[i] = max(1, int(shares[i]))
@@ -251,8 +205,8 @@ def allocate_group_segments(
         leftover -= 1
         position += 1
     while leftover < 0:
-        # Over-allocated by the floor of 1: take back from the longest that can
-        # spare a segment, never from one that is down to its last.
+        # Over-allocated by the floor of 1: take back from the longest, never
+        # below one segment.
         spare = [i for i in order if counts[i] > 1]
         if not spare:
             break
@@ -268,24 +222,10 @@ def side_neighbours(
 ) -> list[list[int]]:
     """The Plasticity faces on the other side of each side, most-covering first.
 
-    A side spans several boundary segments, and they don't have to agree: only
-    topological corners are guaranteed to fall on a change of neighbour, so an
-    angle-split side can straddle two of them. So this returns a *list* per
-    side rather than a single id, and both halves of it matter:
-
-    - `[0]` is the majority face, which is what the picker names in its report;
-    - the whole list is the only geometry a match on that side may look at.
-
-    That second one is what stops the picker reaching across the patch. Matching
-    used to be pure proximity against every committed vertex in the result mesh,
-    so a short side would happily collect points off a patch it does not touch
-    at all -- anything that passed within the tolerance -- and hand back a
-    vertex run tracing a loop around the neighbourhood instead of the shared
-    edge. A side can only weld to what it actually borders, and the mesh says
-    outright what that is.
-
-    An empty list means the side borders nothing committed-able: an open edge
-    of the solid, or a mesh with no patch data to read.
+    A side can border several faces.
+    `[0]` is the majority face, which the picker names.
+    The whole list is the only geometry a match on that side may use.
+    An empty list means an open edge, or no patch data.
     """
     if not segment_neighbours or len(segment_neighbours) != len(loop):
         return [[] for _ in side_indices]
@@ -312,10 +252,7 @@ def patch_is_planar(
 ) -> bool:
     """True when every polygon of the patch faces (nearly) the same way.
 
-    Deliberately cheap -- polygon normals only, no boundary walk or KD-tree --
-    because it gates n-gon mode on every hover. A CAD plane tessellates into
-    coplanar triangles, so its deviation is ~0; a bevel or fillet fans around
-    and blows past any sane tolerance.
+    Polygon normals only: it runs on every hover.
     """
     face_id_of_poly = patch_data.analyse(mesh).face_id_of_poly
     normals = [mesh.polygons[i].normal for i, fid in enumerate(face_id_of_poly)
@@ -327,7 +264,7 @@ def patch_is_planar(
     for normal in normals:
         average += normal
     if average.length < 1e-9:
-        return False  # normals cancelling out is as non-flat as it gets
+        return False  # normals cancel out
     average.normalize()
 
     limit = math.radians(tolerance_degrees)

@@ -1,15 +1,9 @@
 """Names and small facts every layer of the addon has to agree on.
 
-Generator names are the addon's real cross-module vocabulary: the panel, the
-viewport overlay, the span registry and the commit path all branch on them, and
-they are compared as *strings* because a generator is looked up by side count,
-never held as a type. That makes a typo silent -- "Nside" simply matches
-nothing and the patch quietly falls into the single-span branch.
+Generator names are compared as strings across modules, so a typo fails
+silently. Always use these constants.
 
-This module exists so those strings, and the sets built from them, are written
-once. It imports nothing from the package on purpose: `overlay` runs inside a
-draw handler and must never reach `operators` (which imports it back), so a
-leaf module is the only place both of them can share a constant.
+Imports nothing from the package, so `overlay` and `operators` can both use it.
 """
 
 # --- generator names -------------------------------------------------------
@@ -24,13 +18,12 @@ NSIDE = "N-Side"
 RING = "Ring"
 NGON = "N-gon"
 
-# Generators driven by two spans, so Tab switches which one the wheel and the
-# number keys adjust: quad U/V, wedge along/across, ring around/across.
-# Everything else has a single span shared by all of its sides.
+# Generators driven by two spans: quad U/V, wedge along/across, ring
+# around/across. Tab switches which one is adjusted.
+# Every other generator has a single span.
 TWO_SPAN_GENERATORS = frozenset({QUAD, WEDGE, RING})
 
-# How the two spans are labelled in the panel, per generator. Falls back to
-# along/across, which is what a wedge's pair means.
+# Panel labels for the two spans, per generator. Defaults to along/across.
 SPAN_LABELS: dict[str, tuple[str, str]] = {
     QUAD: ("Span U", "Span V"),
     RING: ("Span (around)", "Span (across)"),

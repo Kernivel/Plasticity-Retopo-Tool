@@ -1,32 +1,21 @@
 """Corner detection and side-splitting for a patch boundary loop.
 
-Two ways to find corners, because neither alone is right:
+- **angle**: where the boundary turns sharper than a threshold. Misses gentle
+  features such as a shallow chamfer.
+- **topology**: where the neighbouring patch changes, i.e. a real B-rep
+  vertex. Misses a face bordered by a single neighbour.
+- **synthesised**: a boundary with none gets corners from its shape, or four
+  by arc length for a circle. A face with a single side cannot be generated.
 
-- **angle**: the vertex where the boundary polyline turns sharper than a
-  threshold. Purely geometric, so it is fooled by anything gentle -- a 30
-  degree chamfer reads as a smooth stretch and gets swallowed into the middle
-  of a side.
-- **synthesised**: a boundary with no corner at all -- a disc, a circular
-  pocket floor, any face bounded by one closed curve -- gets four, evenly
-  spaced by arc length. Not a refinement: without them such a face has a single
-  side, `find_generator` has nothing that takes one (Wedge 2, Triangle 3,
-  Quad 4, N-Side 5+), generation returns None and the face simply cannot be
-  hovered or picked at all. Four is what makes it a Quad, i.e. a Coons grid on
-  the disc.
-- **topology**: the vertex where the *neighbouring patch changes*
-  (`patch_data.boundary_neighbours_for_loop`). That is a genuine B-rep vertex,
-  the junction between two CAD edges, and it does not care how gentle the turn
-  is. It misses the opposite case: a face whose whole boundary runs against one
-  single neighbour has no such junction at all, however square it looks.
-
-So the default is the union of both. `state.corner_method` switches.
+`resolve_corners` combines them. The method is set per mode
+(`corner_method_spans`, `corner_method_ngon`).
+See "Corners come from two tests" in CLAUDE.md.
 """
 import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # Annotations only -- this module stays free of Blender imports so it can
-    # be exercised on plain point tables.
+    # Annotations only: this module stays free of Blender imports.
     import mathutils
 
 # A closed boundary loop, as vertex indices, plus the table those index into.
@@ -95,8 +84,7 @@ def detect_topological_corners(
 def deviations(loop: Loop, positions: Positions) -> list[float]:
     """How far the boundary bends at each vertex, in degrees.
 
-    0 is dead straight, 90 is a square corner. The complement of `_angle_at`,
-    and the quantity everything about corner *strength* is measured in.
+    0 is dead straight, 90 is a square corner. The complement of `_angle_at`.
     """
     n = len(loop)
     return [180.0 - _angle_at(positions[loop[(i - 1) % n]],
@@ -105,22 +93,13 @@ def deviations(loop: Loop, positions: Positions) -> list[float]:
             for i in range(n)]
 
 
-# A corner list is reduced only where the ranking shows a genuine *cliff*: the
-# candidates sorted by how much they bend fall off by at least this factor from
-# one to the next. A ratio rather than an absolute limit, because that is the
-# only thing that separates the two cases -- on a real polygon every corner
-# bends about as much as the others and there is no cliff anywhere, while a
-# curve sampled into corners sits well below the real ones and the drop is
-# unmistakable.
+# A corner list is reduced only where the candidates, sorted by how much they
+# bend, drop by at least this ratio from one to the next. A ratio, never an
+# absolute angle: a real polygon has no such drop.
 CORNER_CLIFF = 1.5
-# Cutting all the way down to a triangle is a much bigger claim than cutting to
-# a quad -- it says one whole corner of what looked like a four-sided face was
-# imaginary -- so it takes a far clearer cliff. Without the distinction, a
-# rectangle with one chamfered corner (three 90s and two 45s) came out as a
-# triangle on a 2:1 ratio.
+# Cutting down to a triangle takes a much clearer drop.
 CORNER_CLIFF_TO_TRIANGLE = 2.5
-# Reducing below this would start inventing shapes rather than removing noise:
-# three sides is the fewest any grid generator wants from a corner list.
+# Never reduce below three corners.
 MIN_DOMINANT_CORNERS = 3
 
 
@@ -132,26 +111,10 @@ def dominant_corners(
 ) -> list[int]:
     """Drop the corners that are only noise, when the patch has too many.
 
-    A face comes back with more than four sides for two very different
-    reasons, and they need opposite treatment. Either it genuinely has them --
-    a hexagonal boss, a five-sided transition -- and every side matters; or the
-    angle test caught the tessellation of something smooth alongside the real
-    corners, and those extra sides are what turn a quad into an N-Side fan of
-    triangles converging on a made-up centre point.
-
-    Telling them apart is a question of *contrast*, not of any absolute angle:
-    see CORNER_CLIFF. A boundary with no cliff in it is handed back untouched,
-    which is what keeps a real hexagon six-sided.
-
-    `protected` corners are exempt and take no part in the ranking. Those are
-    the *topological* ones: a junction between two CAD edges is a fact the mesh
-    states outright, not an inference from how sharply something bends, and a
-    gentle chamfer's junction bends barely at all -- dropping it for being
-    shallow is precisely the bug the topology test was added to fix. Only what
-    the angle test guessed at is up for reduction.
-
-    Only ever runs on five or more candidates: at four the answer is already a
-    quad, and there is nothing a reduction could improve.
+    Cuts only where the ranking shows a cliff (CORNER_CLIFF). A boundary with
+    none, like a real hexagon, is returned untouched.
+    `protected` corners (the topological ones) are always kept and never ranked.
+    Only runs on five or more candidates.
     """
     if len(corners) <= 4:
         return list(corners)
@@ -163,11 +126,8 @@ def dominant_corners(
     if not ranked:
         return list(corners)
 
-    # `keep` is how many of the ranked candidates survive, so the cliff it
-    # names sits between ranked[keep - 1] and ranked[keep] -- both have to
-    # exist. Tried nearest-to-four first, and the wider cut before the
-    # narrower one on a tie: a quad is the outcome a grid generator handles
-    # best, and it is what an over-split patch was supposed to be.
+    # `keep` ranked candidates survive; the cliff is between ranked[keep - 1]
+    # and ranked[keep]. Tried nearest-to-four first, so a quad wins a tie.
     order = sorted(
         (keep for keep in range(1, len(ranked))
          if keep + len(exempt) >= MIN_DOMINANT_CORNERS),
@@ -191,10 +151,7 @@ def dominant_corners(
     return sorted(exempt | set(ranked[:cut]))
 
 
-# How much the boundary's turn may vary from one vertex to the next and still
-# count as "the same everywhere". Loose enough to absorb the jitter of a
-# tessellated circle, far tighter than the gap between a square corner and the
-# shallow kink beside it.
+# How much the boundary's turn may vary and still count as uniform.
 UNIFORM_TURN_SPREAD = 1.6
 
 
@@ -202,24 +159,16 @@ def corners_are_uniform(loop: Loop, positions: Positions, corners: list[int]) ->
     """True when the flagged corners are indistinguishable from the rest of the
     boundary -- every vertex bending about the same amount.
 
-    That is what a coarsely tessellated circle looks like: an eight-segment
-    bore turns 45 degrees at every vertex, exactly the default threshold, so
-    every one of them reads as a corner and the face becomes an eight-sided
-    N-Side fan. It is also, unavoidably, what a real octagon looks like -- the
-    two are the same polyline. So this only *reports*: the panel says the
-    threshold is doing nothing useful on this patch and lets you raise it,
-    rather than guessing which of the two it is and rounding a real octagon
-    off in the half of the cases it guesses wrong.
+    A coarse circle and a real octagon look the same, so this only reports.
+    The panel suggests raising the threshold. Never guess.
     """
     if len(corners) < 5 or len(corners) < len(loop):
         return False
     turn = sorted(deviations(loop, positions))
     if not turn or turn[-1] <= 1e-6:
         return False
-    # Spread measured between two quantiles rather than peak-over-median: the
-    # set this has to reject is *bimodal* -- four square corners and four
-    # shallow kinks -- and its median sits on whichever mode happens to hold
-    # the middle, which made a boundary with obvious contrast read as flat.
+    # Between two quantiles, never peak over median: a bimodal set (square
+    # corners plus shallow kinks) would read as flat.
     last = len(turn) - 1
     low = turn[int(0.1 * last)]
     high = turn[int(0.9 * last)]
@@ -229,13 +178,10 @@ def corners_are_uniform(loop: Loop, positions: Positions, corners: list[int]) ->
 FALLBACK_CORNER_COUNT = 4
 
 
-# The scale the shape of a cornerless boundary is judged at, as a share of its
-# perimeter. Small enough to separate a strip's two ends, large enough to see
-# past the tessellation: a rounded end spreads its turn over dozens of vertices,
-# none of which is a corner on its own.
+# The window a cornerless boundary's turn is measured over, as a share of its
+# perimeter.
 SHAPE_WINDOW = 0.06
-# A boundary whose turn is this uniform has no shape to find -- a circle. Below
-# it, the peaks mean something; above it, they are just the mesher's noise.
+# Peaks must stand this far above the average turn, or the boundary is a circle.
 SHAPE_CONTRAST = 1.35
 # Peaks nearer than this along the perimeter are the same feature seen twice.
 SHAPE_SEPARATION = 0.12
@@ -266,10 +212,8 @@ def _index_at_offset(
 def shape_turns(loop: Loop, positions: Positions) -> list[float]:
     """How much the boundary turns at each vertex, measured over SHAPE_WINDOW.
 
-    Not the turn *at* the vertex: on a tessellated boundary that is dominated
-    by how finely the mesher sampled it. Measured between the directions a
-    window before and a window after, it reads the shape instead -- flat along
-    a straight run, small on a gentle arc, large where a strip caps off.
+    Measured between a window before and a window after the vertex, so it reads
+    the shape rather than the tessellation.
     """
     n = len(loop)
     cumulative, total = _cumulative_lengths(loop, positions)
@@ -289,15 +233,10 @@ def shape_turns(loop: Loop, positions: Positions) -> list[float]:
 def shape_corners(loop: Loop, positions: Positions) -> list[int]:
     """Corners recovered from the boundary's *shape*, or [] if it has none.
 
-    A cornerless loop is not the same as a featureless one. A long strip that
-    curves back on itself has no vertex sharp enough for the angle test, but it
-    plainly has two ends -- and splitting it anywhere else is what turned it
-    into a fan: quarter-perimeter corners land in the middle of its long sides,
-    so the "quad" fed to the Coons patch is half a side and half an end.
-
-    Returns however many it finds, up to four, which is what decides the
-    generator: two ends make a Wedge (a grid running along the strip), three a
-    Triangle, four a Quad. A circle has no peaks at all and gets [].
+    Finds e.g. the two ends of a strip that no vertex marks sharply.
+    Returns up to four, which picks the generator: two make a Wedge, three a
+    Triangle, four a Quad. A circle gets [].
+    See "A boundary with no corner still has a shape" in CLAUDE.md.
     """
     n = len(loop)
     turns = shape_turns(loop, positions)
@@ -306,8 +245,7 @@ def shape_corners(loop: Loop, positions: Positions) -> list[int]:
 
     strongest = max(turns)
     average = sum(turns) / n
-    # A boundary that turns the same everywhere is a circle: any peak in it is
-    # noise, and picking one would be picking a direction at random.
+    # A boundary that turns the same everywhere is a circle.
     if strongest < 1.0 or strongest < average * SHAPE_CONTRAST:
         return []
 
@@ -324,13 +262,7 @@ def shape_corners(loop: Loop, positions: Positions) -> list[int]:
     window = total * SHAPE_WINDOW
 
     def is_local_max(index: int) -> bool:
-        """A feature is where the turn *peaks*, not merely where it is high.
-
-        Without this the tangency between a strip's straight side and its cap
-        gets picked too: it is half as sharp as the cap itself but still well
-        above the flat run, and far enough away to survive the separation
-        rule. It is not a peak -- the turn keeps rising past it into the cap.
-        """
+        """Whether the turn peaks here within the window, not merely is high."""
         here = turns[index]
         step = index
         while True:
@@ -375,22 +307,11 @@ def synthesise_corners_detail(
 ) -> tuple[list[int], bool]:
     """(corners, whether they are *arbitrary*) for a boundary with none.
 
-    The shape is asked first (`shape_corners`): a strip, a slot, a rounded
-    rectangle all have ends even when no single vertex is sharp. Only a
-    boundary with no shape either -- a circle -- falls back to `count` points
-    spread evenly by arc length. Arc length rather than index spacing: a
-    tessellated circle is not sampled uniformly, so every `n // 4`th vertex
-    would bunch the corners wherever the mesher happened to be dense.
+    Asks `shape_corners` first. Only a circle falls back to `count` points
+    spread by arc length (never by index: tessellation is not uniform).
 
-    That last case is the only one reported as **arbitrary**, and the flag
-    matters downstream. A shape corner is a fact about the boundary -- the end
-    of a strip is where it is, and moving it would destroy the very feature it
-    marks. A quarter point on a circle is a fact about nothing at all: it says
-    only that the loop had to be cut somewhere to have sides, and every
-    rotation of the four is as good as every other. `sidematch` uses that
-    licence to cut them where a committed neighbour already put its vertices,
-    which is the difference between a disc that welds to the ring around it and
-    one that cannot (see `_recut_arbitrary_loop`).
+    Only that fallback is reported as arbitrary. `sidematch` may then move
+    those corners onto a neighbour's vertices (`_recut_arbitrary_loop`).
     """
     n = len(loop)
     if n <= count:
@@ -421,15 +342,8 @@ def complete_corners(
 ) -> list[int]:
     """Add corners until the loop has enough of them to be split into sides.
 
-    One corner is no better than none: `split_into_sides` returns a single side
-    running all the way round, `find_generator` has nothing that takes one
-    (Wedge 2, Triangle 3, Quad 4, N-Side 5+), generation returns None, and the
-    face silently cannot be hovered or picked at all. That is a real shape
-    though -- a teardrop, a cone cap cut by one seam, a fillet ending in a
-    single point -- so the corner it does have is *kept*, and the missing ones
-    are spread by arc length starting from it. Anchoring them on the real
-    corner is the whole point: spread from an arbitrary origin instead, and the
-    one feature the face actually has lands in the middle of a side.
+    One corner gives one side, which no generator accepts. The existing corner
+    is kept and the rest are spread by arc length from it.
     """
     n = len(loop)
     if n <= count:
@@ -476,26 +390,13 @@ def resolve_corners_detail(
 ) -> tuple[list[int], bool]:
     """(corner indices, whether they are arbitrary) under the chosen method.
 
-    The second value is True only when *nothing* was detected and the corners
-    are the four quarter points of a circle -- see `synthesise_corners_detail`
-    for why that case is worth telling apart from every other.
+    The second value is True only for the quarter points of a circle
+    (`synthesise_corners_detail`).
 
-    'TOPOLOGY' falls back to the angle test when the boundary has no junction
-    at all -- with no corners a patch is one single side, which every
-    span-based generator would have to treat as an unusable 1-sided patch.
-    Silently retopologising it wrong is worse than ignoring the setting here.
-
-    And when *neither* test finds anything -- a disc, a circular pocket floor,
-    any face bounded by one closed curve -- four are synthesised. Without them
-    the face has one side, no generator accepts one, and it can't be picked at
-    all; see synthesise_corners.
-
-    `allow_synthesis` is what a **ring** turns off. A band between two circles
-    reaches the Ring generator directly, never `find_generator`, so a cornerless
-    loop gives it no trouble -- and inventing four corners on each of its two
-    loops actively hurts: `ring.ring_from_sides` allocates points per side, so
-    two loops whose synthesised corners don't face each other get their points
-    paired across a shear instead of straight across the band.
+    'TOPOLOGY' falls back to the angle test when the boundary has no junction.
+    When neither test finds anything, corners are synthesised.
+    A ring passes `allow_synthesis=False`: invented corners on its two loops
+    would shear the band.
     """
     angle_corners = set(detect_corners(loop, positions, angle_threshold))
     topo_corners = set(detect_topological_corners(loop, neighbour_ids))
@@ -503,8 +404,7 @@ def resolve_corners_detail(
     if method == 'ANGLE':
         corners = sorted(angle_corners)
     elif method == 'TOPOLOGY':
-        # Explicitly asked for junctions: hand back exactly the junctions,
-        # unranked. Reducing them here would be overruling the setting.
+        # Junctions exactly as found, never ranked.
         return _fill_out(loop, positions, sorted(topo_corners) or sorted(angle_corners),
                          allow_synthesis)
     else:
@@ -519,19 +419,13 @@ def _fill_out(
 ) -> tuple[list[int], bool]:
     """Corners as resolved, topped up to a usable count when allowed.
 
-    Fewer than two corners means fewer than two sides, and no generator takes
-    one. `allow_synthesis` is what a **ring** turns off: a band between two
-    circles reaches the Ring generator directly, so a cornerless loop gives it
-    no trouble -- and inventing corners on each of its two loops actively
-    hurts, since `ring.ring_from_sides` allocates points per side and two loops
-    whose invented corners don't face each other get their points paired across
-    a shear instead of straight across the band.
+    Fewer than two corners means fewer than two sides, which no generator
+    takes. A ring turns `allow_synthesis` off.
     """
     if len(corners) >= 2 or not allow_synthesis:
         return corners, False
     if corners:
-        # One real corner kept and the rest spread from it: the shape's one
-        # feature is still on a side boundary, so these are not arbitrary.
+        # Anchored on a real corner, so not arbitrary.
         return complete_corners(loop, positions, corners), False
     return synthesise_corners_detail(loop, positions)
 
@@ -548,9 +442,8 @@ def split_into_sides(
     corner up to and including the next corner (so consecutive sides share
     their corner vertex, as expected for a boundary polygon).
 
-    `corner_indices`, if given, replaces the angle test entirely -- that is how
-    the addon feeds in a set resolved by `resolve_corners`. The bare
-    `angle_threshold` path is the standalone one, used by the tests.
+    `corner_indices`, if given, replaces the angle test (the addon passes the
+    set from `resolve_corners`).
     """
     n = len(loop)
     if n < 2:
@@ -564,8 +457,7 @@ def split_into_sides(
     corner_positions = sorted(corner_positions)
 
     if not corner_positions:
-        # No corner found (e.g. a full circle boundary): treat the whole loop
-        # as a single side with an arbitrary start.
+        # No corner: the whole loop is one side.
         return [loop + [loop[0]]]
 
     sides = []

@@ -1,31 +1,17 @@
 """Which vertices a patch's side has to reproduce, and where they come from.
 
-Two patches only weld along a shared boundary if they land on the *same
-vertices*, not merely on the same count -- a neighbour committed as an n-gon
-put its points where the boundary curves, and a grid resampling evenly to that
-same count lands between them every time. So a side takes the neighbour's own
-committed vertices, and the generator is told the count that reproduces them
-(`geometry.resample_polyline_by_arclength` hands a polyline straight back when
-asked for exactly as many points as it holds, so no generator needed changing).
+A matched side takes the neighbour's own committed vertices, not just their
+count. Every generator reproduces them unchanged, since
+`geometry.resample_polyline_by_arclength` returns a polyline untouched when the
+count already matches.
 
-Three things decide what a side may take:
+- A side only matches the faces it actually borders (`_match_pool`).
+- Automatic matching takes only an exact answer. A pinned side may reach
+  further, by `match_margin`.
+- A grid has one count per direction: a match the resolved span cannot
+  reproduce is dropped (`_honours`).
 
-- **what it borders.** A side can only match the Plasticity faces actually
-  across it, which the mesh states per boundary segment. Proximity alone cannot
-  tell those from a patch that merely passes nearby, and matching used to be
-  proximity alone -- which is how a side ended up following a run of vertices
-  tracing a loop through its neighbourhood instead of the edge it shares.
-- **who asked.** An automatic match takes only an exact answer. A pin -- you
-  pointed at the side, so you have said which neighbour you mean -- may reach
-  one that has drifted, by `match_margin`.
-- **whether the spans still allow it.** A grid has one count per *direction*,
-  so two sides wanting different counts along one axis cannot both be honoured,
-  and a count the user typed since releases the match rather than being
-  overruled by it.
-
-Kept out of `operators` for the same reason `patchprep` is, plus one more: the
-overlay draws what a match would take, and a draw handler must never be able to
-reach the operators module.
+A leaf module: the overlay reads it and must never reach `operators`.
 """
 import json
 from typing import TYPE_CHECKING
@@ -50,9 +36,8 @@ Winners = dict[str, "tuple[SideReference, list[mathutils.Vector], bool]"]
 class SideReference:
     """One side of the active patch, ready to be pointed at in the viewport.
 
-    `span` is what the neighbour across this side put along it, or None when
-    there is nothing to match -- that's the difference between a side the
-    picker offers and one it greys out.
+    `span` is the neighbour's segment count along this side, or None when there
+    is nothing to match.
     """
 
     __slots__ = ("index", "loop", "in_loop", "group", "grouped", "points", "match_points",
@@ -72,55 +57,39 @@ class SideReference:
         strict_points: "list[mathutils.Vector] | None" = None,
         match_world: "list[mathutils.Vector] | None" = None,
     ) -> None:
-        # Points this side may be substituted with even though another side
-        # won its span -- because the two want the *same* count. See
-        # `_winning_matches`. None when it is not a co-winner; `tied_key` is
-        # the span it ties on, so a side of another span with a coincidentally
-        # equal count is never swept in with it.
+        # Points this side takes although another side won its span, because
+        # both want the same count (`_winning_matches`). `tied_key` is that span.
         self.tied_points = None
         self.tied_key = ""
-        # The same points in world space, for the overlay to draw. Kept here
-        # rather than transformed at draw time: a draw handler runs on every
-        # redraw and has no business recomputing what generation knew.
+        # The same points in world space, for the overlay. Computed here, never
+        # at draw time.
         self.match_world = match_world or []
-        # Why this side can't be matched, when it can't -- an opaque refusal on
-        # a side that visibly touches retopology is impossible to act on.
+        # Why this side cannot be matched, or "".
         self.reason = reason
-        # What the *automatic* matching is allowed to take: found without the
-        # picker's margin, so it never reaches for something merely nearby.
-        # `match_points` is the generous answer, for a side you pointed at.
+        # What automatic matching may take: found without the margin.
+        # `match_points` is the generous answer, for a pinned side.
         self.strict_points = strict_points
-        # Which group of its loop this side ends up in, 0-based -- what the
-        # generator counts as one side. Filled in by `build_side_references`
-        # once the numbering is known; `in_loop` when nothing is grouped.
+        # This side's 0-based group within its loop. Set by
+        # `build_side_references`.
         self.group = in_loop
-        # Whether that group holds more than this one side. A side inside a
-        # merged group carries only *part* of its group's span, so it drives a
-        # count of its own rather than the direction's -- see `span_key_for`.
+        # Whether that group holds several sides. Such a side keys its span
+        # per side (`span_key_for`).
         self.grouped = False
         self.index = index      # flat index across every loop, in order
         self.loop = loop        # which boundary loop it belongs to
         self.in_loop = in_loop  # its index within that loop
         self.points = points    # world space, for drawing and hit-testing
-        # The neighbour's own committed vertices along this side, in the source
-        # object's local space -- the thing that actually gets matched. None
-        # when there is nothing to match, or when the neighbour covers only
-        # part of the side.
+        # The neighbour's committed vertices along this side, in the source's
+        # local space, or None.
         self.match_points = match_points
-        # Every Plasticity face across this side, most-covering first. The
-        # match is confined to these; see _side_neighbours.
+        # Every Plasticity face across this side, most-covering first
+        # (`patchprep.side_neighbours`). The match is confined to these.
         self.neighbours = list(neighbours or [])
-        # Whether this side's polyline was actually *replaced* this generation,
-        # and by which points. "Could be matched" and "is being matched" are
-        # different questions and the viewport used to answer only the first:
-        # a side that lost a span collision, one the resolved span no longer
-        # honours and one nobody asked to match all drew the same green as a
-        # side whose vertices the preview is genuinely reproducing. Set by
-        # `apply_side_matches`, which is the only place that knows.
+        # Whether this side's polyline was replaced this generation, and by
+        # which points. Set by `apply_side_matches`. Not the same as `available`.
         self.applied = False
         self.applied_points: "list[mathutils.Vector]" = []
-        # It wanted a match and lost -- another side drove the same span, or
-        # the span the user typed can no longer reproduce these points.
+        # It wanted a match and lost: a span collision or a typed span.
         self.outvoted = False
 
     @property
@@ -138,9 +107,8 @@ class SideReference:
         return len(self.match_points) - 1 if self.match_points else None
 
 
-# Rebuilt every time a patch is generated, dropped by a reload. The overlay and
-# the modal both read it; nothing persists it, because it holds Vectors and
-# describes a preview that only exists while the session runs.
+# Rebuilt on every generation, empty after a reload. Read by the overlay and
+# the modal.
 _active_sides: list[SideReference] = []
 
 
@@ -156,54 +124,35 @@ def build_side_references(
 ) -> list[SideReference]:
     """The active patch's sides, with the geometry each of them could match.
 
-    Walks every loop, so a ring or a holed n-gon offers its hole's sides too --
-    those border committed neighbours just as much as the outer ones do.
-
-    Each side is matched **only against the patches it actually borders**
-    (`SideReference.neighbours`). Matching used to run against every committed
-    vertex in the result mesh and keep whatever fell within the tolerance, which
-    is how a short side ended up following a loop around its neighbourhood
-    instead of the edge it shares: proximity alone cannot tell "the patch across
-    this edge" from "a patch that happens to pass nearby". The mesh already says
-    which is which, per boundary segment.
+    Walks every loop, holes included. Each side is matched only against the
+    patches it borders.
     """
     global _active_sides
 
     state = context.scene.plasticity_retop
     matrix = obj.matrix_world
-    # The patch being *generated*, which is not the same thing as the one the
-    # scene currently calls active: picking a committed patch generates it
-    # before recording it as active, so reading the active id here left the
-    # patch's own committed geometry in its own pool and it matched itself --
-    # a re-edit came back with whatever spans reproduced what was already there
-    # instead of the ones it was committed with.
+    # The patch being generated, which may not be the active one yet: it must
+    # never match its own committed geometry.
     if face_id is None:
         face_id = state.active_face_id
-    # Grouped once for the whole patch: this walks the result mesh, and doing it
-    # per side made a hover cost that times the side count.
+    # Once for the whole patch: it walks the result mesh.
     committed = mesh_build.committed_boundary_map(obj)
 
-    # One reach for the whole patch, from its longest side. A neighbour's drift
-    # is an absolute distance, so a per-side share of the margin left a short
-    # side unable to see what the long side beside it matched without trouble.
+    # One reach for the whole patch, from its longest side.
     reference_length = max(
         (sum((b - a).length for a, b in zip(side, side[1:]))
          for loop_sides in prepared.loops_sides for side in loop_sides),
         default=0.0)
 
-    # Corners nothing in the model agrees on get moved onto the ones a
-    # neighbour already committed, *before* any side is measured against it.
-    # Everything below then works as it always has -- the sides simply start
-    # and end on the neighbour's own vertices instead of a quarter of the way
-    # round a circle. See `_recut_arbitrary_loop`.
+    # Move arbitrary corners onto a neighbour's vertices first
+    # (`_recut_arbitrary_loop`).
     if state.auto_match_neighbours:
         for loop_i, arbitrary in enumerate(prepared.loops_corners_arbitrary):
             if arbitrary:
                 _recut_arbitrary_loop(state, prepared, loop_i, committed,
                                       face_id, reference_length)
 
-    # Every side of the patch, so each match can be confined to the side it is
-    # actually nearest -- see the `rivals` argument below.
+    # Every side, so each match is confined to the side it is nearest (`rivals`).
     all_sides = [side for loop_sides in prepared.loops_sides for side in loop_sides]
 
     references = []
@@ -216,21 +165,13 @@ def build_side_references(
                           if side_i < len(neighbours_of_side) else [])
             pool = _match_pool(committed, neighbours, face_id)
 
-            # Two answers, two reaches -- but *one* idea of what makes two
-            # points the same vertex. The strict tolerance is that idea (it is
-            # the weld distance), and the generous one is only about how far
-            # off the side a neighbour may have drifted; deduping the generous
-            # answer at its own reach merges consecutive neighbour vertices and
-            # halves the count a pin reproduces.
+            # Two reaches, but always dedupe at the strict tolerance: deduping
+            # at the generous one merges consecutive neighbour vertices.
             strict = mesh_build.side_match_tolerance(
                 state, side, reference_length=reference_length)
             rivals = [other for other in all_sides if other is not side]
-            # `partial` on the picker's answer only. A neighbour covering
-            # part of a side is completed at its own spacing (see
-            # `match_side_to_points`), and that is a real decision about the
-            # rest of the side -- so it is taken when you point at the side and
-            # not on every side of every patch you hover past. Automatic
-            # matching keeps the strict answer, as it does for the margin.
+            # `partial` on the picker's answer only: completing a partly covered
+            # side is a decision, never taken automatically.
             match_points, reason = mesh_build.match_side_to_points(
                 pool, side, mesh_build.side_match_tolerance(
                     state, side, margin=True, reference_length=reference_length),
@@ -250,10 +191,7 @@ def build_side_references(
             ))
             index += 1
 
-    # Which group each side lands in, now that they all exist. Stored on the
-    # reference so `span_key_for` can count groups rather than sides: several
-    # sides gathered into one are one side of the patch as far as the generator
-    # and the span collisions are concerned.
+    # Which group each side lands in, for `span_key_for`.
     assign_groups(references, group_numbers(references, state))
 
     _active_sides = references
@@ -283,45 +221,14 @@ def _recut_arbitrary_loop(
 ) -> bool:
     """Cut a cornerless loop where a committed neighbour put its vertices.
 
-    A disc, a circular pocket floor, the cap of a cylinder: nothing on the
-    boundary is a corner, so `sides.synthesise_corners` cuts it into four at
-    the quarter points of its arc length. Those four are arbitrary -- the loop
-    had to be split somewhere to have sides, and no other part of the model
-    agrees on where. Which is exactly why matching could never work on one.
+    For a loop whose corners are arbitrary (the quarter points of a circle).
+    The whole loop is matched once as a closed side, then its sides are carved
+    out of the neighbour's ring of points, so every corner lands on a neighbour
+    vertex.
 
-    The neighbour has its own vertices along that same circle, at its own
-    phase, and the quarter points fall *between* them. The endpoint rule in
-    `match_side_to_points` then asks each side for a committed vertex at a
-    corner the neighbour has no reason to have one at, and whether it finds one
-    is a coin toss per corner: measured on a truncated cone's cap, two of the
-    four sides landed within 0.0026 of a rim vertex and matched, while the
-    other two had theirs claimed by the side next door (it lies *on* that one)
-    and refused with "neighbour stops short of this side's start". Nothing
-    about the tolerances fixes that -- widening them far enough to swallow a
-    whole vertex spacing is what the half-cell offset rule exists to prevent.
-
-    So the loop is re-cut instead. The whole boundary is matched **once**, as
-    the closed side it really is -- which is the path `_close_matched_ring`
-    already handles, rotation and all -- and the sides are then carved out of
-    the neighbour's own ring of points. Every corner lands on a neighbour
-    vertex at distance zero, so the strict tolerance passes and *automatic*
-    matching fires, where before even a hand pin refused half the sides.
-
-    Two things this deliberately gives up, both of which the loop had nothing
-    to lose in the first place:
-
-    - the corner ids, blanked to `NO_SOURCE` because the new corners are not
-      source vertices at all. They weld by proximity like every other boundary
-      point, and span propagation out of this patch stops -- its corners were
-      never B-rep vertices, so the pairs it would have registered named
-      nothing any neighbour could look up.
-    - the side count is *kept*, which is what makes this safe everywhere else:
-      `find_generator` still sees four sides, and the commit path -- which
-      re-prepares the patch and replays the same references by index -- still
-      lines up.
-
-    Only a loop `sides` flagged arbitrary comes here. A shape corner (the end
-    of a strip, a slot's cap) is a fact about the boundary and is never moved.
+    The side count is kept. Corner ids are blanked to `NO_SOURCE`.
+    A shape corner is never moved.
+    See "A corner nothing agrees on" in CLAUDE.md.
 
     Returns whether it re-cut.
     """
@@ -345,9 +252,7 @@ def _recut_arbitrary_loop(
     if (loop_points[0] - loop_points[-1]).length > 1e-12:
         loop_points.append(loop_points[0].copy())
 
-    # The strict answer, never the picker's margin: this runs unasked, on every
-    # hover, and moving a patch's corners is not something to do on a neighbour
-    # that merely passes nearby.
+    # The strict answer only: this runs unasked, on every hover.
     strict = mesh_build.side_match_tolerance(
         state, loop_points, reference_length=reference_length)
     ring, _reason = mesh_build.match_side_to_points(
@@ -360,9 +265,8 @@ def _recut_arbitrary_loop(
     if n <= count:
         return False
 
-    # Anchored on the point nearest the corner the loop already had, so the
-    # cut moves as little as it can: a hover that re-cuts to a different
-    # rotation every frame would be its own kind of broken.
+    # Anchored on the point nearest the existing first corner, so the cut is
+    # stable across hovers.
     anchor = min(range(n), key=lambda i: (closed[i] - sides[0][0]).length)
     lengths = _opposed_segment_counts(n, count)
     if lengths is None:
@@ -375,10 +279,7 @@ def _recut_arbitrary_loop(
         new_sides.append([point.copy() for point in piece])
         at += segments
 
-    # Which faces each new side borders, carried over from whichever old side
-    # it runs along. The cut points barely move, so this is a relabelling
-    # rather than a re-derivation -- but it has to happen, or a side could be
-    # matched against a patch it does not touch.
+    # Each new side borders the faces of the old side it runs along.
     new_neighbours = []
     for piece in new_sides:
         middle = piece[len(piece) // 2]
@@ -398,18 +299,9 @@ def _recut_arbitrary_loop(
 def _opposed_segment_counts(n: int, count: int) -> list[int] | None:
     """How to share `n` segments between `count` sides of a re-cut loop.
 
-    As evenly as possible, but with **opposite sides equal** wherever the
-    arithmetic allows, and that is the whole reason this is not one line. A
-    grid has one span per direction, so sides 0 and 2 of a quad are the same
-    number: hand them 12 and 13 and only one of the two can be honoured, the
-    other is outvoted by `_winning_matches` and left on the CAD tessellation --
-    a crack down one half of a disc that had just been cut to weld. Spreading
-    the remainder over *pairs* costs nothing (the two counts still differ by at
-    most one, exactly as before) and lets all four sides be reproduced.
-
-    An odd remainder on an even side count cannot be paired, and neither can an
-    odd side count; both fall back to spreading one at a time, which is no
-    worse than what a boundary of that length could ever have offered.
+    As evenly as possible, with opposite sides equal where the arithmetic
+    allows: a grid has one span per direction, so opposite sides must agree to
+    both be matched.
     """
     if count < 2 or n < count:
         return None
@@ -429,9 +321,7 @@ def _opposed_segment_counts(n: int, count: int) -> list[int] | None:
 def _empty_pool_reason(
     neighbours: list[int], committed: CommittedMap, active_face_id: int | None
 ) -> str:
-    """Why a side had nothing to look at -- which is not the same as having
-    looked and found nothing. "No neighbour" on a side that plainly runs
-    against a finished patch is the refusal nobody can act on.
+    """Why a side had nothing to match against, naming the patch it waits for.
     """
     others = [face_id for face_id in neighbours if face_id != active_face_id]
     if not others:
@@ -446,20 +336,9 @@ def _match_pool(
 ) -> "list[mathutils.Vector]":
     """The committed vertices a side is allowed to match.
 
-    Strictly the Plasticity faces across this side, plus any untracked
-    retopology. Nothing else, ever -- and *nothing at all* when none of those
-    faces has been committed yet, rather than falling back to the rest of the
-    result mesh. Proximity cannot tell "the patch across this edge" from "a
-    patch that happens to run close by", which is how a side used to collect a
-    vertex run tracing a loop through its neighbourhood: a thin wall, a face
-    stacked a fraction above another, two sheets meeting at a shallow angle all
-    put committed vertices well inside the tolerance of a side they do not
-    touch. The mesh already says, per boundary segment, which face is across.
-
-    Untracked retopology (`NO_PATCH`) is the one thing that cannot be checked
-    that way -- it predates patch ids and belongs to no named face -- so it
-    stays available to every side. That is also the only case a mesh with no
-    patch data at all can produce.
+    Only the Plasticity faces across this side, plus untracked retopology
+    (`NO_PATCH`, which belongs to no face). Empty when none of those faces is
+    committed: never fall back to proximity over the whole mesh.
     """
     if not committed:
         return []
@@ -477,32 +356,20 @@ def clear_side_references() -> None:
     _active_sides = []
 
 
-# What a manual pin on a side means. Stored rather than the segment count it
-# resolves to: the count is recomputed from live geometry every regeneration,
-# so keeping a stale copy of it could only ever disagree.
+# What a manual pin on a side means. The kind is stored, never the count.
 PIN_NEIGHBOUR = "N"  # follow the committed patch across this side
-# "Leave this side alone" -- and it has to be recorded, not merely absent.
-# Automatic matching is on by default, so releasing a pin puts the automatic
-# match straight back and the side stays green: clicking a matched side looked
-# like it did nothing at all. This is what the click actually means.
+# "Leave this side alone". Must be recorded, or automatic matching would put
+# the match straight back.
 PIN_EXCLUDED = "-"
 PIN_KINDS = (PIN_NEIGHBOUR, PIN_EXCLUDED)
 
 
 # --- which group each side of the active patch is in -------------------------
 #
-# A group is what a generator will eventually be handed as one side, so the
-# *count* of them per loop is what picks the generator: five sides in four
-# groups is a Quad. The number is chosen per side and stored per side.
-#
-# **Free, and checked rather than constrained.** An earlier version stored the
-# demoted *corners* and let a click only merge a side into the one before it or
-# split it back out -- always valid by construction, and unpredictable to use:
-# nothing on screen said whether the next click would open a new group or join
-# an existing one. So the number is now set directly, any number, and a
-# grouping that cannot work is **reported** (`group_problems`) instead of being
-# made unreachable. That is the same judgement `sides.corners_are_uniform` and
-# the crack report already make: say what is wrong, do not guess.
+# A group is handed to the generator as one side, so the group count picks the
+# generator: five sides in four groups is a Quad.
+# Any number can be set. A grouping that cannot work is reported
+# (`group_problems`), never prevented.
 
 
 def side_groups(state: "state_mod.RetopPatchState") -> dict[int, int]:
@@ -537,10 +404,8 @@ def set_side_groups(state: "state_mod.RetopPatchState", numbers: dict[int, int])
 class SideSlot:
     """Just enough of a side for the grouping: where it is, and which loop in.
 
-    The grouping has to be known *before* `find_generator` runs -- the group
-    count is what picks the generator -- and the `SideReference`s do not exist
-    that early. These carry the three fields `group_numbers` and its friends
-    actually read, so one implementation serves both moments.
+    The grouping is needed before the `SideReference`s exist, since it picks
+    the generator.
     """
 
     __slots__ = ("index", "loop", "in_loop")
@@ -552,10 +417,8 @@ class SideSlot:
 
 
 def side_slots(prepared: "patchprep.PreparedPatch") -> list[SideSlot]:
-    """One slot per side of `prepared`, flat-indexed the way
-    `build_side_references` indexes its references -- loops in order, sides in
-    order. The two must agree or a stored group number names a different side
-    in each."""
+    """One slot per side of `prepared`, flat-indexed exactly as
+    `build_side_references` does."""
     slots = []
     index = 0
     for loop_i, loop_sides in enumerate(prepared.loops_sides):
@@ -568,14 +431,8 @@ def side_slots(prepared: "patchprep.PreparedPatch") -> list[SideSlot]:
 def side_midpoint(points: list) -> object:
     """The point half way along a side, by arc length.
 
-    Where the group bubble is anchored, and it lives here rather than in the
-    overlay because the *hit test* has to agree with the drawing to the pixel:
-    two implementations of "the middle of this side" would drift apart on a
-    curved boundary, and a bubble you cannot click where you see it is worse
-    than no bubble. By arc length rather than by index, or a densely
-    tessellated end pulls the bubble into it. World space, so it is projected
-    once per side -- and vector-agnostic, since `sidematch` imports no Blender
-    at runtime.
+    Anchors the group bubble. Shared by the drawing and the hit test, so both
+    agree.
     """
     if not points:
         return None
@@ -599,9 +456,7 @@ def group_numbers(
 ) -> dict[int, int]:
     """{flat side index: group number}, for every side of the patch.
 
-    The default is one group per side, numbered from 1 **within each loop**: a
-    ring's two rims are separate boundaries, and numbering them 1..7 across
-    both would imply an order they have no reason to share.
+    The default is one group per side, numbered from 1 within each loop.
     """
     stored = side_groups(state)
     numbers: dict[int, int] = {}
@@ -614,8 +469,7 @@ def group_numbers(
 
 
 def group_count_for(references: "list[SideReference]", loop: int) -> int:
-    """How many sides the loop has -- the largest group number worth offering,
-    since more groups than sides is not a thing a boundary can be cut into."""
+    """How many sides the loop has: the largest group number offered."""
     return sum(1 for reference in references if reference.loop == loop)
 
 
@@ -624,10 +478,7 @@ def group_runs(
 ) -> list[list[int]]:
     """The maximal runs of consecutive sides carrying the same number, per loop.
 
-    What the overlay colours and what the side count is read off. A *valid*
-    grouping has exactly one run per number; an invalid one has the same number
-    in two places and so more runs than groups, which is precisely what
-    `group_problems` reports.
+    A valid grouping has exactly one run per number.
     """
     runs: list[list[int]] = []
     for loop in sorted({reference.loop for reference in references}):
@@ -635,8 +486,7 @@ def group_runs(
                                         key=lambda r: r.in_loop)]
         if not ring:
             continue
-        # Start where the number changes, so a run never breaks at the
-        # arbitrary point the half-edge walk happened to begin at.
+        # Start where the number changes, so no run breaks at the loop's start.
         first = next((position for position, index in enumerate(ring)
                       if numbers.get(index) != numbers.get(ring[position - 1])), None)
         if first is None:
@@ -669,20 +519,11 @@ def group_problems(
 ) -> "tuple[set[int], str]":
     """(the sides at fault, what is wrong) -- empty and "" when the grouping works.
 
-    Two things can be wrong, and nothing else:
+    - A number in two places: a group must be a contiguous run.
+    - A loop left with one group: no generator takes one side.
 
-    - **A number in two places.** A group becomes one side of a Coons patch, so
-      it has to be a contiguous arc of the boundary. `1,2,1` is not a patch.
-    - **A loop left with one group.** That is one closed side, which no
-      generator accepts (`find_generator` starts at Wedge 2).
-
-    Gaps in the numbering are deliberately *not* a fault: `1,1,3,4` is three
-    connected runs and a perfectly good three-sided patch. The numbers are
-    labels, and complaining about a gap would be nagging about nothing.
-
-    The sides come back so the viewport can ring the offending bubbles -- which
-    is the half that can actually be acted on, since a side has no name on
-    screen beyond the bubble sitting on it.
+    A gap in the numbering is not a fault. The sides come back so the viewport
+    can ring their bubbles.
     """
     runs = group_runs(references, numbers)
     loop_of = {reference.index: reference.loop for reference in references}
@@ -724,11 +565,8 @@ def side_override_map(state: "state_mod.RetopPatchState") -> dict[int, str]:
 
     pins = {}
     for key, value in stored.items():
-        # Older sessions stored the resolved segment count here; anything
-        # numeric means "follow the neighbour", which is all it ever meant.
-        # A stored "S" is an older still: the CAD-tessellation pin, which no
-        # longer exists. It falls through to None here and the side simply
-        # matches, or doesn't, like any other.
+        # Older files: a number means PIN_NEIGHBOUR; "S" (a removed pin kind)
+        # is ignored.
         kind = value if value in PIN_KINDS else (
             PIN_NEIGHBOUR if isinstance(value, int) and value >= 1 else None)
         if kind is not None:
@@ -745,42 +583,24 @@ def store_side_overrides(
 def span_key_for(generator_name: str, reference: SideReference) -> str:
     """Which span a match on this side drives.
 
-    A grid has one count per *direction*, not per side: pinning a quad's bottom
-    side pins its top one too, because they are the same span. Sides that share
-    an answer are exactly the sides that collide, which is what the key is for.
-    An n-gon has no spans at all -- every side carries its own segment count --
-    so each gets a key of its own and nothing ever collides.
+    Sides with the same key collide. A grid has one count per direction; an
+    n-gon or N-Side has one per side; a ring one per loop.
     """
-    # The *group*, not the raw side: several sides can be gathered into one
-    # side of the patch (see `patchprep.group_side_points`), and it is the
-    # group that a generator counts, spans and collides. With no grouping the
-    # two are the same number.
+    # The group, not the raw side: the generator counts groups.
     position = getattr(reference, "group", None)
     if position is None:
         position = reference.in_loop
     if getattr(reference, "grouped", False):
-        # Inside a merged group: its count is its own share of the group's
-        # span, allocated by `patchprep.allocate_group_segments`, so comparing
-        # it against the whole direction would drop every match on a merged
-        # side. Keyed per side like an N-Side's, and for the same reason --
-        # what settles a disagreement is the allocation, not a vote here.
+        # Inside a merged group: its count is its share of the group's span
+        # (`patchprep.allocate_group_segments`), so it is keyed per side.
         return f"side:{reference.index}"
     if generator_name in (constants.NGON, constants.NSIDE):
-        # Both carry a segment count per side rather than per direction: an
-        # n-gon because every side is its own edge run, an N-Side because side
-        # `i` is the sum of the two spokes either side of it (see
-        # generators/nside.py). Two of an N-Side's *can* still disagree, when
-        # they meet at the same spoke -- but that is the allocation's answer to
-        # give, not a collision to settle before it is asked.
+        # A count per side. For an N-Side the spoke allocation settles any
+        # disagreement.
         return f"side:{position}"
     if generator_name == constants.RING:
-        # A ring's two loops both feed "around", but they are not in
-        # competition the way a quad's opposite sides are: the generator runs
-        # one rung from outer[i] to inner[i], so both rims *can* be reproduced
-        # at once -- as long as they agree on the count, which is exactly what
-        # `_honours` checks once the span is resolved. Keyed per loop so both
-        # get that chance; a shared key let the second rim's committed
-        # neighbour be dropped even when it wanted the very same number.
+        # Keyed per loop: both rims can be matched if they agree on the count
+        # (`_honours` checks it).
         return f"span_u@{reference.loop}"
     if generator_name == constants.QUAD:
         return "span_u" if position % 2 == 0 else "span_v"
@@ -803,10 +623,8 @@ def _match_candidates(
 ) -> "list[tuple[SideReference, list[mathutils.Vector], bool]]":
     """Every side that wants to be matched, with the points it would take.
 
-    A pin uses the picker's generous margin -- pointing at a side is saying
-    which neighbour you mean, so it may reach one that has drifted. Automatic
-    matching only ever takes the exact answer, or it would reach for whatever
-    happens to be nearby on sides nobody asked about.
+    A pin uses the generous margin. Automatic matching takes only the exact
+    answer.
     """
     pins = side_override_map(state)
     automatic = state.auto_match_neighbours
@@ -834,14 +652,9 @@ def _winning_matches(
     """One match per span, since a grid cannot honour two counts in one
     direction.
 
-    Two sides driving the same span used to both get substituted and the second
-    one silently win the count, which left the loser's points resampled to a
-    number that was not theirs -- the exact "the spans agree but the vertices
-    don't" crack the matching exists to close. Only the winner is substituted
-    now; the rest keep their own polyline and are told about it.
-
-    A pin beats an automatic match, because it was asked for. Between two of a
-    kind the denser one wins: it is the one that would lose the most detail.
+    A pin beats an automatic match, then the denser one wins. Only the winner
+    is substituted; the losers keep their own polyline and are flagged.
+    A side wanting the same count as the winner is a tie, not a loser.
     """
     by_key: "dict[str, list[tuple[tuple, SideReference, list[mathutils.Vector], bool]]]" = {}
     for reference, _points, _pinned in candidates:
@@ -860,13 +673,7 @@ def _winning_matches(
         rank, reference, points, pinned = entries[0]
         best[key] = (reference, points, pinned)
         for _rank, other, other_points, _pinned in entries[1:]:
-            # Two sides driving one span is only a conflict when they want
-            # *different* counts. A quad's opposite sides asking for the same
-            # number can both be reproduced -- the grid puts that many segments
-            # along the direction and each side lands on its own neighbour's
-            # vertices. Outvoting one of them anyway left half a re-cut disc
-            # welded and half of it on the CAD tessellation, which is a crack
-            # down a boundary that had just been arranged to close.
+            # Only a different count is a conflict. The same count is a tie.
             if len(other_points) == len(points):
                 other.tied_points = other_points
                 other.tied_key = key
@@ -882,9 +689,7 @@ def collect_side_matches(
 ) -> tuple[Winners, list[SideReference]]:
     """({span key: (side, points, pinned)}, [sides that lost a collision]).
 
-    Everything the caller needs to decide spans *before* any side is rewritten:
-    which sides want to be matched, what they would take, and which of them
-    were outvoted because a grid cannot honour two counts in one direction.
+    Called before any side is rewritten, so the spans can be decided first.
     """
     state = context.scene.plasticity_retop
     return _winning_matches(
@@ -896,20 +701,13 @@ def _honours(
 ) -> bool:
     """Whether the resolved spans still let this match reproduce its points.
 
-    A substituted side only comes back vertex for vertex if the generator asks
-    for exactly as many points as it was handed. Once the span driving that
-    side says otherwise -- because the user typed one, or because the opposite
-    side won the direction -- substituting would hand the generator a polyline
-    it is about to resample anyway, moving the very vertices the match existed
-    to land on. Better to leave the side as the CAD drew it and let the count
-    the user asked for mean what it says.
+    Only if the span equals the match's segment count. Otherwise the side keeps
+    its CAD boundary, and a typed span means what it says.
     """
     if spans is None:
         return True
     if key.startswith("side:"):
-        # An n-gon hands down no spans at all -- nothing there can disagree.
-        # An N-Side does: its spoke allocation is what decides which sides it
-        # can honour, and a side it could not is dropped here like any other.
+        # No span for this side (an n-gon): nothing can disagree.
         return key not in spans or spans[key] == len(points) - 1
     return spans.get(span_base(key)) == len(points) - 1
 
@@ -924,15 +722,11 @@ def apply_side_matches(
 ) -> tuple[dict[int, int], list[int]]:
     """Replace each matched side's polyline with the vertices it must reproduce.
 
-    Nothing downstream needs to know: every generator resamples a side with
-    `geometry.resample_polyline_by_arclength`, which hands a polyline straight
-    back when asked for exactly as many points as it holds. So a matched side is
-    reproduced vertex for vertex as long as the generator puts len-1 segments
-    along it -- which is what the returned counts are for.
+    A generator reproduces a matched side exactly as long as it puts len-1
+    segments along it: that is what the returned counts are for.
 
-    `spans` is the finally-resolved {span key: count}; a match the spans no
-    longer honour is skipped (see `_honours`). Given None, every match is taken,
-    which is what a caller that has no spans to resolve wants.
+    `spans` is the resolved {span key: count}. A match it no longer honours is
+    skipped (`_honours`). With None, every match is taken.
 
     Returns ({flat side index: segments}, [sides that lost a collision]).
     """
@@ -948,10 +742,8 @@ def apply_side_matches(
         reference.applied_points = []
     for key, (reference, points, _pinned) in winners.items():
         if not _honours(key, points, spans):
-            # It wanted a match the resolved span can no longer reproduce, so
-            # the side keeps the boundary the CAD drew. Say so rather than
-            # leaving it looking matched: that is the state the viewport had no
-            # way of showing.
+            # The resolved span cannot reproduce it: the side keeps its CAD
+            # boundary and is flagged.
             reference.outvoted = True
             continue
         for side_reference, side_points in _with_ties(key, reference, points):
@@ -970,9 +762,7 @@ def _with_ties(
 ) -> "list[tuple[SideReference, list[mathutils.Vector]]]":
     """The winner of a span, plus any side that tied it on count.
 
-    A tie is not a conflict: both sides get the number of segments the span
-    resolved to, so both can be handed their own neighbour's vertices. Each
-    keeps its *own* points -- they lie along different boundaries.
+    Each tied side keeps its own points.
     """
     applied = [(reference, points)]
     for other in active_sides():
@@ -992,11 +782,7 @@ def _blank_moved_corner(
 ) -> None:
     """Drop a corner id the match has moved off its source vertex.
 
-    A corner welds *by identity*, so leaving the name on a point that has moved
-    would make a later patch reuse a vertex that is no longer there, or drag
-    this one onto it. Blanked, it welds by proximity like every other boundary
-    point. Only a cornerless loop can get here: a real corner is a B-rep vertex
-    the neighbour shares, so its match starts exactly on it.
+    A corner welds by identity, so a moved one must lose its id.
     """
     tolerance = mesh_build.side_match_tolerance(state, original)
     if (points[0] - original[0]).length > tolerance:
@@ -1010,16 +796,9 @@ def status_of(
 ) -> tuple[str, str]:
     """(what this side is doing, why) -- one short line each.
 
-    Written once here because the viewport tooltip and the panel have to say
-    the same thing, and it is the same thing the colour says. Three states, in
-    the order they matter:
-
-    **Matched** (green), **unmatched against a committed neighbour** (red) and
-    **nothing to match** (grey). Only the middle one is a problem -- a side
-    bordering finished retopology that is not reproducing it leaves a real
-    crack, whether it lost a span collision, had its span typed over, or was
-    released by hand. A side with nothing across it yet is the normal state of
-    a model being retopologized and is never reported as a failure.
+    Shared by the viewport tooltip and the panel.
+    Matched (green), unmatched against a committed neighbour (red, a crack),
+    nothing to match (grey, normal).
     """
     who = (f"patch {reference.neighbour}" if reference.neighbour is not None
            else "the committed neighbour")
@@ -1029,8 +808,7 @@ def status_of(
         return ("Matched",
                 f"reproduces {who}'s vertices{pinned} — click to release")
     if reference.available:
-        # Red in the viewport: there is retopology across this side and this
-        # patch is not welding to it.
+        # Red in the viewport.
         crack = "Not matched — this edge will crack"
         if pin_kind == PIN_EXCLUDED:
             return (crack, "released by hand — click to match it again")
@@ -1048,10 +826,8 @@ def status_of(
 def applied_loops() -> set[int]:
     """Boundary loops whose points a match has replaced this generation.
 
-    A ring has to know: a loop carrying a committed neighbour's own vertices
-    must be reproduced exactly, so it may not be phase-aligned or resampled --
-    doing that is what threw the match away and left the two rims half a step
-    apart. See `generators.ring.generate`.
+    A ring leads with such a loop and never resamples it
+    (`generators.ring.generate`).
     """
     return {reference.loop for reference in active_sides() if reference.applied}
 
@@ -1060,12 +836,8 @@ def applied_side_counts() -> dict[int, dict[int, int]]:
     """{loop: {side within that loop: segments}} for every side a match
     replaced this generation.
 
-    `applied_loops` says *that* a rim carries a neighbour's vertices, which is
-    all a rim of one cornerless side needs. A rim cut into several -- by
-    isoparms, or by a corner the angle test found -- needs to know *which* of
-    them: only the matched sides hold the neighbour's points, and re-allocating
-    the loop's total by length hands them a count that is not theirs, which is
-    the match thrown away. See `generators.ring.allocate_segments`.
+    For a rim cut into several sides: only the matched ones are pinned
+    (`generators.ring.allocate_segments`).
     """
     counts: dict[int, dict[int, int]] = {}
     for reference in active_sides():
@@ -1079,9 +851,7 @@ def applied_side_counts() -> dict[int, dict[int, int]]:
 def ngon_group_key(run: "list[int]") -> str:
     """The key an n-gon group's vertex count is stored under: its sides.
 
-    The sides themselves rather than the group number, so a count follows the
-    exact run it was set on. Regroup the sides and the old count simply stops
-    applying; put them back and it comes back with them.
+    The sides, never the group number, so a regrouping stops a count applying.
     """
     return ",".join(str(index) for index in sorted(run))
 
@@ -1119,9 +889,7 @@ def ngon_runs(
 ) -> "list[list[int]]":
     """The side runs an n-gon's vertex counts apply to.
 
-    The user's grouping when it is usable, one run per side otherwise: an
-    invalid grouping is kept and reported, exactly as on a grid, and the sides
-    stay individually adjustable in the meantime.
+    The user's grouping when it is valid, else one run per side.
     """
     numbers = group_numbers(references, state)
     at_fault, _message = group_problems(references, numbers)

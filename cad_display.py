@@ -1,29 +1,12 @@
 """What the CAD surface looks like underneath the triangles, for the viewport.
 
-The bridge sends a triangle soup plus `groups`/`face_ids`. No edges, no
-vertices, no surface parameters -- the Plasticity protocol carries none of it
-(see patch_data). So a mesh imported through it shows as a uniform field of
-triangles, and the two things worth seeing while retopologizing it are exactly
-the two things that field hides:
+- **B-rep edges and vertices** are exact: an edge is a run of boundary
+  segments with the same neighbouring face id, a vertex is where it changes.
+- **Surface flow** is derived, not imported: the grid a patch would be filled
+  with, at a low span. The bridge sends no surface parameters.
 
-**Where one CAD face ends and the next begins.** That *is* recoverable, and
-exactly: a boundary half-edge (a, b) of one patch is matched by (b, a) of the
-patch on the other side, so every B-rep edge is the maximal run of boundary
-segments whose neighbouring face id does not change, and every B-rep vertex is
-where it does. Those are facts about the model, not estimates.
-
-**Which way the surface runs.** That is *not* recoverable. Plasticity's own
-isoparametric curves come from each face's NURBS parameterisation, and none of
-it crosses the bridge. What can be built instead is the flow implied by the
-face's own boundary: split it into sides the way the generators do, run the
-same Coons interpolation over it, and draw the resulting grid. On a fillet or a
-swept face those lines land very close to the true isoparms, because both are
-answering the same question about the same boundary -- but they are derived,
-not imported, and the panel says so. They are also the more useful of the two
-here: they show the topology the retopology would actually get.
-
-Everything is cached per mesh, keyed on the same fingerprint `patch_data` uses.
-A draw handler runs on every redraw, and none of this may be recomputed there.
+Everything is cached per mesh on the `patch_data` fingerprint. A draw handler
+must never recompute any of it.
 """
 import array
 import zlib
@@ -43,8 +26,7 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T")
 
-# mesh name -> {key: (fingerprint, value)}. Each mesh keeps one entry per
-# derived product, since they are asked for independently and cost differently.
+# mesh name -> {key: (fingerprint, value)}, one entry per derived product.
 _cache: dict[str, dict[str, tuple[patch_data.Fingerprint, Any]]] = {}
 _CACHE_LIMIT = 4
 
@@ -64,10 +46,8 @@ def _cached(
 ) -> _T:
     """`build()`'s result, kept until the mesh changes under it.
 
-    `surfaces=True` for anything derived from the mesh's own Plasticity
-    surfaces rather than from the patches laid over them: it keys on the
-    geometry alone, so building a composite -- which moves no vertex -- does
-    not throw away a picture of the model that did not change.
+    `surfaces=True` for anything derived from the raw Plasticity surfaces: it
+    keys on the geometry alone, so writing a composite does not invalidate it.
     """
     fingerprint = (patch_data.geometry_fingerprint(mesh) if surfaces
                    else patch_data.mesh_fingerprint(mesh))
@@ -89,11 +69,8 @@ def _cached(
 def _structure(mesh: "bpy.types.Mesh", face_id: int | None) -> "patch_data.MeshPatches":
     """The analysis the CAD structure display should read.
 
-    With no face id it describes the **model**, so it reads the mesh's own
-    surfaces: a composite is this addon's decision about how to retopologize,
-    and the edges the part was built from do not stop existing because a patch
-    was laid across them. Asked about one face id it describes a **patch**, and
-    then the composites are exactly what it has to honour -- that id may be one.
+    With no face id: the model's own surfaces, ignoring composites.
+    With a face id: the patches, since that id may be a composite.
     """
     return (patch_data.analyse(mesh) if face_id is not None
             else patch_data.analyse_surfaces(mesh))
@@ -107,13 +84,8 @@ def _edge_runs(
 ) -> list[list[int]]:
     """Split one boundary loop into runs of constant neighbour.
 
-    Each run is a list of positions *into the loop*, from one junction up to
-    and including the next, so consecutive runs share their junction vertex --
-    the same convention `sides.split_into_sides` uses, and for the same reason:
-    a junction belongs to both edges meeting there.
-
-    A loop whose neighbour never changes is one closed edge, and comes back as
-    a single run that closes on itself.
+    Each run is a list of positions into the loop, from one junction up to and
+    including the next. A loop whose neighbour never changes is one closed run.
     """
     count = len(loop)
     if count < 2 or not neighbours or len(neighbours) != count:
@@ -140,19 +112,12 @@ def edge_polylines(
 ) -> "list[list[mathutils.Vector]]":
     """Every B-rep edge of `mesh`, as a list of point polylines in local space.
 
-    Each edge is emitted **once**, though both of the faces that share it walk
-    it. Which of the two emits it is settled by face id rather than by
-    remembering what has been seen: the lower id wins, an outer boundary (no
-    face on the other side) always emits, and nothing has to be compared for
-    equality -- two patches tessellated from the same CAD edge agree on their
-    welded vertex indices, but a set of those is a much larger thing to carry
-    around than one comparison.
+    Each edge is emitted once: by the lower face id of the two sharing it.
+    An outer boundary always emits.
     """
     def build() -> list[list["mathutils.Vector"]]:
         analysis = _structure(mesh, face_id)
-        # Boundary loops are in welded index space, and a welded id is itself a
-        # vertex index -- build_weld_map elects one of the coincident vertices
-        # rather than inventing a new id -- so `positions` indexes directly.
+        # A welded id is itself a vertex index, so `positions` indexes directly.
         positions = analysis.positions
         polylines = []
         for owner, patch in analysis.patches.items():
@@ -161,15 +126,12 @@ def edge_polylines(
             for loop, neighbours in zip(patch.boundary_loops, patch.boundary_neighbours):
                 for run in _edge_runs(loop, neighbours):
                     other = neighbours[run[0]]
-                    # One patch of a pair draws their shared edge -- unless only
-                    # one patch is being asked about, when there is no pair.
+                    # The lower id of a pair draws it, unless one patch was asked.
                     if face_id is None and other is not None and other < owner:
                         continue
                     polylines.append([positions[loop[i]] for i in run])
         return polylines
 
-    # Keyed on the geometry alone when it describes the whole model, so a
-    # composite written mid-pick does not rebuild a picture that did not change.
     return _cached(mesh, f"edges:{face_id}", build, surfaces=face_id is None)
 
 
@@ -178,15 +140,8 @@ def shared_edges(
 ) -> "list[tuple[int, int, list[mathutils.Vector]]]":
     """Every B-rep edge with a face on *both* sides, as (owner, other, points).
 
-    `edge_polylines` throws the pair away because a drawing only needs the
-    curve; this keeps it, because the question it answers is about the two
-    patches rather than about the edge -- "are these two welded to each other
-    along the edge they share". An outer boundary has no pair and is not here
-    at all: nothing can crack along an edge with one face on it.
-
-    Emitted once per pair, by the same `other < owner` rule and for the same
-    reason: both faces walk their shared edge, and comparing ids is cheaper
-    than remembering which runs have been seen.
+    For the crack report. Outer boundaries are left out. Emitted once per pair,
+    by the same rule as `edge_polylines`.
     """
     def build() -> list[tuple[int, int, list["mathutils.Vector"]]]:
         analysis = patch_data.analyse(mesh)
@@ -210,8 +165,7 @@ def edge_segments(
 ) -> "list[mathutils.Vector]":
     """The same edges as a flat list of point pairs, ready for a LINES batch.
 
-    One batch for the whole object rather than one per edge: a CAD part has
-    hundreds of edges, and a draw call each is what makes an overlay stutter.
+    One batch for the whole object, never one per edge.
     """
     def build() -> list["mathutils.Vector"]:
         segments = []
@@ -221,8 +175,6 @@ def edge_segments(
                 segments.append(b)
         return segments
 
-    # Keyed on the geometry alone when it describes the whole model, so a
-    # composite written mid-pick does not rebuild a picture that did not change.
     return _cached(mesh, f"edge_segments:{face_id}", build, surfaces=face_id is None)
 
 
@@ -231,18 +183,9 @@ def patch_triangles(
 ) -> "list[mathutils.Vector]":
     """One patch's polygons as a flat list of triangle corners, for a TRIS batch.
 
-    What a *highlight* over a surface needs, as against the outline
-    `edge_segments` gives: a patch picked out of a dense CAD part by its border
-    alone is a border among hundreds of other borders.
-
-    `surfaces=True` reads the mesh's own surfaces instead, so `face_id` can be
-    one that a composite has swallowed -- which is exactly the case the surface
-    picker's hover is in, since it marks the surface a click would take rather
-    than the patch it may already be part of.
-
-    Fan-triangulated, which the bridge's triangle soup makes a no-op -- the
-    same thing `geometry.build_bvh_with_polygon_map` does, and for the same
-    reason: nothing here requires the triangulated export.
+    For a tinted highlight. `surfaces=True` reads the raw surfaces, so
+    `face_id` can be one a composite has absorbed.
+    Fan-triangulated: an untriangulated export works too.
     """
     def build() -> list["mathutils.Vector"]:
         analysis = (patch_data.analyse_surfaces(mesh) if surfaces
@@ -268,9 +211,7 @@ def brep_vertices(
 ) -> "list[mathutils.Vector]":
     """The junctions between CAD edges -- genuine B-rep vertices.
 
-    Where the face on the other side of the boundary changes, two CAD edges
-    meet, and the vertex there is one the model itself put down. Every other
-    boundary vertex is the mesher's.
+    Where the face on the other side of the boundary changes.
     """
     def build() -> list["mathutils.Vector"]:
         analysis = _structure(mesh, face_id)
@@ -288,15 +229,12 @@ def brep_vertices(
                         points.append(positions[vertex])
         return points
 
-    # Keyed on the geometry alone when it describes the whole model, so a
-    # composite written mid-pick does not rebuild a picture that did not change.
     return _cached(mesh, f"brep_vertices:{face_id}", build, surfaces=face_id is None)
 
 
 # --- surface flow -----------------------------------------------------------
 
-# How dense a patch's flow grid may get. The display is there to be read at a
-# glance, and past this the lines stop being distinguishable from the surface.
+# Max span of a patch's flow grid.
 MAX_FLOW_SPAN = 12
 
 
@@ -333,15 +271,12 @@ def _patch_flow(
     if len(loops_sides) == 2 and generators.ring.is_band(loops_sides):
         generator = generators.RING
         generation_input = loops_sides
-        # A band's "around" is one count for the whole rim, so a plain span
-        # would give it a handful of points and a twisted-looking ring.
+        # A band's "around" covers the whole rim, so it needs a larger span.
         settings = dict(settings,
                         span_u=generators.ring.around_count(loops_sides, span * 4))
     else:
-        # Not a band -- a plate with a small hole, say. A ring across it is
-        # stretched the width of the plate, which says nothing true about how
-        # the surface runs, so the outer boundary alone is drawn and the hole
-        # is simply not described. Same judgement `_generate_for_face` makes.
+        # Not a band: draw the outer boundary alone, as `_generate_for_face`
+        # would fill it.
         generator = generators.find_generator(len(loops_sides[0]))
         generation_input = loops_sides[0]
     if generator is None:
@@ -350,7 +285,7 @@ def _patch_flow(
     try:
         result = generator.generate(generation_input, settings, bvh=bvh)
     except (ValueError, ZeroDivisionError):
-        # A degenerate patch is not worth a traceback out of a display path.
+        # A degenerate patch: draw nothing.
         return [], []
 
     edges = set()
@@ -372,9 +307,7 @@ def flow_segments(
 ) -> "list[mathutils.Vector]":
     """Flow lines for every patch of `mesh`, as a flat list of point pairs.
 
-    Built from the same generators the retopology uses, at a low span, and
-    reprojected onto the surface through one shared BVH -- so what is drawn is
-    the shape a patch would actually be filled with, not a flat lid over it.
+    Built from the same generators at a low span, reprojected onto the surface.
     """
     def build() -> list["mathutils.Vector"]:
         analysis = patch_data.analyse(mesh)
@@ -406,8 +339,7 @@ def patch_count(mesh: "bpy.types.Mesh") -> int:
 def integrity(mesh: "bpy.types.Mesh") -> patch_data.GroupReport:
     """`patch_data.group_report`, cached like everything else here.
 
-    Asked for from a panel draw, which runs on every mouse move over the
-    sidebar, so it may no more walk a mesh than a viewport handler may.
+    Cached: a panel draw may not walk a mesh either.
     """
     return _cached(mesh, "integrity", lambda: patch_data.group_report(mesh))
 
@@ -416,13 +348,9 @@ def integrity(mesh: "bpy.types.Mesh") -> patch_data.GroupReport:
 class PatchLabel:
     """One patch's raw bridge numbers, and where to write them on screen.
 
-    `anchor` is the centre of one of the patch's own polygons -- the one nearest
-    the mean of them all -- rather than the mean itself. The mean of a concave
-    patch is outside it and the mean of an annulus is in its hole, which would
-    put a label on a face it does not describe; a polygon centre is on the
-    surface by construction. `normal` is that polygon's, and is what lets the
-    far side of a closed part be culled instead of writing its labels over the
-    near side.
+    `anchor` is the centre of the patch polygon nearest the mean of them all,
+    never the mean itself, which can lie outside a concave patch.
+    `normal` is that polygon's, for back-face culling.
     """
     face_id: int
     loop_start: int
@@ -435,10 +363,7 @@ class PatchLabel:
 def _selection_fingerprint(mesh: "bpy.types.Mesh") -> int:
     """A CRC of which polygons are selected.
 
-    Selection does not touch `patch_data.mesh_fingerprint` -- it is not
-    geometry -- so scoping the labels to the selection needs its own key. One
-    `foreach_get` plus one CRC, both C loops, which is the same budget the
-    geometry fingerprint already spends per redraw.
+    Selection is not in `patch_data.mesh_fingerprint`, so it needs its own key.
     """
     count = len(mesh.polygons)
     flags = array.array("i", bytes(4 * count))
@@ -450,28 +375,20 @@ def _selection_fingerprint(mesh: "bpy.types.Mesh") -> int:
 def patch_labels(mesh: "bpy.types.Mesh") -> list[PatchLabel]:
     """Every patch's `face_id` / `loop_start` / `loop_count`, placed in space.
 
-    Always the whole mesh, keyed on the geometry alone. Which of them to *draw*
-    -- one under the cursor, the selected ones, all of them -- is a filter over
-    a few hundred entries and belongs at the point of drawing: scoping this
-    would put a second, far more volatile key on a cache whose expensive half
-    (a scan of every polygon centre) does not depend on it at all.
+    Always the whole mesh. Which ones to draw is filtered at draw time.
     """
     return _cached(mesh, "labels", lambda: _build_patch_labels(mesh))
 
 
-# mesh name -> (geometry fingerprint, selection crc, face ids). Same shape and
-# same reason as `_label_cache`: the panel asks for this on every redraw of the
-# sidebar, and walking the polygons there is no cheaper than doing it in a
-# viewport handler.
+# mesh name -> (fingerprint, selection crc, face ids). The panel asks on every
+# redraw.
 _selected_cache: dict[str, tuple[patch_data.Fingerprint, int, set[int]]] = {}
 
 
 def selected_face_ids(mesh: "bpy.types.Mesh") -> set[int]:
     """The face ids of the patches carrying a selected polygon.
 
-    Empty while Blender holds the mesh in Edit Mode: selection flags are only
-    written back to the mesh datablock on leaving it. That is a fact about
-    Blender rather than something to work around, and the panel says so.
+    Empty in Edit Mode: Blender writes selection back only on leaving it.
     """
     fingerprint = patch_data.mesh_fingerprint(mesh)
     selection = _selection_fingerprint(mesh)
@@ -507,13 +424,11 @@ def _build_patch_labels(mesh: "bpy.types.Mesh") -> list[PatchLabel]:
     labels = []
     for entry in report.entries:
         if entry.poly_start < 0 or entry.poly_count <= 0:
-            # A group that does not land on a polygon boundary -- reported by
-            # `integrity`, and there is nothing here to point at.
+            # Not on a polygon boundary: `integrity` reports it.
             continue
         indices = range(entry.poly_start, entry.poly_start + entry.poly_count)
 
-        # The polygon nearest the patch's own average centre. Two passes over
-        # the patch's polygons, no square roots in the first.
+        # The polygon nearest the patch's average centre.
         mx = my = mz = 0.0
         for i in indices:
             mx += centres[i * 3]

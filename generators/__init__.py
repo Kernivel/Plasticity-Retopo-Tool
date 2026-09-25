@@ -15,12 +15,11 @@ GENERATORS: list[base.Generator] = [
     nside.NSideGenerator(),
 ]
 
-# Not in GENERATORS on purpose: a ring is recognised by its patch having two
-# boundary loops, not by a side count, so operators reaches for it directly.
+# Not in GENERATORS: a ring is chosen by its patch having two boundary loops,
+# not by a side count.
 RING: ring.RingGenerator = ring.RingGenerator()
 
-# Same: N-gon is a *mode* the user toggles during a session, never something a
-# side count selects, so it is reached directly too.
+# Not in GENERATORS either: N-gon is a mode the user toggles.
 NGON: ngon.NgonGenerator = ngon.NgonGenerator()
 
 

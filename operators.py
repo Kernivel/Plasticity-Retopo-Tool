@@ -18,17 +18,12 @@ from . import sidematch
 from . import state as state_mod
 from . import tweak
 
-# Whether a session modal is actually listening. Session *state* lives in the
-# scene and outlives a reload or a crashed modal, so the two can disagree --
-# which is what `session_is_running` exists to report (see the panel's reset).
+# Whether a session modal is actually listening. Session state lives in the
+# scene and can outlive it (`session_is_running`).
 _SESSION_RUNNING: bool = False
 
-# Set by the undo/redo handler, consumed by the session modal on its next
-# event. The handler may not touch a datablock -- Blender has just swapped the
-# whole file state out from under it -- but the preview mesh it leaves behind
-# is geometry for a patch that is no longer open, so somebody has to empty it.
-# The modal is the one place that runs after the handler, owns the preview and
-# is allowed to write to it.
+# Set by the undo/redo handler, consumed by the modal on its next event: the
+# handler may not touch a datablock. See "The undo handler defers" in CLAUDE.md.
 _undo_needs_reconcile: bool = False
 
 
@@ -37,10 +32,8 @@ def resolve_session_object(
 ) -> bpy.types.Object | None:
     """The object a session should actually run on.
 
-    Selecting `<Something>_Retop` and starting a session is asking to carry on
-    retopologizing `Something` -- the result mesh has no patch data of its own
-    and never will, so taking it literally can only fail. Everything else is
-    returned untouched.
+    `<Something>_Retop` resolves to `Something`. Anything else is returned
+    untouched.
     """
     if obj is None:
         return None
@@ -58,11 +51,8 @@ def _propagated_defaults(
     corner_source_ids: list[int],
     defaults: dict[str, int],
 ) -> tuple[dict[str, int], list[str]]:
-    """Override `defaults` (span_u/span_v or span) with spans already used by
-    committed neighboring patches sharing a side (see mesh_build's span
-    registry), so adjacent patches naturally weld along their whole shared
-    edge instead of only at corners. Returns (defaults, locked_keys) where
-    locked_keys names which entries were overridden by propagation.
+    """Override `defaults` with the spans committed neighbours used along a
+    shared side (mesh_build's span registry). Returns (defaults, locked_keys).
     """
     n = len(corner_source_ids)
 
@@ -86,7 +76,7 @@ def _propagated_defaults(
             defaults["span_v"] = span_v
             locked.append("span_v")
     elif generator.name == constants.WEDGE:
-        # both sides are linked, so either one determines the span
+        # Both sides share one span.
         span_u = side_span(0)
         if span_u is None:
             span_u = side_span(1)
@@ -94,8 +84,7 @@ def _propagated_defaults(
             defaults["span_u"] = span_u
             locked.append("span_u")
     else:
-        # Triangle / N-Side: one span shared by every side, so the first
-        # already-committed neighbour edge decides it.
+        # One span for every side: the first committed neighbour decides it.
         for i in range(n):
             span = side_span(i)
             if span is not None:
@@ -111,26 +100,16 @@ def register_spans_for(
     source_obj: bpy.types.Object,
     prepared: patchprep.PreparedPatch,
 ) -> None:
-    """Record the span used along each side of a just-committed patch, so
-    neighbouring patches pick it up (mesh_build's span registry).
+    """Record the span along each side of a just-committed patch, in
+    mesh_build's span registry.
 
-    A ring registers each of its two loops separately: pairing corners
-    cyclically across the whole flat list would invent a side running from the
-    outer boundary to the hole. Its per-side counts come from the generator's
-    own allocation, since "around" is one number spread over the sides.
+    A ring and an n-gon register each loop separately: pairing corners across
+    loops would invent a side from the outer boundary to a hole.
     """
     state = context.scene.plasticity_retop
     if state.generator_name == generators.NGON.name:
-        # An n-gon has no span, but it does have a segment count per side, and
-        # that is what a neighbouring grid patch has to match to weld onto it.
-        # Recomputed rather than carried over: same inputs, same result, and it
-        # keeps the commit path from having to thread the allocation through.
-        #
-        # Per loop, like a ring: pairing corners cyclically across a flat list
-        # of both loops' ids would invent a side running from the outer
-        # boundary into the hole.
-        # Same substitution the preview was built with, or the registry would
-        # advertise a curvature count on a side that was matched to a neighbour.
+        # An n-gon's segment count per side, recomputed with the same matches
+        # the preview was built with.
         matched = sidematch.apply_side_matches(
             context, source_obj, prepared, generators.NGON.name)[0]
         forced = ngon_forced_segments(state, prepared, matched)
@@ -144,28 +123,17 @@ def register_spans_for(
                         forced[loop_i] if loop_i < len(forced) else None))
         return
 
-    # The same grouping generation used, or the registry describes a patch that
-    # was not built: a pentagon committed as a Quad has four spans and five
-    # corners, and pairing the five against the four is what raised IndexError
-    # out of `register_patch_spans`. Read through the one helper, so the two can
-    # only ever agree. Neither the n-gon nor the ring path above reaches here --
-    # both are grouping-free, and both have already returned.
+    # The same grouping as generation (`_side_groups_for`), or the registry
+    # describes a patch that was not built.
     groups = _side_groups_for(state, prepared, ngon=False)
     corner_ids = prepared.corner_source_ids
     if groups:
-        # One entry per group, naming the corner it starts at. The corner
-        # *inside* a group is deliberately not registered: what these pairs
-        # describe is a shared boundary, and a group's boundary is the whole
-        # merged run -- a neighbour across only part of it has no pair to look
-        # up, which is the same propagation this gives up as the matching does.
+        # One entry per group, at the corner it starts at. Corners inside a
+        # group are not registered.
         corner_ids = [prepared.loops_corner_ids[0][run[0]] for run in groups]
 
     if state.generator_name == constants.NSIDE:
-        # Per side, from the same solve generation ran: the registry has to
-        # advertise what the mesh actually got, and an N-Side's sides no longer
-        # share one number. The winners are re-collected rather than carried
-        # over, off the side references the preview left behind -- same patch,
-        # same pins, same answer.
+        # Per side, from the same spoke solve as generation (`nside_allocation`).
         winners, _outvoted = sidematch.collect_side_matches(context, constants.NSIDE)
         spokes, _refused = nside_allocation(len(corner_ids) or len(prepared.sides),
                                             state.span, winners)
@@ -194,17 +162,9 @@ def nside_allocation(
 ) -> tuple[list[int], list[int]]:
     """(spoke counts, side indices whose match cannot be honoured) for N-Side.
 
-    An N-Side patch's sides are no longer one shared span: side `i` spans the
-    two spokes either side of it, so several sides can reproduce several
-    committed neighbours at once. What they cannot always do is *all* of them --
-    two sides meeting at one spoke can want counts that disagree -- so the
-    wanted counts are applied in the same order `_winning_matches` ranks them
-    (a pin first, then the denser match) and whatever is left over is refused
-    rather than approximated.
-
-    Shared by generation and the commit path deliberately: the registry has to
-    advertise the counts the mesh actually got, and the only way to be sure of
-    that is for both to run the same solve on the same inputs.
+    Wanted counts are applied in `_winning_matches` order (a pin first, then
+    the denser match). What cannot fit is refused, never approximated.
+    Shared by generation and the commit path, so both get the same answer.
     """
     ranked = []
     for key, (reference, points, pinned) in winners.items():
@@ -226,8 +186,8 @@ def nside_allocation(
 
 
 def spans_per_side(state: state_mod.RetopPatchState, num_sides: int) -> list[int]:
-    """Span used along each side of the active patch, in boundary order --
-    what gets recorded for propagation to neighbouring patches.
+    """Span along each side of the active patch, in boundary order, for the
+    span registry.
     """
     if state.generator_name == constants.QUAD:
         return [state.span_u, state.span_v, state.span_u, state.span_v]
@@ -266,24 +226,10 @@ def adopt_side_reference(
 ) -> sidematch.SideReference | None:
     """Pin side `flat_index` to the vertices it should reproduce.
 
-    One path for every generator: the pin is recorded, and regeneration
-    substitutes those points into that side and sets whatever count reproduces
-    them. Which span that turns out to be is the generator's business (see
-    `span_key_for`).
-
-    There is one thing a side can be pinned to: `sidematch.PIN_NEIGHBOUR`, the
-    committed patch across it, which is what welds two patches together. A side
-    with nothing committed across it cannot be pinned at all -- matching is
-    binary, and there is no third state where a side follows something that is
-    not a neighbour.
-
-    **A click on a side that is already being matched turns the match off**
-    (`sidematch.PIN_EXCLUDED`), rather than merely releasing the pin. Releasing
-    is what this used to do, and with automatic matching on -- which is the
-    default -- the automatic match put itself straight back on the next
-    regeneration: the side stayed green and the click read as broken. Clicking
-    an excluded side matches it again, so the gesture is a plain two-state
-    toggle: matched or not.
+    A side can only be pinned to the committed patch across it
+    (`sidematch.PIN_NEIGHBOUR`). A click on a matched side turns the match off
+    (`sidematch.PIN_EXCLUDED`), never just releases the pin: automatic matching
+    would put it straight back. A two-state toggle.
 
     Returns the SideReference that was pinned, or None if it can't be.
     """
@@ -322,9 +268,7 @@ def _ngon_wanted(
     """Whether the *mode* asks for an n-gon, before checking the patch can take
     one (see ngon_blocker).
 
-    A patch already in the result mesh comes back the way it was committed --
-    same rule as its spans, and for the same reason: hovering a finished patch
-    must show what is actually there, not what the current mode would build.
+    A committed patch comes back the way it was committed.
     """
     if committed:
         stored = mesh_build.lookup_patch_settings(obj, face_id)
@@ -341,14 +285,7 @@ def ngon_blocker(
 ) -> str:
     """Why this patch can't be an n-gon, or "" when it can.
 
-    One reason, and it is hard: a curved face would get a flat lid over it and
-    the shape would simply be gone.
-
-    Holes used to be the second one. They no longer are -- `generate_holed`
-    bridges each hole into the face around it, so any number of them comes back
-    as that many n-gons plus one. `num_loops` is still taken, because callers
-    pass it and because the count is what the panel reports, but it blocks
-    nothing.
+    Only one reason: a face that is not flat. `num_loops` blocks nothing.
     """
     if not patchprep.patch_is_planar(mesh, face_id, state.ngon_planar_tolerance):
         return "not a flat face"
@@ -358,9 +295,7 @@ def ngon_blocker(
 def _joined(subsides: "list[list[mathutils.Vector]]") -> "list[mathutils.Vector]":
     """Several consecutive sides as one polyline, the shared endpoints dropped.
 
-    The end of one side and the start of the next are the same vertex; kept
-    twice, every generator would see a zero-length segment there and
-    `resample_polyline_by_arclength` would divide by it.
+    Never keep the shared vertex twice: that is a zero-length segment.
     """
     points: "list[mathutils.Vector]" = []
     for sub in subsides:
@@ -369,9 +304,8 @@ def _joined(subsides: "list[list[mathutils.Vector]]") -> "list[mathutils.Vector]
     return points
 
 
-# Segments per side of the n-gon last generated, by flat side index. What
-# Ctrl+wheel over a side starts from, so the first step moves one vertex from
-# what is on screen rather than jumping to a number nobody saw.
+# Segments per side of the n-gon last generated, by flat side index: where
+# Ctrl+wheel over a side starts from.
 _ngon_allocation: dict[int, int] = {}
 
 
@@ -382,15 +316,10 @@ def ngon_forced_segments(
 ) -> "list[dict[int, int]]":
     """Per loop, {side in loop: segments} for the n-gon fill.
 
-    The matched sides first, then the counts set with Ctrl+wheel. A count set on
-    a group is shared out over its sides by length
-    (`patchprep.allocate_group_segments`), so the corner inside the group stays
-    a vertex a neighbour can weld to. A matched side inside it is a pin on that
-    share; a lone matched side keeps its match, since it carries a neighbour's
-    own vertices.
-
-    Shared by generation and the commit path, so the registry advertises the
-    counts the mesh actually got.
+    The matched sides first, then the counts set with Ctrl+wheel, shared over a
+    group's sides by `patchprep.allocate_group_segments`. A lone matched side
+    keeps its match.
+    Shared by generation and the commit path.
     """
     forced = sidematch.ngon_side_segments(prepared, matched)
     counts = sidematch.ngon_group_counts(state)
@@ -467,9 +396,8 @@ def nudge_ngon_side(
 
 
 def _span_for_group(spans: dict[str, int], generator_name: str, position: int) -> int:
-    """How many segments group `position` carries, read off the resolved spans
-    through the same key the matching uses -- two ideas of which span drives a
-    side is how a grid comes out with its two directions swapped."""
+    """How many segments group `position` carries, through the same span key
+    the matching uses (`sidematch.span_key_for`)."""
     key = sidematch.span_key_for(
         generator_name, sidematch.SideSlot(position, 0, position))
     return max(1, spans.get(key, spans.get(sidematch.span_base(key), 1)))
@@ -482,12 +410,8 @@ def _side_groups_for(
 ) -> "list[list[int]] | None":
     """The user's grouping as runs of side indices, or None to use the sides.
 
-    None whenever the grouping would change nothing or cannot be built: an
-    n-gon or a ring (neither reaches `find_generator` by side count), a
-    numbering that leaves every side on its own, and a numbering
-    `sidematch.group_problems` has something to say about -- an unusable
-    grouping is *kept* and reported rather than refused, so the generator has
-    to go on building the patch the old way in the meantime.
+    None for an n-gon or a ring, when nothing is merged, or when the grouping
+    is invalid (it is reported, and the sides are used meanwhile).
     """
     if ngon or prepared.is_ring:
         return None
@@ -509,12 +433,8 @@ def _group_pins(
 ) -> "list[dict[int, int]]":
     """Per group, {position within it: segments} for its matched sub-sides.
 
-    A match hands a side a committed neighbour's own vertices, so its count is
-    not negotiable -- resampling it off them is the crack matching exists to
-    close. Inside a merged group that count is only a *share* of the group's
-    span, which is why those sides key their span per side (`span_key_for`)
-    and end up here as pins on the allocation rather than as a vote on the
-    direction.
+    A matched side's count is fixed: it becomes a pin on the group's
+    allocation.
     """
     wanted = {reference.index: len(points) - 1
               for _key, (reference, points, _pinned) in winners.items()}
@@ -531,16 +451,13 @@ def _generate_for_face(
     face_id: int,
     span_overrides: dict[str, int] | None = None,
 ) -> "PatchPreview | None":
-    """Shared core: prepare a patch, pick a generator, generate a result and
-    push it into the preview object. Returns a PatchPreview on success, or None
-    on failure (nothing reported here -- callers report, since CANCELLED vs.
-    silently-ignored-during-hover differ).
+    """Prepare a patch, pick a generator, generate and push the result into the
+    preview object. Returns a PatchPreview, or None on failure. Callers report.
     """
     state = context.scene.plasticity_retop
     mesh = obj.data
 
-    # Committed state is needed before anything else: an n-gon patch has to come
-    # back as an n-gon, and the corner method depends on which mode will run.
+    # Decide the mode first: the corner method depends on it.
     committed = mesh_build.is_patch_committed(obj, face_id)
     wants_ngon = _ngon_wanted(state, obj, face_id, committed)
     blocker = ngon_blocker(state, mesh, face_id) if wants_ngon else ""
@@ -549,24 +466,18 @@ def _generate_for_face(
     def prepare(for_ngon: bool) -> patchprep.PreparedPatch | None:
         return patchprep.prepare_patch(
             mesh, face_id, state.corner_angle_threshold,
-            # Like every other distance in the panel: typed in state.length_unit.
+            # Typed in state.length_unit.
             state_mod.to_blender_units(state, state.small_side_tolerance),
             state.corner_method_ngon if for_ngon else state.corner_method_spans,
-            # Several holes are the n-gon fill's to bridge and nobody else's,
-            # so a span generator is still handed the outer boundary alone.
+            # A span generator gets the outer boundary alone.
             keep_holes=for_ngon)
 
     prepared = prepare(ngon)
     if prepared is None:
         return None
 
-    # Two boundary loops is not the same thing as a band. A flat plate with a
-    # small hole is an annulus too, and the Ring generator has to give both of
-    # its loops the same point count -- so the hole ends up absurdly dense, the
-    # outline absurdly coarse, and every quad stretched across the plate. The
-    # n-gon fill (outer boundary plus hole, bridged) is the right topology for
-    # a flat one, and it is already what pressing N would produce, so a
-    # non-band takes it rather than being quietly ruined by a band.
+    # Two loops that are not a band (a plate with a small hole) go to the n-gon
+    # fill. See "Two boundary loops is not the same thing as a band".
     ring_note = ""
     if not ngon and prepared.is_ring and not generators.ring.is_band(prepared.loops_sides):
         if committed:
@@ -580,12 +491,7 @@ def _generate_for_face(
             if prepared is None:
                 return None
 
-    # More than one hole, and nothing with a span can pave more than a single
-    # outline -- so under one of those the holes are simply covered over, while
-    # the n-gon fill bridges every one of them. Same judgement as the non-band
-    # ring above and for the same reason: a patch quietly ruined is worse than
-    # one built by the other generator. The planarity test is paid for here
-    # rather than on every hover, since this is the one branch that asks.
+    # Several holes go to the n-gon fill: a span generator would cover them.
     if not ngon and prepared.num_loops > 2:
         blocker = ngon_blocker(state, mesh, face_id)
         holes = prepared.num_loops - 1
@@ -607,24 +513,14 @@ def _generate_for_face(
 
     corner_source_ids = prepared.corner_source_ids
 
-    # Several of the patch's sides gathered into one, if the user has said so.
-    # This is what turns a five-sided face into the quad it usually wants to
-    # be, and it has to be settled here because the group *count* is what picks
-    # the generator.
-    #
-    # Single-loop span patches only, which is the case it exists for. A ring is
-    # chosen by having two loops and pairs them itself, so a group count would
-    # not reach `find_generator` at all; an n-gon follows its boundary whatever
-    # the sides are called, so grouping it changes nothing. Neither is refused
-    # -- the numbering is simply not read for them.
+    # The user's side grouping, settled before the generator: the group count
+    # picks it. Single-loop span patches only.
     groups = _side_groups_for(state, prepared, ngon)
     if groups:
         corner_source_ids = [prepared.loops_corner_ids[0][run[0]] for run in groups]
 
-    # Which generator runs is settled before anything is substituted, and can
-    # be: substitution swaps a side's *points*, never how many sides there are.
-    # It has to be, because a grid has one span per direction, so resolving two
-    # sides that want different counts needs to know which sides share one.
+    # The generator is chosen before any side is substituted: matches are
+    # resolved per span, which depends on the generator.
     if ngon:
         generator = generators.NGON
     elif prepared.is_ring:
@@ -636,25 +532,20 @@ def _generate_for_face(
             return None
 
     sidematch.build_side_references(context, obj, prepared, face_id)
-    # Collected here, applied further down: a match both *drives* a span and
-    # depends on it, so the spans have to be settled before any side is
-    # rewritten. The references have to exist first -- they are what holds the
-    # neighbour's vertices.
+    # Collected now, applied once the spans are settled: a match both drives a
+    # span and depends on it.
     winners, outvoted = sidematch.collect_side_matches(context, generator.name)
     state.match_conflicts = len(outvoted)
 
     if ngon:
-        # An n-gon carries a segment count per side, so no two matches can
-        # disagree and there is nothing to resolve first.
+        # One count per side: no match can conflict.
         matched, _ = sidematch.apply_side_matches(context, obj, prepared, generator.name,
                                         winners=winners)
         forced = ngon_forced_segments(state, prepared, matched)
         _remember_ngon_allocation(state, prepared, forced)
         settings = {"ngon_angle": state.ngon_angle, "side_segments": forced}
         if prepared.has_holes:
-            # Each hole bridged into the face around it with two edges, giving
-            # one more n-gon per hole (a Blender n-gon can't carry a hole on
-            # its own).
+            # One more n-gon per hole.
             result = generator.generate_holed(prepared.loops_sides, settings)
         else:
             settings = dict(settings, side_segments=settings["side_segments"][0])
@@ -666,21 +557,16 @@ def _generate_for_face(
                             corner_source_ids, [], committed, ngon=True)
 
     if prepared.is_ring:
-        # Two boundary loops: fill the band between them instead of trying to
-        # treat one of the loops as if it were the whole patch boundary.
+        # Two boundary loops: fill the band between them.
         generation_input = prepared.loops_sides
         num_sides = len(corner_source_ids)
         defaults = state_mod.scale_default_spans(
             state, generator.default_spans(generation_input))
-        # Propagation is per side; a ring's "around" span is one number for the
-        # whole loop, so nothing is pulled in from neighbours here (it is still
-        # pushed out to them on commit).
+        # Spans are not propagated into a ring, only out of it.
         propagated = []
     elif groups:
-        # Concatenated without resampling for now: `default_spans` reads edge
-        # lengths off the whole side, which the joined polyline already is. The
-        # allocation that puts a grid vertex on each internal corner needs the
-        # resolved span, so it runs further down.
+        # Joined for `default_spans` only. The real per-sub-side allocation
+        # needs the resolved span, further down.
         generation_input = [_joined([prepared.sides[i] for i in run]) for run in groups]
         num_sides = len(generation_input)
         defaults = state_mod.scale_default_spans(
@@ -689,15 +575,13 @@ def _generate_for_face(
     else:
         generation_input = prepared.sides
         num_sides = len(generation_input)
-        # Resolution first, propagation second: a span taken from a committed
-        # neighbour has to survive the preset, or the two patches stop welding.
+        # Resolution first, then propagation: a propagated span is never scaled.
         defaults = state_mod.scale_default_spans(
             state, generator.default_spans(generation_input))
         defaults, propagated = _propagated_defaults(obj, generator, corner_source_ids, defaults)
 
-    # An already-committed patch comes back with the spans it was committed
-    # with -- they beat both the computed defaults and propagation, which would
-    # otherwise silently re-shape a patch the user had already tuned by hand.
+    # A committed patch comes back with its committed spans, which beat both
+    # the defaults and propagation.
     if committed:
         stored = mesh_build.lookup_patch_settings(obj, face_id)
         if stored:
@@ -714,25 +598,10 @@ def _generate_for_face(
         span_v = span_overrides.get("span_v", span_v)
         span = span_overrides.get("span", span)
 
-    # A matched side only reproduces the neighbour's vertices if the generator
-    # asks for exactly as many points as it was handed, so the match decides the
-    # span that drives it. A grid has one span per *direction*, so pinning one
-    # side pins the opposite one's count too -- that's the generator's model,
-    # not a choice made here.
-    #
-    # A **pin** always decides; an **automatic** match only seeds the span the
-    # first time the patch is generated. Otherwise scrolling the span on a side
-    # that happens to border a committed neighbour would do nothing at all --
-    # the match would put its own count straight back every regeneration, and
-    # the control would look broken. Changing it away from the neighbour's
-    # count instead drops that substitution: the two can no longer weld, which
-    # is what asking for a different count means.
-    #
-    # Sorted, and weakest first, so the strongest match is the one that ends up
-    # driving the span: a ring keys its two rims separately (both drive
-    # "around"), so dict order would otherwise decide which committed neighbour
-    # the band reproduces. `_honours` then drops whichever rim the resolved
-    # count can no longer reproduce.
+    # A match sets the span that drives it. A pin always decides; an automatic
+    # match only seeds the span on first generation, so a typed span wins.
+    # See "An automatic match seeds a span; a pin decides it" in CLAUDE.md.
+    # Weakest first, so the strongest match ends up driving the span.
     for key, (_reference, points, pinned) in sorted(
             winners.items(), key=lambda item: (item[1][2], len(item[1][1]))):
         if key.startswith("side:"):
@@ -749,10 +618,8 @@ def _generate_for_face(
             span = count
 
     if groups:
-        # A group of `n` sub-sides needs at least `n` segments, or one of them
-        # gets none and its end corner -- a B-rep vertex a neighbour welds to
-        # -- is no longer on our grid. Floored per span rather than globally,
-        # so a quad whose U side is merged does not also inflate V.
+        # A group of `n` sub-sides needs at least `n` segments. Floored per
+        # span, never globally.
         floors: dict[str, int] = {}
         group_pins = _group_pins(winners, groups)
         for position, run in enumerate(groups):
@@ -760,10 +627,7 @@ def _generate_for_face(
                 sidematch.span_key_for(generator.name, sidematch.SideSlot(
                     position, 0, position)))
             pins = group_pins[position]
-            # Room for what the matched sub-sides must reproduce exactly, plus
-            # one segment for each of the rest: below that the pin set cannot
-            # fit and `allocate_group_segments` drops it whole, which is a
-            # boundary that had been arranged to weld coming back cracked.
+            # Room for the pins, plus one segment per other sub-side.
             needed = max(len(run), sum(pins.values()) + (len(run) - len(pins)))
             floors[key] = max(floors.get(key, 1), needed)
         span_u = max(span_u, floors.get("span_u", 1))
@@ -773,11 +637,8 @@ def _generate_for_face(
     spans = {"span_u": span_u, "span_v": span_v, "span": span}
     group_counts: "list[list[int]]" = []
     if groups:
-        # Allocated once, here, because the counts the matching is checked
-        # against have to be the very numbers the polylines are built from --
-        # two calls to the allocator could only ever agree by luck. A sub-side
-        # carrying a neighbour's vertices is pinned to its exact count; the
-        # rest share out what is left by arc length.
+        # Allocated once, here: the matching and the polylines must use the
+        # same counts.
         for position, run in enumerate(groups):
             group_counts.append(patchprep.allocate_group_segments(
                 [prepared.sides[i] for i in run],
@@ -789,12 +650,8 @@ def _generate_for_face(
                               for index, count in zip(run, counts)})
     nside_spokes = None
     if generator.name == constants.NSIDE:
-        # An N-Side patch splits every side at a spoke, so with nothing matched
-        # every side carries the same even count -- and a match moves only the
-        # two spokes its own side sits between, which is what lets several
-        # neighbours be reproduced on one patch. The allocation is settled here,
-        # before any side is rewritten, and handed down as a per-side span so
-        # `_honours` drops exactly the matches it could not fit.
+        # The spoke allocation, as per-side spans, so `_honours` drops exactly
+        # the matches it could not fit.
         span = generators.nside.even_span(span)
         nside_spokes, _refused = nside_allocation(
             len(groups) if groups else len(prepared.sides), span, winners)
@@ -805,11 +662,7 @@ def _generate_for_face(
     sidematch.apply_side_matches(context, obj, prepared, generator.name, spans, winners=winners)
 
     if groups:
-        # Now that the spans are final, each group is rebuilt with its share of
-        # them allocated to its sub-sides as integers -- which is what puts a
-        # grid vertex exactly on every corner *inside* the group. Built after
-        # the substitution, so a single-side group that was matched still hands
-        # its neighbour's own vertices through untouched.
+        # Rebuild each group from its sub-sides' counts, after the substitution.
         generation_input = [
             patchprep.group_side_points([prepared.sides[i] for i in run], counts)
             for run, counts in zip(groups, group_counts)]
@@ -820,25 +673,13 @@ def _generate_for_face(
     if nside_spokes is not None:
         span_settings["spokes"] = nside_spokes
     if prepared.is_ring:
-        # Which loops now carry a neighbour's own vertices rather than a sample
-        # of the CAD boundary. The ring has to know: a matched rim may not be
-        # phase-aligned or resampled, or the match is thrown away and the two
-        # rims come back half a step apart. See generators/ring.py.
+        # The loops carrying a neighbour's vertices: never phased or resampled.
         span_settings["locked_loops"] = sorted(sidematch.applied_loops())
-        # And *which* sides of them, with the count each was handed: a rim cut
-        # into several sides has only some of them carrying the neighbour's
-        # vertices, and the allocation may not redistribute those away.
+        # And which of their sides, with each one's count.
         span_settings["matched_sides"] = sidematch.applied_side_counts()
     result = generator.generate(generation_input, span_settings, bvh=bvh)
 
-    # Cell shape, once the grid exists. Every generator here interpolates
-    # between opposite sides, which stops being the right answer as soon as the
-    # sides do not face each other -- a concave rim bunches the cells against
-    # it, an acute corner collapses them -- and none of that is decided by the
-    # boundary, so no choice of corners or spans can fix it. The boundary is
-    # pinned, so this changes nothing a neighbour welds to, and it needs the
-    # BVH: see `geometry.relax_interior_points` for why there is nothing safe
-    # to do with reprojection off.
+    # Relax the interior; the boundary stays put. Needs the BVH.
     if bvh is not None:
         geometry.relax_interior_points(
             result.verts, result.faces, result.boundary_local_indices,
@@ -850,10 +691,8 @@ def _generate_for_face(
 
 
 def regenerate_active_preview(context: bpy.types.Context) -> bool:
-    """Re-run generation for the currently locked-in patch (state.active_face_id)
-    using the current span settings. Used by the Update Preview operator and
-    by the span/reproject property update callbacks (state.py) so dragging a
-    slider updates the preview live instead of requiring a manual click.
+    """Re-run generation for the active patch with the current settings.
+    Called by the property update callbacks, so sliders update live.
     """
     state = context.scene.plasticity_retop
     if state.active_face_id == -1 or state.source_object_name not in bpy.data.objects:
@@ -865,9 +704,7 @@ def regenerate_active_preview(context: bpy.types.Context) -> bool:
     if preview is None:
         return False
 
-    # Which generator ran can change under a live update -- toggling N-gon mode
-    # is exactly that -- and the panel, the overlay and the commit path all read
-    # the patch's shape from these.
+    # The generator can change on a live update (N-gon mode).
     state.generator_name = preview.generator.name
     state.num_sides = preview.num_sides
     state.num_loops = preview.num_loops
@@ -877,8 +714,8 @@ def regenerate_active_preview(context: bpy.types.Context) -> bool:
 def update_committed_count(
     context: bpy.types.Context, obj: bpy.types.Object | None
 ) -> None:
-    """Refresh the panel's cached "N patches done" figure. Called whenever the
-    result mesh changes, so the panel never has to walk it while redrawing.
+    """Refresh the panel's cached count of committed patches.
+    Call whenever the result mesh changes.
     """
     state = context.scene.plasticity_retop
     state.committed_patch_count = len(mesh_build.committed_face_ids(obj)) if obj else 0
@@ -891,9 +728,7 @@ def begin_reedit(
     re-edit rebuilds it from nothing, and remember the snapshot that puts it
     back. Returns how many faces were removed.
 
-    Removing on pick rather than on commit is what makes a re-edit legible: the
-    old patch disappears the moment you click it, so "nothing was removed" shows
-    up immediately instead of surfacing as two overlapping surfaces afterwards.
+    Removed on pick, never on commit, so a failure shows at once.
     """
     state = context.scene.plasticity_retop
     removed, backup = mesh_build.remove_patch_from_result(obj, face_id)
@@ -904,8 +739,7 @@ def begin_reedit(
     print(f"[Plasticity Retop] Re-editing patch {face_id} of '{obj.name}': "
           f"removed {removed} existing face(s)")
     if removed:
-        # Taking the patch out edits the result mesh and creates the snapshot
-        # datablock: both belong in an undo step of their own.
+        # It edited the result mesh and created a datablock: push an undo step.
         push_undo(f"Retop: re-edit patch {face_id}")
     return removed
 
@@ -926,8 +760,8 @@ def keep_reedit_removal(context: bpy.types.Context) -> None:
 
 
 def restore_reedit_removal(context: bpy.types.Context) -> None:
-    """Put back the patch a re-edit took out (discard, Esc, leaving the object,
-    ending the session): an uncommitted re-edit must never lose topology.
+    """Put back the patch a re-edit took out. Every exit but a commit must
+    call this.
     """
     state = context.scene.plasticity_retop
     if state.reedit_backup_mesh:
@@ -938,11 +772,8 @@ def restore_reedit_removal(context: bpy.types.Context) -> None:
 
 
 def _is_own_scaffolding(obj: bpy.types.Object) -> bool:
-    """True for objects this addon itself creates (the live preview and the
-    committed result meshes). They sit right on top of the surface being
-    picked -- the preview even sits slightly in front of it when Preview
-    Offset is used -- so a raycast must look straight through them instead of
-    treating them as an occluder.
+    """True for the preview and the result meshes: a raycast looks through
+    them.
     """
     return (obj.name == mesh_build.PREVIEW_OBJ_NAME
             or obj.name.endswith(mesh_build.RESULT_NAME_SUFFIX))
@@ -960,23 +791,10 @@ def _raycast_patch_ray(
     actually visible in this viewport, or (None, None, None). `distance` is
     measured in world units from `ray_origin`.
 
-    `surfaces=True` names the mesh's own Plasticity surface rather than the
-    patch covering it. That is what the surface picker needs: once two
-    surfaces are one patch, every polygon of both answers with the patch, and
-    Shift+click could no longer take one of them back out.
+    `surfaces=True` names the raw Plasticity surface, not the patch over it.
 
-    Two classes of hit are skipped by re-casting from just past them rather
-    than aborting the whole cast:
-
-    - objects hidden in this viewport (Local View '/', eye/collection
-      toggles): context.scene.ray_cast ignores per-viewport visibility, so
-      without this it would happily pick a patch on an isolated-away object.
-    - this addon's own preview/result meshes: they're coincident with (or
-      pushed in front of) the very surface being hovered, so treating them as
-      an occluder made the hover flicker -- the ray would hit the preview,
-      report "no patch here", delete the preview, then hit the source mesh
-      again on the next mouse move and rebuild it, over and over.
-
+    Looks through, never stops at: objects hidden in this viewport, this
+    addon's own meshes, and non-Plasticity meshes.
     Respects the Pick Max Distance setting (0 = unlimited).
     """
     depsgraph = context.evaluated_depsgraph_get()
@@ -995,15 +813,9 @@ def _raycast_patch_ray(
             return None, None, None
 
         visible = hit_obj.visible_get(viewport=space) if space else hit_obj.visible_get()
-        # A non-Plasticity mesh in the way used to abort the whole cast, which
-        # made anything behind it unpickable -- a stand-in, a boolean cutter, a
-        # block-out. It is an obstacle like the others, so look through it.
+        # Look through anything that is not a visible Plasticity mesh.
         if not visible or _is_own_scaffolding(hit_obj) or not _is_plasticity_mesh(hit_obj):
-            # Step past this hit and keep looking along the same ray. Scaled to
-            # the distance travelled: a fixed epsilon is either too small to
-            # clear the surface at far range (the same hit repeats until the
-            # attempts run out) or big enough to skip past a thin recess floor
-            # on a small part.
+            # Step past the hit, by a share of the distance travelled.
             origin = location + ray_direction * max(1e-6, distance * 1e-5)
             continue
 
@@ -1023,16 +835,15 @@ def patch_hit_distance(
     obj: bpy.types.Object | None,
     face_id: int,
 ) -> float | None:
-    """Distance from `ray_origin` to where the ray strikes patch `face_id` of
-    `obj`, or None if the ray doesn't hit that particular patch. Used for the
-    hover hysteresis in the modal picker.
+    """Distance from `ray_origin` to where the ray hits patch `face_id` of
+    `obj`, or None. For the hover hysteresis.
     """
     if obj is None or obj.name not in bpy.data.objects:
         return None
 
     matrix_inv = obj.matrix_world.inverted()
     local_origin = matrix_inv @ ray_origin
-    # direction transforms without translation
+    # A direction transforms without translation.
     local_dir = (matrix_inv.to_3x3() @ ray_direction).normalized()
 
     hit, location, _normal, index = obj.ray_cast(local_origin, local_dir)
@@ -1051,10 +862,7 @@ def viewport_region(
 ) -> tuple[bpy.types.Region | None, bpy.types.RegionView3D | None]:
     """(region, region_3d) of the 3D viewport's WINDOW region, or (None, None).
 
-    context.region / context.region_data can't be trusted inside a modal: when
-    the operator was launched from the N-panel button, the current region is
-    the UI one (and region_data is None), which silently produced an invalid
-    ray -- so nothing was ever hit and clicks appeared to do nothing.
+    Never trust context.region inside a modal: it may be the N-panel's.
     """
     area = context.area
     if area is None or area.type != 'VIEW_3D':
@@ -1074,13 +882,8 @@ def viewport_region(
     return region, rv3d
 
 
-# Events the modal must never swallow when the cursor is outside the 3D view's
-# WINDOW region -- which is *all* of them; the set is here so the rule can be
-# asserted rather than only described. Clicks and scrolls are the obvious ones;
-# mouse moves are the non-obvious part (Blender drives button highlighting from
-# them, so eating MOUSEMOVE over the N-panel leaves the panel unclickable even
-# while the clicks are let through), and the keys matter too, since digits
-# collide with a field being typed into and Enter confirms the wrong thing.
+# Events the modal must never swallow outside the viewport. In fact it passes
+# every event through there; this set lets the tests assert it.
 PANEL_EVENTS = {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'LEFTMOUSE', 'RIGHTMOUSE',
                 'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
                 'RET', 'NUMPAD_ENTER', 'ESC', 'TAB', 'BACK_SPACE',
@@ -1088,12 +891,8 @@ PANEL_EVENTS = {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'LEFTMOUSE', 'RIGHTMOUSE',
                 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE'}
 
 
-# Regions drawn *over* the 3D view's WINDOW region. With Region Overlap on --
-# Blender's default -- the WINDOW region spans the whole area and the N-panel,
-# toolbar and headers float on top of it, so a point under the N-panel is
-# genuinely inside the WINDOW region. Testing that region alone therefore says
-# "over the viewport" while the pointer is over the panel, which is exactly how
-# the modal ended up swallowing the panel's events.
+# Regions drawn over the WINDOW region. With Region Overlap on, a point under
+# the N-panel is also inside WINDOW, so these must be subtracted.
 OVERLAY_REGION_TYPES = {'UI', 'TOOLS', 'TOOL_PROPS', 'HEADER', 'TOOL_HEADER',
                         'NAV_BAR', 'FOOTER', 'ASSET_SHELF', 'ASSET_SHELF_HEADER',
                         'HUD', 'EXECUTE', 'CHANNELS'}
@@ -1102,9 +901,7 @@ OVERLAY_REGION_TYPES = {'UI', 'TOOLS', 'TOOL_PROPS', 'HEADER', 'TOOL_HEADER',
 def point_in_region(region: bpy.types.Region | None, x: float, y: float) -> bool:
     """Whether a window-absolute point is inside `region`.
 
-    Window-absolute because `context.region` is unreliable inside a modal (it
-    can be the N-panel's), so the modal works from window coordinates and the
-    region it resolved itself -- see viewport_region.
+    Window-absolute: `context.region` is unreliable in a modal.
     """
     if region is None:
         return False
@@ -1127,8 +924,7 @@ def point_in_viewport(
     if area is None:
         return True
     for other in area.regions:
-        # A collapsed region still exists, reporting a 1px size; it covers
-        # nothing and must not veto the whole viewport.
+        # A collapsed region reports 1px and covers nothing.
         if (other.type in OVERLAY_REGION_TYPES
                 and other.width > 1 and other.height > 1
                 and point_in_region(other, x, y)):
@@ -1150,11 +946,9 @@ def ray_from_window(
 ) -> tuple[mathutils.Vector | None, mathutils.Vector | None]:
     """The same, from window-absolute coordinates rather than from an event.
 
-    Window-absolute throughout, converted against the WINDOW region itself:
-    `event.mouse_region_*` is relative to whichever region received the event,
-    which may not be the one being cast into. Which is also why an operator the
-    modal dispatches can use this at all -- it reads the pointer the modal left
-    in `overlay.cursor_window` instead of an event it never gets.
+    Window-absolute, converted against the WINDOW region: `event.mouse_region_*`
+    may belong to another region. Operators the modal dispatches pass
+    `overlay.cursor_window`.
     """
     region, rv3d = viewport_region(context)
     if region is None:
@@ -1189,10 +983,7 @@ def nearest_side_to_cursor(
 ) -> int:
     """Flat index of the side nearest the cursor, or -1.
 
-    Screen space, not a raycast: the sides are polylines lying exactly on the
-    surface, so a ray would hit the surface beside them as often as the line
-    itself. Distance to the projected segments is what "pointing at an edge"
-    actually means on screen.
+    In screen space: a raycast would hit the surface beside the line.
     """
     region, rv3d = viewport_region(context)
     if region is None or rv3d is None:
@@ -1228,22 +1019,14 @@ def _distance_to_segment(
     return (point - (start + segment * t)).length
 
 
-# The corner set itself lives in `sidematch`, a leaf: the overlay reads it on
-# every redraw and must never import this module, which imports it back. Only
-# the hit test stays here, because it needs a region and a viewport.
+# The grouping lives in `sidematch`. Only the hit test is here: it needs a
+# region.
 def side_bubble_under_cursor(context: bpy.types.Context, event: bpy.types.Event) -> int:
     """Flat index of the side whose group bubble the cursor is on, or -1.
 
-    The bubbles are screen-space discs, so this is a point-in-disc test rather
-    than a distance to a polyline -- what the user is aiming at is the bubble,
-    not the edge under it. Both the anchor and the radius come from the same
-    places the drawing takes them (`sidematch.side_midpoint`,
-    `overlay.GROUP_BUBBLE_SIZE`): a bubble that is not clickable where it is
-    drawn is worse than no bubble at all.
-
-    Nearest wins when two overlap, which they do on a short side of a dense
-    part -- a click then takes the one whose centre is closer, which is the
-    one the pointer is visibly on.
+    A point-in-disc test, with the same anchor and radius as the drawing
+    (`sidematch.side_midpoint`, `overlay.GROUP_BUBBLE_SIZE`). The nearest wins
+    when two overlap.
     """
     region, rv3d = viewport_region(context)
     if region is None or rv3d is None:
@@ -1271,9 +1054,8 @@ def side_bubble_under_cursor(context: bpy.types.Context, event: bpy.types.Event)
 
 # --- One patch from several surfaces -----------------------------------------
 #
-# The assembly itself lives in `patch_data` (see the section there): these are
-# the session's half of it -- what Shift+click gathers, and the two moments
-# that write a composite to the mesh.
+# The assembly lives in `patch_data`. This is the session's half: what
+# Shift+click gathers, and writing a composite to the mesh.
 
 
 def surface_selection(state: state_mod.RetopPatchState) -> list[int]:
@@ -1307,40 +1089,24 @@ def toggle_patch_surface(
         return True, (f"Dropped surface {face_id} — {len(selection)} selected"
                       if selection else "Surface selection cleared")
 
-    # Already inside a patch somebody else built. Absorbing it would mean
-    # taking that patch apart, which is a decision with a button of its own --
-    # and the alternative, two composites naming one surface, is the overlap
-    # `applicable_composites` throws both of them out for.
+    # Already inside another composite: it must be split first.
     for other, surfaces in patch_data.read_composites(obj.data).items():
         if other != state.pending_composite_id and face_id in surfaces:
             return False, (f"surface {face_id} is already part of another patch — "
                            "split that one apart first")
 
-    # A committed patch's faces carry *its* id, and the composite would carry a
-    # new one: nothing would ever delete them again, so they would sit under
-    # the new grid as a second surface. Refused rather than resolved --
-    # stamping them over is a re-edit, and a re-edit is something you ask for.
+    # Already committed: its faces would never be deleted under the new id.
     if mesh_build.is_patch_committed(obj, face_id):
         return False, (f"surface {face_id} is already retopologized — delete its "
                        "patch first (X while re-editing it)")
 
-    # The mesh's own surfaces, not the patches over them: the selection is kept
-    # in surface ids, and from the second pick on the ones already in it have
-    # been folded into the pending composite -- so a merged analysis would
-    # report the *patch* as the candidate's neighbour and the contiguity test
-    # below would never match anything again.
+    # The raw surfaces: the selection is kept in surface ids.
     analysis = patch_data.analyse_surfaces(obj.data)
     patch = analysis.patches.get(face_id)
     if patch is None or not patch.boundary_loops:
         return False, f"surface {face_id} has no usable boundary"
 
-    # Contiguity, checked as the selection is built rather than when the patch
-    # is opened. Two reasons it is the right moment: the answer is cheap here
-    # (the analysis is already in hand and the neighbours are one attribute
-    # away), and a refusal at the click points at the surface that caused it,
-    # while one at the end can only say the set is wrong. What it prevents is a
-    # patch whose surfaces meet at a point -- a pinched boundary -- or not at
-    # all, which comes back with two outer loops and is read as a band.
+    # Contiguity is checked at each click, so the refusal names the surface.
     if selection and not patch_data.patch_neighbour_ids(patch).intersection(selection):
         return False, ("that surface does not touch the selection — one patch has to "
                        "be one connected area")
@@ -1358,21 +1124,11 @@ def refresh_pending_composite(
     """Rebuild the patch the picked surfaces make, and preview it. Returns its
     id, or -1 when fewer than two are picked.
 
-    The selection is not a list of surfaces waiting to become a patch -- it
-    *is* a patch, from the second Shift+click on, and this is what makes the
-    preview say so. Without it the viewport showed whichever single surface the
-    cursor had last passed over, which is the one thing the gesture is not
-    about: the whole question being answered is what the surfaces make
-    *together*, and a grid over one of them answers it wrongly rather than not
-    at all.
-    The composite really is written to the mesh, because that is the only thing
-    `analyse` reads -- so every way out of the pick has to take it back apart,
-    which is `discard_pending_composite`.
+    From the second pick on, the selection is a composite written to the mesh.
+    Every way out of the pick must call `discard_pending_composite`.
     """
     state = context.scene.plasticity_retop
-    # Taken apart first, every time: the selection is kept in the mesh's own
-    # surface ids, so the ones from the click before have to be surfaces again
-    # before they can be gathered with the new one.
+    # Always taken apart first, then rebuilt from the surface ids.
     _drop_pending_composite(context, obj)
 
     selection = surface_selection(state)
@@ -1386,9 +1142,7 @@ def refresh_pending_composite(
 
     state.pending_composite_id = composite_id
     if _generate_for_face(context, obj, composite_id) is None:
-        # Nothing can be built over them -- a closed shell with no boundary
-        # left, or surfaces that only meet at a point. The selection stays, so
-        # it can be adjusted; the preview says so by being empty.
+        # Nothing can be built over them. The selection stays.
         mesh_build.clear_preview_object()
     return composite_id
 
@@ -1410,10 +1164,8 @@ def _drop_pending_composite(
 def discard_pending_composite(context: bpy.types.Context) -> None:
     """Drop the picked surfaces and everything built from them.
 
-    Called by every exit that is not "open it": Esc, clicking another surface,
-    leaving the object, ending the session. Nothing was committed and no ID was
-    created, so there is no undo step to push -- only a mesh property to put
-    back the way it was.
+    Called by every exit that does not open the patch. No undo step: only a
+    mesh property changes.
     """
     state = context.scene.plasticity_retop
     obj = bpy.data.objects.get(state.session_object_name)
@@ -1427,10 +1179,8 @@ def build_composite(
 ) -> tuple[int | None, str]:
     """Write `face_ids` to the mesh as one composite patch and return its id.
 
-    Adding a surface to a patch that is *already* a composite rebuilds it
-    **flat**: the composites the selection was standing on are replaced by the
-    one that now owns their surfaces, so a surface list is always raw
-    Plasticity face ids and nothing has to follow a chain.
+    Always flat: an existing composite in the selection is replaced by the new
+    one.
     """
     mesh = obj.data
     analysis = patch_data.analyse(mesh)
@@ -1443,8 +1193,7 @@ def build_composite(
         return None, "a patch needs at least two surfaces to be built from several"
 
     composites = patch_data.read_composites(mesh)
-    # Allocated *before* the old composites are dropped, so an id that a result
-    # mesh may still have faces stamped with is never handed out twice.
+    # Allocated before the old ones are dropped: never reissue an id.
     composite_id = patch_data.next_composite_id(composites)
     for face_id in face_ids:
         composites.pop(face_id, None)
@@ -1463,12 +1212,8 @@ def split_composite(
     if not surfaces:
         return False, "that patch is a single surface already"
 
-    # Committed, *or* open in a re-edit -- which is the same thing seen halfway
-    # through: picking a committed patch takes its faces out of the result mesh
-    # before anything else runs, so `is_patch_committed` says no exactly when
-    # the button offering this is on screen. Either way those faces would be
-    # left naming a patch that no longer exists, and nothing would ever delete
-    # them again.
+    # Refused while committed or open in a re-edit: its faces would name a
+    # patch that no longer exists.
     state = context.scene.plasticity_retop
     reediting = (state.editing_committed and state.active_face_id == composite_id)
     if reediting or mesh_build.is_patch_committed(obj, composite_id):
@@ -1485,10 +1230,8 @@ def dissolve_composite(obj: bpy.types.Object, composite_id: int) -> int:
     """Take a composite off the mesh unconditionally. Returns how many surfaces
     it covered, or 0 if it was not one.
 
-    `split_composite` is the version with the rules on it -- it refuses while
-    the patch is committed or open in a re-edit, because its faces would be
-    left naming a patch that no longer exists. This is for the one caller that
-    has just made sure there are no such faces.
+    `split_composite` without the rules, for a caller that has just deleted
+    the patch's faces.
     """
     composites = patch_data.read_composites(obj.data)
     surfaces = composites.pop(composite_id, None)
@@ -1506,10 +1249,8 @@ def surface_under_cursor(
 ) -> int:
     """The mesh's own surface under the cursor, or -1.
 
-    `obj`/`face_id` are what the hover already found, which is a *patch*. With
-    no composite on the mesh the two are the same thing, and the answer is free;
-    only once one exists does this cost a second cast, and only while Shift is
-    held. That matters because it runs on every mouse move.
+    `obj`/`face_id` are the hovered patch. A second raycast only when the mesh
+    has a composite.
     """
     if obj is None or face_id is None:
         return -1
@@ -1525,8 +1266,7 @@ def surface_under_cursor(
 
 
 def composite_surfaces(obj: bpy.types.Object | None, face_id: int) -> list[int]:
-    """The Plasticity surfaces `face_id` is built from, or [] when it is a
-    single one. What the panel reads to say how many a patch covers."""
+    """The Plasticity surfaces `face_id` is built from, or [] for a single one."""
     if obj is None or obj.type != 'MESH' or face_id >= 0:
         return []
     return list(patch_data.analyse(obj.data).composites.get(face_id, []))
@@ -1538,10 +1278,8 @@ def load_patch_choices(
     """Put back the per-patch choices `face_id` was committed with, or clear
     them: the side grouping and the n-gon side counts.
 
-    Both name sides by index, so carried over from the last patch they would
-    reshape whichever sides of this one happen to share those numbers. Called
-    when a patch is opened, and by the hover before it previews one, so the
-    preview and the click agree.
+    Both name sides by index, so they are per patch. Called when a patch is
+    opened and by the hover.
     """
     stored_settings = mesh_build.lookup_patch_settings(obj, face_id) or {}
     state.side_groups = str(stored_settings.get("side_groups", "") or "")
@@ -1556,42 +1294,25 @@ def set_active_patch(
     context: bpy.types.Context, obj: bpy.types.Object, face_id: int
 ) -> tuple[str | None, int | None, list[str] | None]:
     """Generate a preview for `face_id` on `obj` and lock it in as the active
-    patch (the state the N-panel's span controls act on). Returns
-    (generator_name, num_sides, propagated_keys), or (None, None, None) if the
-    patch can't be generated. Shared by the viewport picker and by tests, so
-    both go through exactly one code path.
+    patch. Returns (generator_name, num_sides, propagated_keys), or
+    (None, None, None). The one code path for the picker and the tests.
     """
-    # A pin names a side *of the patch it was picked on*, by index. Carrying it
-    # into the next patch would silently pin whichever side happened to land on
-    # that index. Cleared here rather than in the modal so every caller --
-    # viewport, panel, tests -- gets the same guarantee.
+    # Pins name sides by index: per patch, cleared here for every caller.
     state = context.scene.plasticity_retop
     state.side_overrides = ""
     state.hovered_side = -1
-    # The corner set names sides by index too, so it is per patch for exactly
-    # the same reason -- and the editor is closed rather than carried over: it
-    # is a gesture on one patch, not a mode the session sits in.
-    # Cleared, then put back from the record if this patch has one: a patch
-    # committed as a Quad because two of its five sides were merged has to
-    # reopen as that Quad, the same rule its spans and its n-gon mode follow.
-    # Here rather than inside `_generate_for_face`, because the restore is
-    # about *opening* a patch -- doing it on every regeneration would undo the
-    # user's next change to the grouping.
+    # The grouping too, restored from the patch's record if it has one. Here,
+    # never in `_generate_for_face`, or each regeneration would undo edits.
     load_patch_choices(state, obj, face_id)
-    # Which patch this one copied from, and which way round. Per patch, for the
-    # same reason a pin is: carried over, the first click on the *next* patch
-    # would come back swapped.
+    # The copy source is per patch too.
     state.copy_source_face_id = -1
     state.copy_source_swapped = False
 
-    # Same reason as in enter_session_object: put the tracking right before
-    # deciding whether this patch is a re-edit. Here too, and not only on entry,
-    # because the bridge can re-send the part mid-session (Refresh, Live Link)
-    # and rename its faces under us. A signature compare when nothing changed.
+    # Correct the tracking before deciding whether this patch is a re-edit.
+    # Also here, since the bridge can re-send the part mid-session.
     mesh_build.reconcile_patch_tracking(context, obj)
 
-    # Generate first, remove second: _generate_for_face reads the result mesh to
-    # decide this is a re-edit and to recover the spans it was committed with.
+    # Generate first, remove second: generation reads the committed faces.
     preview = _generate_for_face(context, obj, face_id)
     if preview is None:
         return None, None, None
@@ -1612,9 +1333,7 @@ def session_is_running() -> bool:
     return _SESSION_RUNNING
 
 
-# Re-exported so `operators.TWO_SPAN_GENERATORS` keeps working for the panel
-# and the tests; the definition lives in `constants`, which the overlay can
-# also reach without importing this module back.
+# Re-exported for the panel and the tests. Defined in `constants`.
 TWO_SPAN_GENERATORS = constants.TWO_SPAN_GENERATORS
 
 # Number-row and numpad digits, for typing a span directly.
@@ -1626,9 +1345,7 @@ for _d in range(10):
 
 
 def active_span_prop(state: state_mod.RetopPatchState) -> str:
-    """Name of the span property the wheel/keyboard adjusts for the current
-    patch: quads and wedges have two spans (Tab switches between them),
-    everything else has a single one shared by all sides.
+    """The span property the wheel and the digits adjust on the active patch.
     """
     if state.generator_name in TWO_SPAN_GENERATORS:
         return "span_u" if state.span_axis == 'U' else "span_v"
@@ -1636,9 +1353,8 @@ def active_span_prop(state: state_mod.RetopPatchState) -> str:
 
 
 def _clear_match_state(state: state_mod.RetopPatchState) -> None:
-    """The side picker is per patch: its cache holds Vectors describing a
-    preview, and its pins describe sides that patch had. `match_mode` is a
-    preference, not patch state, so it survives."""
+    """Clear the per-patch side picker state. `match_mode` is a preference and
+    survives."""
     sidematch.clear_side_references()
     state.hovered_side = -1
     state.side_overrides = ""
@@ -1647,40 +1363,28 @@ def _clear_match_state(state: state_mod.RetopPatchState) -> None:
 
 
 def end_session(context: bpy.types.Context, push: bool = True) -> None:
-    """Leave the current retop session entirely: drop any preview, stop
-    highlighting the result mesh, and clear session/patch state. Safe to call
-    when no modal is running (used to reset stale session state).
+    """End the session: drop the preview, the highlight and all session state.
+    Safe with no modal running.
 
-    `push=False` is for the one caller that is *itself* reacting to an undo:
-    pushing a step straight after Ctrl+Z would truncate the redo branch the
-    user just created, i.e. take away the Ctrl+Shift+Z that puts it back.
+    `push=False` when reacting to an undo: a push would discard the redo.
     """
     global _SESSION_RUNNING
     _SESSION_RUNNING = False
 
     state = context.scene.plasticity_retop
-    # A hand-edit round trip that never got its Tab back: the snapping and
-    # auto-merge settings it overwrote are the user's, not ours, and leaving
-    # them rewritten by a mode that is no longer open is the rudest failure
-    # available. Cheap and idempotent -- it is a no-op with no snapshot saved.
+    # Restore the tool settings of an unfinished hand-edit. Idempotent.
     tweak.restore_tool_settings(context)
-    # The one place the preview object is actually freed: ending the session is
-    # a deliberate moment, unlike a hover.
+    # The only place the preview object is freed.
     mesh_build.remove_preview_object()
     overlay.hover_committed = False
     overlay.cursor_window = None
-    # An in-flight re-edit is rolled back, never silently dropped: its patch was
-    # removed from the result mesh on pick and was never re-committed.
+    # Roll back an unfinished re-edit.
     restore_reedit_removal(context)
-    # And so is a pick that never happened. It *did* write a composite to the
-    # mesh, so this is not only state to drop -- one left behind comes back as
-    # a patch nobody built the next time the object is entered. Before the
-    # state is cleared, since that is what still names the object.
+    # And a pending composite, before the state that names the object is
+    # cleared.
     discard_pending_composite(context)
 
-    # Clear the state *before* refreshing: the look of every result mesh is
-    # derived from session state, so refreshing first would just re-apply the
-    # highlight we're trying to drop.
+    # Clear the state before refreshing: the look derives from it.
     state.session_active = False
     state.session_object_name = ""
     state.session_phase = 'OBJECT'
@@ -1699,12 +1403,11 @@ def end_session(context: bpy.types.Context, push: bool = True) -> None:
 def push_undo(message: str) -> None:
     """Give the objects a session just created their own undo step.
 
-    Datablocks created between two undo steps are invisible to the one Ctrl+Z
-    rolls back to, which is how the depsgraph ends up walking freed data. All
-    of the session's ID creation happens at the two moments that call this.
+    Every moment that creates or frees an ID, or writes the result mesh, must
+    call this.
     """
     if bpy.app.background:
-        return  # no undo stack in --background, and the tests don't need one
+        return  # no undo stack in --background
     try:
         bpy.ops.ed.undo_push(message=message)
     except Exception:
@@ -1714,12 +1417,8 @@ def push_undo(message: str) -> None:
 def select_only(context: bpy.types.Context, obj: bpy.types.Object) -> None:
     """Make `obj` the selection and the active object.
 
-    Everything Blender does "to the object" -- isolate, frame, the header, the
-    properties editor -- reads the selection rather than anything this addon
-    knows, so entering an object has to say so in the one language those
-    commands speak. Failures are ignored on purpose: an object outside the
-    current view layer cannot be selected, and that is not a reason to refuse
-    the session.
+    Blender's own object commands (isolate, frame) read the selection.
+    Failures are ignored: an object outside the view layer cannot be selected.
     """
     try:
         for other in list(context.selected_objects):
@@ -1737,9 +1436,7 @@ def enter_session_object(
     """Enter `obj` for retopology: make sure its result mesh exists, highlight
     it, and move to the patch-picking phase.
 
-    A result mesh resolves to its source first, so entering by way of the
-    retopology -- selecting it in the outliner, say -- carries on where it left
-    off instead of starting a session on a mesh with no patch data.
+    A result mesh resolves to its source first.
     """
     obj = resolve_session_object(obj)
     state = context.scene.plasticity_retop
@@ -1748,51 +1445,33 @@ def enter_session_object(
         mesh_build.set_result_highlight(context, previous, False)
 
     mesh_build.ensure_result_object(context, obj)
-    # Create the preview here too, rather than on the first hover: that keeps
-    # every datablock this session needs inside the single undo step below.
+    # Create the preview here, never on hover: inside the undo step below.
     mesh_build.ensure_preview_object(context)
-    # Faces whose patch id is missing -- committed before tracking existed, made
-    # by hand -- or no longer names anything, because Plasticity renamed the
-    # face since: either way the patch reads as "never retopped", and picking
-    # it would quietly build a second grid on top of the first instead of
-    # re-editing it. The geometry says which patch each one sits on.
+    # Give every result face the patch id of the surface it sits on.
+    # A missing or stale id makes a committed patch read as never retopped.
     mesh_build.reconcile_patch_tracking(context, obj)
-    # Snapshots left by a re-edit that was undone, crashed or reloaded out from
-    # under us: they carry a fake user, so nothing else would ever collect them.
+    # Collect snapshots left by an interrupted re-edit.
     mesh_build.purge_stale_snapshots(keep_name=state.reedit_backup_mesh)
     update_committed_count(context, obj)
-    # Entering an object *is* being in a session: don't rely on the caller
-    # having set this first, or the highlight below resolves against stale
-    # state and the result mesh silently stays un-highlighted.
+    # Set here, never rely on the caller: the highlight reads it.
     state.session_active = True
     state.session_object_name = obj.name
     state.session_phase = 'PATCH'
     mesh_build.set_result_highlight(context, obj, True)
-    # Picking with the eyedropper also *selects* what was picked. Blender's own
-    # object-scoped commands read the selection, not this addon's state, so
-    # without it '/' isolates whatever happened to be selected before the
-    # session started -- or nothing at all. Isolate is the one that matters
-    # here (`sync_local_view` then pulls the retopology and the preview in with
-    # it), but the same is true of every other thing Blender does to "the
-    # object". Selection is not an ID, so this is safe outside an undo step;
-    # it is inside the one below anyway.
+    # Select what was picked, so Blender's own object commands apply to it.
     select_only(context, obj)
-    # Starting a session while already isolated ('/') would otherwise create
-    # the preview and result meshes outside the local view, i.e. invisible.
+    # Pull the new meshes into an active Local View.
     mesh_build.sync_local_view(context)
     push_undo(f"Retop: enter {obj.name}")
 
 
 def exit_session_object(context: bpy.types.Context) -> None:
-    """Leave the current object but keep the session running, so the next
-    click picks another Plasticity object (workflow step 4 -> 5).
+    """Leave the current object but keep the session running.
     """
     state = context.scene.plasticity_retop
     mesh_build.clear_preview_object()
     restore_reedit_removal(context)  # same rule as end_session
-    # Same rule again, and for the same reason it comes first: the surfaces
-    # picked on this object mean nothing on the next one, and the composite
-    # they built has to come off the mesh with them.
+    # And the pending composite.
     discard_pending_composite(context)
 
     # Same ordering rule as end_session: state first, then refresh.
@@ -1836,15 +1515,7 @@ class RETOP_OT_session(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        """Object Mode only.
-
-        Started from Edit Mode the session used to run its whole entry path --
-        create the result mesh, create the preview object, push an undo step --
-        and *then* have the modal hand the viewport straight back, because it
-        does nothing outside Object Mode. Two datablocks created from inside an
-        edit session, for a session that never opened: that is the shape of the
-        Ctrl+Z crash the undo invariant exists to prevent.
-        """
+        """Object Mode only: the entry path creates datablocks."""
         return context.mode == 'OBJECT'
 
     _hover_obj = None
@@ -1857,8 +1528,7 @@ class RETOP_OT_session(bpy.types.Operator):
     _hover_ngon = False
     _timer = None
     _last_phase = ""  # what the modal last set its cursor and status for
-    # None until the first mouse move tells us which side of the region the
-    # pointer is on; see _update_cursor.
+    # None until the first mouse move (see _update_cursor).
     _cursor_in_viewport = None
 
     # phase -> (cursor, status line)
@@ -1870,39 +1540,24 @@ class RETOP_OT_session(bpy.types.Operator):
                   "re-edit it)   |   Esc: leave this object"),
         'ADJUST': ('DEFAULT',
                    "Adjust spans in the Retop panel   |   Enter: commit   |   Esc: discard"),
-        # Blender owns the viewport here, so the cursor is *restored* rather
-        # than set (see _apply_phase_ui): the knife has its own, and a modal
-        # cursor pinned on the window would sit on top of it.
+        # The cursor is restored, never set, here (see _apply_phase_ui).
         'TWEAK': ('DEFAULT',
                   "Hand-editing the retopology   |   K: knife   |   Ctrl+R: loop cut   |   "
                   "J: connect verts   |   G: move (snapped, auto-merge)   |   Tab: back to Retop"),
     }
 
     def _leave_for_other_mode(self, context: bpy.types.Context) -> None:
-        """Drop back to picking an object because Blender left Object mode.
-
-        Entering Edit Mode on the retopology is the normal way to hand-tweak
-        it, and coming back to a session still claiming to be inside an object
-        -- with a stale preview and a cursor to match -- is worse than starting
-        the pick again.
-        """
+        """Drop back to picking an object because Blender left Object mode."""
         state = context.scene.plasticity_retop
         if state.session_phase == 'OBJECT':
             return
 
-        # The session put Blender in Edit Mode itself: that is the hand-edit
-        # round trip, not somebody wandering off, and _modal_tweak owns both
-        # ends of it. (_modal returns before reaching here in that phase; the
-        # check is repeated because this reads as a mode-change policy and the
-        # policy has an exception.)
+        # The hand-edit round trip: _modal_tweak owns it.
         if state.session_phase == 'TWEAK':
             return
 
-        # One exception, and it is not optional: a re-edit has that patch's
-        # faces out of the result mesh and only a snapshot to put them back
-        # with. If the mesh being edited *is* that result mesh, writing to it
-        # from here is discarded the moment edit mode exits -- the patch would
-        # be gone for good. Stay put; the panel says the session is paused.
+        # Stay put when the mesh in Edit Mode is the one a re-edit took faces
+        # out of: restoring them now would be lost when Edit Mode exits.
         editing = getattr(context, "edit_object", None)
         if (state.editing_committed and state.reedit_result_object
                 and editing is not None
@@ -1917,13 +1572,10 @@ class RETOP_OT_session(bpy.types.Operator):
     def _apply_phase_ui(self, context: bpy.types.Context) -> None:
         state = context.scene.plasticity_retop
         cursor, status = self._PHASE_UI.get(state.session_phase, ('DEFAULT', ""))
-        # Only while the pointer is actually over the 3D view: a modal cursor is
-        # set on the whole window, so setting it here unconditionally would put
-        # the eyedropper over the panel's own buttons.
+        # Only over the 3D view: a modal cursor applies to the whole window.
         if context.window and self._cursor_in_viewport is not False:
             if state.session_phase == 'TWEAK':
-                # Blender's own tools draw the cursor while they have the
-                # viewport; a modal cursor set on the window overrides theirs.
+                # Blender's tools draw their own cursor here.
                 context.window.cursor_modal_restore()
                 self._cursor_in_viewport = None
             else:
@@ -1936,9 +1588,7 @@ class RETOP_OT_session(bpy.types.Operator):
     ) -> None:
         """Session cursor over the 3D view, the normal one everywhere else.
 
-        `cursor_modal_set` applies to the entire window, so without this the
-        retop cursor sits over the N-panel and every other editor for as long
-        as the session runs -- which reads as "the UI is not for you".
+        `cursor_modal_set` applies to the whole window.
         """
         if over_viewport == self._cursor_in_viewport or context.window is None:
             return
@@ -1953,10 +1603,8 @@ class RETOP_OT_session(bpy.types.Operator):
     def _set_hover(
         self, context: bpy.types.Context, obj: bpy.types.Object, face_id: int
     ) -> bool:
-        # While surfaces are being picked the preview belongs to the patch they
-        # make, and a hover must not overwrite it with a grid over whichever
-        # one the cursor is crossing. The hovered id is still recorded, because
-        # the click reads it -- only the geometry is left alone.
+        # While surfaces are being picked, record the hover but never touch the
+        # preview: it shows the patch they make.
         state = context.scene.plasticity_retop
         if state.pending_composite_id != -1 or surface_selection(state):
             self._hover_obj = obj
@@ -1974,21 +1622,14 @@ class RETOP_OT_session(bpy.types.Operator):
         self._hover_spans = preview.spans
         self._hover_committed = preview.committed
         self._hover_ngon = preview.ngon
-        # so the overlay can advertise "Re-edit patch" instead of "Pick surface"
+        # For the overlay's "Re-edit patch" hint.
         overlay.hover_committed = preview.committed
         return True
 
     def _open_composite(self, context: bpy.types.Context, composite_id: int) -> bool:
         """Lock in the patch the picked surfaces already make.
 
-        It is on the mesh and on screen before this runs -- `set_active_patch`
-        is what turns a preview into the patch the session is adjusting, and
-        nothing is written that was not written already.
-
-        A patch that cannot be generated is **taken back apart**: one nothing
-        can open is worse than a refusal, and the mesh would be left carrying a
-        composite with no way to reach it. That path is reachable because the
-        preview is allowed to stay empty while surfaces are still being picked.
+        A composite that cannot be generated is taken back apart.
         """
         state = context.scene.plasticity_retop
         obj = bpy.data.objects.get(state.session_object_name)
@@ -2004,16 +1645,14 @@ class RETOP_OT_session(bpy.types.Operator):
                         "Those surfaces have no usable boundary together — undone")
             return False
 
-        # Kept, not dropped: the composite is the patch now. Only the record of
-        # it being *pending* goes, so no exit takes it apart any more.
+        # The composite is the patch now: it is no longer pending.
         state.pending_composite_id = -1
         set_surface_selection(state, [])
         state.session_phase = 'ADJUST'
         mesh_build.refresh_preview_appearance(context)
         self._set_typed("")
         self._apply_phase_ui(context)
-        # A datablock changed, so it gets its own step: Ctrl+Z takes the patch
-        # back apart rather than rolling the session up to the one before.
+        # Its own undo step.
         push_undo("Retop: one patch from several surfaces")
         self.report({'INFO'}, f"One patch over {surfaces} surfaces — {generator}")
         return True
@@ -2035,13 +1674,8 @@ class RETOP_OT_session(bpy.types.Operator):
         """True when the currently-hovered patch is still under the cursor at
         essentially the same depth as the newly-reported hit.
 
-        Overlapping/coincident Plasticity surfaces make scene.ray_cast report
-        whichever of them wins by a sub-epsilon margin, which alternates as
-        the mouse moves and made the hover flip-flop between two patches
-        (rebuilding the preview each frame = flicker). Sticking to the
-        current patch unless the new one is *clearly* in front keeps the
-        pick stable; the user can still reach the other surface by moving off
-        the patch and back, or by hiding/isolating the one in the way.
+        Hysteresis: coincident surfaces would otherwise flip the hover on every
+        mouse move.
         """
         if self._hover_obj is None or new_distance is None:
             return False
@@ -2052,15 +1686,13 @@ class RETOP_OT_session(bpy.types.Operator):
 
         current_distance = patch_hit_distance(ray_origin, ray_direction, self._hover_obj, self._hover_face_id)
         if current_distance is None:
-            return False  # cursor genuinely left the current patch
+            return False  # the cursor left the current patch
 
         state = context.scene.plasticity_retop
         if state.pick_depth_tolerance > 0.0:
             tolerance = state_mod.to_blender_units(state, state.pick_depth_tolerance)
         else:
-            # Automatic: proportional to view distance, which is already
-            # scale-independent (a 1mm fillet is viewed from proportionally
-            # closer than a 10m part), so no unit conversion applies.
+            # Automatic: proportional to view distance.
             tolerance = max(1e-6, new_distance * 2e-3)
         return current_distance <= new_distance + tolerance
 
@@ -2069,34 +1701,22 @@ class RETOP_OT_session(bpy.types.Operator):
     ) -> set[str] | None:
         """Mouse handling while the corner editor is open.
 
-        Ahead of the side picker and independent of it: the editor is reached
-        by pointing at a side, but it is not part of matching and must work
-        with the side highlight turned off. It also takes the *plain* click,
-        which is why `corner_toggle` is declared before `pin_neighbour` and
-        `pin_neighbour` polls on the editor being closed -- both halves, so
-        neither is load-bearing on its own.
+        Ahead of the side picker, and independent of the side highlight.
         """
         state = context.scene.plasticity_retop
 
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
             state.hovered_bubble = side_bubble_under_cursor(context, event)
-            # Neither of these means anything while corners are being chosen,
-            # and leaving them set would paint a side green and outline a
-            # patch in amber for gestures the editor has taken over.
+            # The side and copy hovers mean nothing here.
             state.hovered_side = -1
             state.copy_hover_face_id = -1
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            # Dispatched rather than called, so the click stays a real binding
-            # -- and through `_dispatch_bound`, which walks every action on the
-            # event and runs the first whose poll passes. Taking the first
-            # *match* would resolve every left click to `corner_toggle`.
+            # Through `_dispatch_bound`: the first action whose poll passes.
             if self._dispatch_bound(context, event):
                 return {'RUNNING_MODAL'}
-            # Pointing at no corner: nothing to toggle, and emphatically not
-            # the commit fallback -- committing from inside the editor would
-            # bake a corner set the user was still choosing.
+            # On nothing: never fall back to commit from inside the editor.
             return {'RUNNING_MODAL'}
 
         return None
@@ -2105,37 +1725,22 @@ class RETOP_OT_session(bpy.types.Operator):
         self, context: bpy.types.Context, event: bpy.types.Event
     ) -> set[str] | None:
         """Mouse handling for the side highlight, while it is on. Returns a
-        modal result to stop on, or None to let normal ADJUST handling have the
-        event.
-
-        Deliberately does *not* take Esc or the commit keys: the highlight is
-        on by default, so swallowing Esc would mean the patch could no longer
-        be discarded, and that trade is not worth one keystroke.
+        modal result, or None to let normal ADJUST handling have the event.
+        Never takes Esc or the commit keys.
         """
         state = context.scene.plasticity_retop
 
         if event.type == 'MOUSEMOVE':
             state.hovered_side = nearest_side_to_cursor(context, event)
-            # Ctrl+click is split by what is under the cursor -- a side opens
-            # the corner editor, anything else copies a density -- so the
-            # hover has to say which of the two it would be. An amber outline
-            # over a hovered side would promise the copy and give the editor.
+            # No copy outline over a side: Ctrl+click there opens the editor.
             state.copy_hover_face_id = (
                 -1 if state.hovered_side != -1
                 else _copy_source_under_cursor(context, event))
             return {'RUNNING_MODAL'}
 
         if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-            # A left click has only two jobs while adjusting: take the side
-            # under the cursor, or -- pointing at nothing -- commit. So a
-            # missed aim commits rather than doing nothing, same as right-click
-            # and Enter.
-            #
-            # Only the *fallback* is hover-dependent, and only it stays here.
-            # Taking the side is `retop.pin_side`, a normal binding resolved
-            # like every other -- which is what makes the click remappable. It
-            # was fixed only because it had been lumped in with a fallback it
-            # never shared.
+            # On a side: the `pin_neighbour` binding. On nothing: fall through
+            # to the commit fallback.
             if state.hovered_side == -1:
                 return None
             bound = keymap.session_action_for(event)
@@ -2147,18 +1752,14 @@ class RETOP_OT_session(bpy.types.Operator):
         return None
 
     def _commit(self, context: bpy.types.Context) -> None:
-        # commit_patch applies a half-typed span itself, so this is just the
-        # guard: a click that lands on nothing must not raise on the poll.
+        # Guard: the operator's poll would raise with no preview.
         if mesh_build.has_preview():
             bpy.ops.retop.commit_patch()
         self._set_typed("")
 
-    # Actions whose key must never reach Blender, even when they refuse. `X`
-    # falling through during a session is `object.delete` -- it takes the CAD
-    # object with it -- and `Tab` is `object.editmode_toggle`, which drops the
-    # session out of the object it is in. Everything else is better off falling
-    # through: `N` outside ADJUST should open the sidebar, and a right click
-    # with nothing to commit should open the context menu.
+    # Actions whose key must never reach Blender, even when refused: `X` would
+    # be `object.delete`, `Tab` `object.editmode_toggle`. Every other refused
+    # key falls through.
     _MUST_CONSUME = ("delete_patch", "hand_edit")
 
     def _refusal(self, context: bpy.types.Context, action_id: str) -> str:
@@ -2173,10 +1774,7 @@ class RETOP_OT_session(bpy.types.Operator):
     ) -> bool:
         """Run a session action's operator. Returns whether to consume the event.
 
-        The modal dispatches these rather than letting them fall through to the
-        keymap: an item in the 3D View keymap does not reliably beat a *mode*
-        keymap, and the session's keys collide with those constantly. See
-        keymap.py.
+        See keymap.py for why the modal dispatches these.
         """
         idname = keymap.operator_of(action_id)
         operator = getattr(bpy.ops.retop, idname.split(".", 1)[1], None)
@@ -2200,17 +1798,9 @@ class RETOP_OT_session(bpy.types.Operator):
         """Run whichever action this key means right now. Returns whether the
         event was consumed.
 
-        Several actions can share a key -- three share `TAB` -- so this walks
-        them in declaration order and runs the first whose poll passes, which
-        is what Blender itself does with keymap items. Taking the first *match*
-        instead resolved every Tab to U/V, whose poll fails outside ADJUST, and
-        the key then fell through to the keymap to be answered by whichever
-        item happened to be registered first: it worked, but by an ordering
-        nothing states, and in the OBJECT phase it reached Blender's own
-        `object.editmode_toggle` -- Edit Mode on the CAD object, mid-session.
-
-        When none of them polls, a key Blender claims is still consumed and the
-        refusal reported (see `_MUST_CONSUME`).
+        Runs the first action on the key whose poll passes, never merely the
+        first match. When none polls, a `_MUST_CONSUME` key is still consumed
+        and the refusal reported.
         """
         candidates = keymap.session_actions_for(event)
         for action_id in candidates:
@@ -2222,10 +1812,7 @@ class RETOP_OT_session(bpy.types.Operator):
         return False
 
     def _set_typed(self, value: str) -> None:
-        # Scene state, not an attribute on this instance: the keys that clear
-        # it -- U/V, N-gon mode, the span wheel -- are real operators now, and
-        # an operator has no way to reach the running modal. The overlay reads
-        # the same property.
+        # Scene state: the operators that clear it cannot reach the modal.
         bpy.context.scene.plasticity_retop.typed_span = value
 
     def _flush_typed_span(self, context: bpy.types.Context) -> None:
@@ -2240,15 +1827,13 @@ class RETOP_OT_session(bpy.types.Operator):
     def _handle_typed_digit(
         self, context: bpy.types.Context, event: bpy.types.Event
     ) -> bool:
-        """Digits type a span directly (a faster path than scrolling for big
-        jumps); Backspace edits, Esc clears the entry. Returns True when the
-        event was a numeric-entry key and has been consumed.
+        """Digits type a span directly; Backspace edits. Returns True when the
+        event was consumed.
         """
         state = context.scene.plasticity_retop
         digit = DIGIT_KEYS.get(event.type)
         if digit is not None:
-            # Cap the buffer so a stray keyboard repeat can't build an absurd
-            # span and lock Blender up regenerating it.
+            # Capped, so a key repeat cannot build an absurd span.
             if len(state.typed_span) < 3:
                 self._set_typed(state.typed_span + digit)
                 self._flush_typed_span(context)
@@ -2287,25 +1872,17 @@ class RETOP_OT_session(bpy.types.Operator):
     def _reconcile_after_undo(self, context: bpy.types.Context) -> set[str] | None:
         """Catch up with what Ctrl+Z (or Ctrl+Shift+Z) just restored.
 
-        The undo handler can only write scene properties -- it runs while
-        Blender is still putting the file state back, so it must not touch a
-        datablock. Everything else the step invalidated is dealt with here, on
-        the first event after it: the preview mesh still holds the patch that
-        was open, the hover still names a face on a mesh that may have changed
-        under it, and a half-typed span belongs to a patch that is gone.
+        The undo handler may only write scene properties; the preview, the
+        hover and a typed span are dealt with here.
 
-        Returns a modal return value when the session itself did not survive
-        the step, else None.
+        Returns a modal return value when the session did not survive the step,
+        else None.
         """
         state = context.scene.plasticity_retop
 
-        # Undoing past "Retop: enter <object>" restores a file state from
-        # before the session: no result mesh, no preview object, session_active
-        # off. Carrying on there would leave a modal swallowing viewport events
-        # for a session the panel no longer shows.
+        # Undone past the session's start: end the modal.
         if not state.session_active:
-            # push_undo_step=False: pushing a step right after an undo throws
-            # away the redo the user just made available.
+            # Never push a step right after an undo: it discards the redo.
             return self._finish(context, "Retop session ended by undo",
                                 push_undo_step=False)
 
@@ -2320,16 +1897,9 @@ class RETOP_OT_session(bpy.types.Operator):
     ) -> set[str]:
         """Blender owns the viewport while the retopology is hand-edited.
 
-        Everything passes through -- knife, loop cut, transform, the tool
-        header, undo -- except the key that ends the round trip, which is
-        dispatched here for the same reason every other session key is: its
-        default is `Tab`, and `Tab` in Edit Mode belongs to
-        `object.editmode_toggle` in a keymap ours would not reliably beat.
-        Leaving that to chance means leaving Edit Mode *without* the repair.
-
-        Blender leaving Edit Mode by some other route -- the mode dropdown, a
-        script, an undo -- fires no event of its own, so the timer is what
-        notices, and the repair happens once per trip whichever way it ended.
+        Everything passes through except the key that ends the round trip.
+        Leaving Edit Mode another way fires no event: the timer notices, and the
+        repair still runs once.
         """
         if context.mode == 'OBJECT':
             bpy.ops.retop.end_tweak()
@@ -2356,9 +1926,7 @@ class RETOP_OT_session(bpy.types.Operator):
         try:
             return self._modal(context, event)
         except Exception as exc:
-            # Never die silently: an unhandled error used to leave the scene's
-            # session_* state saying "in session" while no modal was listening,
-            # so Esc and clicks did nothing at all.
+            # Never die silently: end the session cleanly and report.
             import traceback
             traceback.print_exc()
             self._finish(context)
@@ -2379,158 +1947,96 @@ class RETOP_OT_session(bpy.types.Operator):
             if finished is not None:
                 return finished
 
-        # Ending the session is the one thing an operator can ask for but not
-        # do: the timer, the modal cursor and the draw handlers are this
-        # instance's, and nothing else can tear them down. `retop.back` in the
-        # OBJECT phase clears the flag; this is what acts on it.
+        # `retop.back` asks for the end by clearing the flag; only the modal
+        # can tear down its timer, cursor and draw handlers.
         if not state.session_active:
             return self._finish(context, "Retop session ended")
 
-        # The panel's Commit/Discard buttons clear active_face_id; when that
-        # happens, drop straight back to picking the next surface so patches
-        # can be retopologized one after another without relaunching.
+        # Commit and Discard clear active_face_id: back to picking.
         if state.session_phase == 'ADJUST' and state.active_face_id == -1:
             state.session_phase = 'PATCH'
             state.hovered_side = -1
 
-        # Catch up with a phase the *keymap* changed. The session's keys are
-        # real operators now, so `retop.back`, `retop.tweak_mesh` and the
-        # panel's own buttons all move the phase without this instance being
-        # told -- and each leaves a stale hover behind and a cursor and status
-        # line describing the phase before. One check here covers every route
-        # in, which is what a per-caller `_apply_phase_ui` never managed to.
+        # Catch up with a phase changed elsewhere (an operator, the panel).
         if state.session_phase != self._last_phase:
             self._last_phase = state.session_phase
-            # Only on the way *out* of a patch. Entering ADJUST is the modal's
-            # own click handler, and the hover it just built is the preview --
-            # clearing it there would delete the geometry that was picked.
+            # Only when leaving a patch: entering ADJUST keeps the preview.
             if state.session_phase in {'PATCH', 'OBJECT'}:
                 self._clear_hover(context)
-                # Written only on a mouse move, so a phase reached by a key
-                # would otherwise draw one frame of the surface the cursor was
-                # over when the last pick ended.
+                # Otherwise stale until the next mouse move.
                 state.surface_hover_face_id = -1
             self._cursor_in_viewport = None
             self._apply_phase_ui(context)
             mesh_build.refresh_preview_appearance(context)
 
-        # Before the TIMER check, not after: leaving Edit Mode by the mode
-        # dropdown fires no event of its own, so the timer is what notices.
+        # Before the timer check: the timer is what notices Edit Mode ending.
         if state.session_phase == 'TWEAK':
             return self._modal_tweak(context, event)
 
         if event.type == 'TIMER':
             return {'PASS_THROUGH'}
 
-        # Edit/Sculpt/Weight-paint mode: the session has no business in the
-        # viewport there, and holding on to events would make the mode
-        # unusable. Handled on the timer as well as on input, so the hand-back
-        # happens the moment the mode changes rather than on the next click.
+        # Outside Object Mode, the viewport is Blender's.
         if context.mode != 'OBJECT':
             self._leave_for_other_mode(context)
             return {'PASS_THROUGH'}
 
-        # The cursor first, and before the area check: a modal cursor is set on
-        # the whole *window*, so it has to be dropped as soon as the pointer
-        # leaves the 3D view -- including for another editor entirely, which the
-        # area check below returns on. viewport_region gives (None, None) there,
-        # which point_in_region reads as "outside".
+        # The cursor first, before the area check: it applies to the window.
         over_viewport = self._cursor_over_viewport(context, event)
         self._update_cursor(context, over_viewport)
-        # Where the tooltip goes. A draw handler has no event to read the
-        # pointer from, so the modal leaves it where the overlay can find it --
-        # the same arrangement as `overlay.hover_committed`, and cleared the
-        # moment the pointer is elsewhere so a stale tooltip can't linger.
+        # For the tooltips: a draw handler has no event.
         overlay.cursor_window = ((event.mouse_x, event.mouse_y)
                                  if over_viewport else None)
 
-        # The patch data display follows the cursor too, and its own modal is
-        # starved while this one runs -- see `refresh_debug_hover`. Fed from the
-        # move this modal already has, and a no-op unless that display is on.
+        # Feed the debug display's hover, starved while this modal runs.
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
             refresh_debug_hover(context, event.mouse_x, event.mouse_y)
 
-        # Anything outside the 3D viewport (N-panel, properties, ...) must stay
-        # fully interactive -- that's where spans get adjusted during ADJUST.
+        # Other editors stay fully interactive.
         if not self._in_viewport(context):
             return {'PASS_THROUGH'}
 
-        # The N-panel lives *inside* the 3D view's area, so the check above
-        # doesn't cover it: only the region test does.
-        #
-        # Everything passes through when the pointer is outside the 3D view --
-        # every event, not a list of them. The panel has to stay fully usable
-        # for as long as a session runs, and a modal that keeps *any* event
-        # over it will eventually eat the one that mattered: mouse moves stop
-        # buttons from highlighting, digits collide with a field being typed
-        # into, Enter confirms the wrong thing. The cost is that the session's
-        # keybinds need the pointer over the viewport, which is how Blender's
-        # own region keymaps behave anyway.
+        # Every event passes through off the viewport, including over the
+        # N-panel inside the same area. See "The modal swallows nothing outside
+        # the 3D view's WINDOW region" in CLAUDE.md.
         if not over_viewport:
             state.hovered_side = -1
             state.surface_hover_face_id = -1
             return {'PASS_THROUGH'}
 
-        # The session's keys, resolved against the *live* KeyMapItems and run
-        # from here. Dispatching rather than passing through is what makes them
-        # reliable: an item in the 3D View keymap does not beat a mode keymap,
-        # and `X` in Object Mode is `object.delete`. The items are still real
-        # -- editable in Blender's own rows, listed in the keymap editor -- and
-        # their polls still decide what a key means in this phase.
-        #
-        # Clicks are excluded: their meaning depends on what is under the
-        # cursor, so the picker below resolves them instead.
+        # The session's keys, dispatched from here (see keymap.py). Clicks are
+        # resolved by the picker below.
         if event.type not in {'LEFTMOUSE', 'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
             if self._dispatch_bound(context, event):
                 return {'RUNNING_MODAL'}
 
         if state.session_phase == 'ADJUST':
-            # The corner editor owns the mouse and the clicks for as long as it
-            # is open, ahead of the side picker: it is reached through the
-            # picker but is not part of it, and it has to work with the side
-            # highlight off.
+            # The corner editor owns the mouse while open.
             if state.corner_edit:
                 consumed = self._modal_corners(context, event)
                 if consumed is not None:
                     return consumed
 
-            # Match mode owns the mouse while it is on, so it is handled before
-            # anything else in this phase.
+            # Then the side picker, while the highlight is on.
             if state.match_mode:
                 consumed = self._modal_match(context, event)
                 if consumed is not None:
                     return consumed
 
-            # Digits and Backspace are numeric entry, not a shortcut: they have
-            # to stay instantaneous and they only make sense as a block, so
-            # they are deliberately not remappable.
+            # Numeric entry, not remappable.
             if event.value == 'PRESS' and self._handle_typed_digit(context, event):
                 return {'RUNNING_MODAL'}
 
             if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
-                # A click *with a binding on it* is a binding like any other,
-                # and has to be dispatched before the fallback below can claim
-                # it. Clicks are held out of the dispatch at the top of this
-                # method because a plain one means "the thing under the
-                # cursor", which only the picker can resolve -- but that
-                # exclusion swallowed every modified click too, so Ctrl+click
-                # committed the patch instead of copying a density and the
-                # session left ADJUST with nothing done.
-                #
-                # Safe for the plain click as well: the picker above has
-                # already had it, `pin_neighbour` polls on a side being under
-                # the cursor, and with none there nothing runs and the fallback
-                # still commits.
+                # A modified click is a binding: dispatch it before the commit
+                # fallback.
                 if self._dispatch_bound(context, event):
                     return {'RUNNING_MODAL'}
-                # Nothing else to select while adjusting a patch, so a click
-                # that landed on nothing commits -- same as right-click and
-                # Enter. Not a binding: it is what a click falls back to once
-                # nothing else wanted it.
+                # A click on nothing commits.
                 self._commit(context)
                 return {'RUNNING_MODAL'}
 
-            # everything else (the session's keys, navigation, panel clicks)
+            # Everything else passes through.
             return {'PASS_THROUGH'}
 
         if event.type == 'MOUSEMOVE':
@@ -2539,17 +2045,11 @@ class RETOP_OT_session(bpy.types.Operator):
 
             session_obj = bpy.data.objects.get(state.session_object_name)
             obj, face_id, distance = _raycast_patch(context, event)
-            # stay within the object being retopped
+            # Stay within the object being retopped.
             if obj is not None and session_obj is not None and obj != session_obj:
                 obj, face_id = None, None
 
-            # What Shift+click would take, while Shift is actually held. The
-            # gesture is behind a modifier on a click, which is the one kind
-            # nobody finds on their own -- so holding the modifier is made to
-            # answer for itself, on the surface rather than in a hint line.
-            # Drawn whether or not that surface can be taken: an indicator that
-            # appears only over a valid target makes a refusal look like a
-            # target that was never there, and the click says which it is.
+            # What Shift+click would take, while Shift is held.
             was_picking = mesh_build.surface_pick_open(state)
             state.surface_hover_face_id = (
                 surface_under_cursor(context, event, obj, face_id)
@@ -2564,8 +2064,7 @@ class RETOP_OT_session(bpy.types.Operator):
                             self._clear_hover(context)
             elif self._hover_face_id is not None:
                 if surface_selection(state):
-                    # The preview is the patch the picked surfaces make, not a
-                    # hover: moving off the mesh must not wipe it.
+                    # Keep the pick's preview when leaving the mesh.
                     self._hover_obj = None
                     self._hover_face_id = None
                 else:
@@ -2577,18 +2076,13 @@ class RETOP_OT_session(bpy.types.Operator):
                 obj, _face_id, _distance = _raycast_patch(context, event)
                 if obj is None:
                     return {'RUNNING_MODAL'}
-                # Selecting and activating is `enter_session_object`'s job now,
-                # and it does it on the *resolved* object -- setting it here as
-                # well could activate a `<X>_Retop` the raycast handed back.
+                # `enter_session_object` selects the resolved object.
                 enter_session_object(context, obj)
                 self._apply_phase_ui(context)
                 self.report({'INFO'}, f"Retopping {obj.name}")
                 return {'RUNNING_MODAL'}
 
-            # A click carrying a modifier is a binding -- Shift gathers the
-            # surface under the cursor into the next patch -- and has to be
-            # dispatched before the plain pick below claims it. Same arrangement
-            # as in ADJUST, and safe for the plain click: nothing polls here.
+            # A modified click is a binding (Shift gathers a surface).
             if self._dispatch_bound(context, event):
                 return {'RUNNING_MODAL'}
 
@@ -2600,17 +2094,11 @@ class RETOP_OT_session(bpy.types.Operator):
                     self.report({'INFO'}, "Surface selection cleared")
                 return {'RUNNING_MODAL'}
 
-            # A gathered set of surfaces is opened by clicking any one of
-            # them -- the selection is the gesture, and needing a second key to
-            # confirm it would make the first click mean nothing on its own.
-            # Clicking outside it opens that surface instead and drops the
-            # selection, which is what abandoning it looks like.
+            # Clicking a gathered surface opens them all; clicking another
+            # abandons the pick and opens that one.
             pending = state.pending_composite_id
             if pending != -1:
-                # The patch is already built and already on screen: clicking it
-                # only locks it in. Clicking anything else abandons it -- and
-                # then the hover has to be rebuilt, since it was deliberately
-                # not regenerating while the pick was open.
+                # Rebuild the hover after abandoning: it was held.
                 if self._hover_face_id == pending:
                     self._open_composite(context, pending)
                     return {'RUNNING_MODAL'}
@@ -2621,9 +2109,7 @@ class RETOP_OT_session(bpy.types.Operator):
                     self._clear_hover(context)
                     return {'RUNNING_MODAL'}
             elif surface_selection(state):
-                # One surface picked and something else clicked: the same
-                # abandonment, with nothing written to the mesh to undo. The
-                # hover was held while the pick was open, so rebuild it.
+                # One surface picked: abandon it and rebuild the hover.
                 set_surface_selection(state, [])
                 mesh_build.refresh_preview_appearance(context)
                 if (self._hover_obj is None
@@ -2641,8 +2127,7 @@ class RETOP_OT_session(bpy.types.Operator):
             # Per-side matches belong to the patch they were picked on.
             state.side_overrides = ""
             state.hovered_side = -1
-            # Re-editing a patch committed as an n-gon puts the session back
-            # into n-gon mode, so panel and keybinds describe what is on screen.
+            # A patch committed as an n-gon reopens in n-gon mode.
             state.ngon_mode = self._hover_ngon
             state.editing_committed = self._hover_committed
             state.session_phase = 'ADJUST'
@@ -2650,8 +2135,7 @@ class RETOP_OT_session(bpy.types.Operator):
             self._apply_phase_ui(context)
 
             if self._hover_committed:
-                # The hover preview already holds the regenerated grid, so the
-                # old geometry can go now -- no need to rebuild anything.
+                # The hover already built the grid: remove the old faces.
                 removed = begin_reedit(context, self._hover_obj, self._hover_face_id)
                 self.report(
                     {'INFO'} if removed else {'WARNING'},
@@ -2662,8 +2146,7 @@ class RETOP_OT_session(bpy.types.Operator):
                             f"Patch {self._hover_face_id} ({self._hover_generator_name})")
             return {'RUNNING_MODAL'}
 
-        # let viewport navigation (orbit/pan/zoom) and the session's own
-        # KeyMapItems through untouched
+        # Navigation passes through.
         return {'PASS_THROUGH'}
 
     def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
@@ -2682,8 +2165,7 @@ class RETOP_OT_session(bpy.types.Operator):
         state.session_active = True
         state.active_face_id = -1
 
-        # Skip the object-picking step when the active object is already a
-        # Plasticity mesh -- that's the common case after importing.
+        # Skip the object pick when the active object is a Plasticity mesh.
         active = resolve_session_object(context.active_object)
         if _is_plasticity_mesh(active):
             enter_session_object(context, active)
@@ -2723,12 +2205,8 @@ class RETOP_OT_commit_patch(bpy.types.Operator):
     bl_idname = "retop.commit_patch"
     bl_label = "Commit Patch"
     bl_description = "Bake the current preview into the source object's retopology result mesh"
-    # No 'UNDO': the step is pushed by hand at the end of execute() instead.
-    # Blender would push one automatically, but only when the operator is run
-    # from the UI -- and the common path is bpy.ops from inside the session
-    # modal, which is exactly where the step was missing. Pushing it here
-    # covers both, and one flag *plus* one explicit push would leave two
-    # identical states on the stack, i.e. a Ctrl+Z that appears to do nothing.
+    # Never 'UNDO': the step is pushed by hand in execute(). Both would leave
+    # two identical states on the stack.
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -2739,9 +2217,7 @@ class RETOP_OT_commit_patch(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
-        # A number still being typed is part of the patch: applying it here
-        # rather than in the caller means the panel's Commit button honours it
-        # too, which it never did.
+        # Apply a span still being typed, for every caller.
         if state.typed_span:
             value = int(state.typed_span)
             if value >= 1:
@@ -2752,32 +2228,23 @@ class RETOP_OT_commit_patch(bpy.types.Operator):
         face_id = state.active_face_id
         replacing = state.editing_committed
 
-        # Recompute this patch's corner ids so their spans can be registered
-        # for propagation to future neighboring patches (cheap: same lookup
-        # generation already does, just no need to regenerate geometry here).
-        # Same corner method the preview was generated with, or the spans
-        # registered for propagation would describe sides that don't exist.
+        # Re-prepare the patch to register its spans, with the same corner
+        # method as the preview.
         ngon_committed = state.generator_name == generators.NGON.name
         prepared = patchprep.prepare_patch(
             source_obj.data, face_id, state.corner_angle_threshold,
             state.small_side_tolerance,
             state.corner_method_ngon if ngon_committed else state.corner_method_spans,
-            # Same loops generation was handed, or the registry would describe
-            # an n-gon's holes as if they had never been filled.
+            # The same loops generation was handed.
             keep_holes=ngon_committed)
 
-        # Passing the face id is what lets a re-committed patch replace its own
-        # previous faces instead of stacking a second grid on top of them.
+        # The face id lets a re-commit replace the patch's previous faces.
         result_obj, error = mesh_build.commit_preview_to_result(context, source_obj, face_id=face_id)
         if error:
             self.report({'WARNING'}, error)
             return {'CANCELLED'}
 
-        # Bookkeeping first, propagation second. The geometry is already in the
-        # result mesh at this point, so anything that throws from here on leaves
-        # the commit half-done -- and of the three, only these two matter for
-        # correctness: without them the re-edit snapshot stays alive and the
-        # panel's patch count goes stale. Span registration is additive.
+        # Bookkeeping first, then span registration.
         keep_reedit_removal(context)
         update_committed_count(context, source_obj)
 
@@ -2788,22 +2255,14 @@ class RETOP_OT_commit_patch(bpy.types.Operator):
         if prepared is not None:
             register_spans_for(context, source_obj, prepared)
 
-        # Note: the result highlight is owned by the session (it stays on for
-        # as long as you're inside this object), so it is deliberately NOT
-        # turned off here. Clearing active_face_id is what tells a running
-        # session to go back to picking the next surface.
+        # Clearing active_face_id sends the session back to picking.
         state.active_face_id = -1
         state.generator_name = ""
         state.num_sides = 0
 
         verb = "Replaced" if replacing else "Committed"
-        # One undo step per committed patch: that is what makes Ctrl+Z peel the
-        # last patch off instead of rolling the whole session back. Without it
-        # the nearest step below is "Retop: enter <obj>", so a single Ctrl+Z
-        # went to the state *before* the session -- every patch gone at once.
-        # It is also the step that owns the snapshot datablock
-        # keep_reedit_removal just freed: freeing an ID between two undo steps
-        # is what makes Ctrl+Z crash the depsgraph.
+        # One undo step per committed patch. See "One undo step per committed
+        # patch" in CLAUDE.md.
         push_undo(f"Retop: {verb.lower()} patch {face_id}")
         self.report({'INFO'}, f"{verb} patch {face_id} in {result_obj.name}")
         return {'FINISHED'}
@@ -2813,30 +2272,25 @@ class RETOP_OT_clear_preview(bpy.types.Operator):
     bl_idname = "retop.clear_preview"
     bl_label = "Clear Preview"
     bl_description = "Discard the current preview without committing it"
-    bl_options = {'REGISTER'}  # only a restored re-edit pushes a step; see execute
+    bl_options = {'REGISTER'}  # only a restored re-edit pushes a step
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         state = context.scene.plasticity_retop
-        # Also available with an empty preview while a re-edit is open, so its
-        # removal can still be rolled back.
+        # Also during a re-edit with an empty preview, to roll it back.
         return mesh_build.has_preview() or state.editing_committed
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         mesh_build.clear_preview_object()
         state = context.scene.plasticity_retop
         restoring = bool(state.reedit_backup_mesh)
-        # Discarding a re-edit puts the patch that was taken out on pick back
-        # exactly as it was, so Esc can never lose committed topology.
+        # Put back a re-edited patch as it was.
         restore_reedit_removal(context)
         if restoring:
-            # That put geometry back into the result mesh and freed the
-            # snapshot datablock, so it gets its own step -- for the same
-            # reason commit does. A discard with nothing to restore changed no
-            # datablock at all and would only add a Ctrl+Z that does nothing.
+            # A restore changed the result mesh: push a step. Never push one
+            # for a discard that changed nothing.
             push_undo("Retop: discard re-edit")
-        # Highlight stays on while the session is inside this object; clearing
-        # active_face_id sends a running session back to picking a surface.
+        # Clearing active_face_id sends the session back to picking.
         state.active_face_id = -1
         state.generator_name = ""
         state.num_sides = 0
@@ -2849,13 +2303,12 @@ class RETOP_OT_delete_patch(bpy.types.Operator):
     bl_description = ("Remove this patch's retopology for good instead of replacing it. "
                       "Only its own faces go: vertices a neighbouring patch still uses "
                       "survive, so the patches around it keep their welds")
-    bl_options = {'REGISTER'}  # its undo step is pushed by hand, as for commit
+    bl_options = {'REGISTER'}  # the undo step is pushed by hand
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         state = context.scene.plasticity_retop
-        # Only during a re-edit: picking a committed patch is what takes its
-        # faces out, and deleting is simply choosing not to put anything back.
+        # Only during a re-edit: the faces are already out.
         return (state.editing_committed and not state.corner_edit
                 and state.source_object_name in bpy.data.objects)
 
@@ -2865,24 +2318,15 @@ class RETOP_OT_delete_patch(bpy.types.Operator):
         face_id = state.active_face_id
         removed = state.reedit_removed_faces
 
-        # The faces went when the patch was picked; deleting is keeping that
-        # removal and committing nothing in their place. Dropping the snapshot
-        # is what makes it permanent.
+        # Keep the removal: drop the snapshot.
         keep_reedit_removal(context)
         mesh_build.clear_preview_object()
         mesh_build.forget_patch_settings(source_obj, face_id)
-        # A patch built from several surfaces is *also* undone here, and it has
-        # to be: nothing carries its id any more, and leaving the composite on
-        # the mesh leaves an area that is still one patch with nothing in it --
-        # which cannot be taken apart either, since Split Into Surfaces polls
-        # on that patch being *open* and deleting it is what closed it. The
-        # surfaces come back as patches of their own, which is what deleting a
-        # patch means everywhere else.
+        # A composite is dissolved too: nothing could reach it afterwards.
         surfaces = dissolve_composite(source_obj, face_id)
         update_committed_count(context, source_obj)
 
-        # Creases are a property of the border *between* patches, so losing one
-        # changes the shading of edges that belong to its neighbours.
+        # Re-shade: the neighbours' borders changed.
         result_obj = bpy.data.objects.get(mesh_build.result_object_name_for(source_obj))
         if result_obj is not None:
             mesh_build.apply_result_shading(context, result_obj)
@@ -2891,8 +2335,7 @@ class RETOP_OT_delete_patch(bpy.types.Operator):
         state.generator_name = ""
         state.num_sides = 0
 
-        # Same reasoning as commit: one step per change to the result mesh, and
-        # the snapshot keep_reedit_removal freed has to belong to one.
+        # One undo step, as for commit.
         push_undo(f"Retop: delete patch {face_id}")
         self.report({'INFO'},
                     f"Deleted patch {face_id} ({removed} face(s))"
@@ -2903,11 +2346,7 @@ class RETOP_OT_delete_patch(bpy.types.Operator):
 class RETOP_OT_pin_side(bpy.types.Operator):
     """Pin the side under the cursor to the vertices it should reproduce.
 
-    A click follows the committed neighbour across the side; a side with
-    nothing committed across it has nothing to follow and is refused. The modal
-    hands the click over whenever a side is actually under the cursor -- the
-    *fallback* (nothing under it, so commit) is what depends on the hover, not
-    this.
+    A side with nothing committed across it is refused.
     """
     bl_idname = "retop.pin_side"
     bl_label = "Pin Side"
@@ -2938,18 +2377,14 @@ class RETOP_OT_pin_side(bpy.types.Operator):
 class RETOP_OT_edit_corners(bpy.types.Operator):
     """Open the corner editor on the patch being adjusted.
 
-    Ctrl+click, sharing its binding with `retop.copy_patch_spans` and separated
-    from it by what is under the cursor -- a side of this patch opens the
-    editor, anything else copies a density. The same split the plain click
-    already makes between matching a side and committing, and safe for the same
-    reason: neither branch destroys anything, so a miss by a few pixels costs
-    one re-click.
+    Ctrl+click on a side. On anything else, the same binding copies a density
+    (`retop.copy_patch_spans`).
     """
     bl_idname = "retop.edit_corners"
     bl_label = "Edit Corners"
-    bl_description = ("Choose which of this patch's corners are side boundaries. Turning one off "
-                      "merges the two sides meeting there into one, which is what turns a "
-                      "five-sided face into the quad it usually wants to be")
+    bl_description = ("Group this patch's sides: each side gets a number, and consecutive sides "
+                      "with the same number become one side of the patch. That is how a "
+                      "five-sided face becomes the quad it usually wants to be")
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -2966,8 +2401,7 @@ class RETOP_OT_edit_corners(bpy.types.Operator):
             self.report({'WARNING'},
                         "Nothing to choose: this patch has fewer than three corners")
             return {'CANCELLED'}
-        # What Esc puts back. The edit is several clicks long, so it owes a way
-        # out that neither commits the patch nor keeps a half-made corner set.
+        # What Esc puts back.
         state.side_groups_backup = state.side_groups
         state.corner_edit = True
         state.hovered_bubble = -1
@@ -2981,18 +2415,8 @@ class RETOP_OT_edit_corners(bpy.types.Operator):
 class RETOP_OT_toggle_corner(bpy.types.Operator):
     """Step the group number of the side under the cursor.
 
-    **Free, and checked rather than constrained.** This used to merge the side
-    into the group before it or split it back out -- always valid by
-    construction, and unpredictable to use: nothing on screen said whether the
-    next click would open a new group or join an existing one, so the one thing
-    a bubble is for (reading the state before acting on it) did not extend to
-    the click. Now the number is simply stepped, every value is reachable, and
-    a grouping that cannot work is reported by `sidematch.group_problems` with
-    the offending bubbles ringed.
-
-    Wraps rather than clamping, and the ceiling is the loop's own side count:
-    more groups than sides is not something a boundary can be cut into, and a
-    click that does nothing at the end of the range reads as a broken control.
+    Any number is reachable; an invalid grouping is reported, never prevented.
+    Wraps at the loop's side count, never clamps.
     """
     bl_idname = "retop.toggle_corner"
     bl_label = "Change Side Group"
@@ -3035,9 +2459,7 @@ class RETOP_OT_toggle_corner(bpy.types.Operator):
 def refresh_group_warning(context: bpy.types.Context) -> None:
     """Re-read what is wrong with the grouping, for the panel and the overlay.
 
-    Written to the scene rather than recomputed at draw time: a draw handler
-    runs on every redraw, and the panel and the viewport have to agree about
-    one grouping rather than each reaching their own conclusion.
+    Written to the scene, so the panel and the overlay read the same answer.
     """
     state = context.scene.plasticity_retop
     references = sidematch.active_sides()
@@ -3050,12 +2472,7 @@ def refresh_group_warning(context: bpy.types.Context) -> None:
 
 
 def _corner_report(counts: dict[int, int], ngon: bool = False) -> str:
-    """What the grouping now amounts to -- the generator it would pick.
-
-    The count is the whole point of the gesture: it is what `find_generator`
-    reads, so saying "4 groups" without saying "Quad" would report the input
-    and withhold the answer.
-    """
+    """What the grouping now amounts to -- the generator it would pick."""
     if ngon:
         total = sum(counts.values())
         return (f"{total} groups -- "
@@ -3083,9 +2500,7 @@ class RETOP_OT_corners_accept(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
-        # The warning outlives the editor on purpose: an invalid grouping is
-        # kept rather than refused, so the panel has to go on saying it cannot
-        # be built. Refusing to close would be the modal nobody can get out of.
+        # Always closes; an invalid grouping stays reported.
         _close_corner_editor(state)
         regenerate_active_preview(context)
         if state.group_warning:
@@ -3125,15 +2540,8 @@ def _copy_source_under_cursor(
 ) -> int:
     """The committed patch the cursor is over, or -1.
 
-    What the overlay outlines to say "this one has a density you can take". A
-    raycast per mouse move, which the PATCH phase already pays for and which
-    nothing here caches: it is the *outline* that would be expensive, and that
-    comes from `cad_display`, cached per mesh like everything else a draw
-    handler reads.
-
-    Only ever a different patch from the one being adjusted, and only one that
-    has been committed -- whether its generator agrees is left to the overlay,
-    which has room to say why not.
+    Never the patch being adjusted. Whether the generators agree is left to
+    the overlay.
     """
     state = context.scene.plasticity_retop
     session_obj = bpy.data.objects.get(state.session_object_name)
@@ -3154,15 +2562,10 @@ def copy_spans_from(
 ) -> tuple[bool, str]:
     """Give the patch being adjusted the spans `face_id` was committed with.
 
-    The generator each patch was built by is recorded at commit
-    (`mesh_build.register_patch_settings`), which is what makes this answerable
-    at all: a Ring's two counts mean *around* and *across*, an N-Side's single
-    one means segments per side, and a number copied between two different
-    generators would be a number with a different meaning. So the spans travel
-    only between patches built the same way, and the refusal names both.
+    Only between patches built by the same generator: the spans mean
+    different things otherwise.
 
-    Returns (done, message) -- the message is worth saying either way, since
-    "nothing happened" is what a silently refused click looks like.
+    Returns (done, message).
     """
     state = context.scene.plasticity_retop
     if face_id == state.active_face_id:
@@ -3180,18 +2583,8 @@ def copy_spans_from(
     if source_generator != state.generator_name:
         return False, (f"patch {face_id} is a {source_generator or 'different'}, "
                        f"this one is a {state.generator_name or 'different patch'}")
-    # The viewport promised this before the click; `copy_source_status` is what
-    # it promised with, and it reads the same record.
-
-
-    # **Clicking the same patch again exchanges the two spans.** Which of a
-    # quad's directions is U comes from where its boundary walk started, and
-    # nothing in either patch says how one's U relates to the other's -- so a
-    # copy lands rotated about half the time and there is no way to work out in
-    # advance which half. A second click is that answer: one gesture, two
-    # states, the same shape as clicking a matched side to release it. A ring
-    # never needs it (around is around), and a single-span generator has
-    # nothing to exchange, which is said rather than silently ignored.
+    # Clicking the same patch again swaps U and V: which direction is U is
+    # arbitrary on each patch.
     swap = (face_id == state.copy_source_face_id) and not state.copy_source_swapped
     two_spans = source_generator in constants.TWO_SPAN_GENERATORS
     if swap and not two_spans:
@@ -3201,9 +2594,7 @@ def copy_spans_from(
     if swap:
         values["span_u"], values["span_v"] = values["span_v"], values["span_u"]
 
-    # Every span in the record, exactly as a re-edit restores them: which of
-    # them the generator reads is the generator's business, and the ones it
-    # does not read cost nothing.
+    # Every span in the record, as a re-edit restores them.
     changed = []
     for key in ("span_u", "span_v", "span"):
         value = values.get(key)
@@ -3211,8 +2602,7 @@ def copy_spans_from(
             continue
         if getattr(state, key, None) == value:
             continue
-        # Assigning fires the property's update callback, which regenerates the
-        # preview -- the same path the wheel takes.
+        # Assigning regenerates the preview through the update callback.
         setattr(state, key, value)
         changed.append(f"{key[-1].upper()}={value}" if key != "span" else f"span={value}")
 
@@ -3228,11 +2618,7 @@ def copy_spans_from(
 class RETOP_OT_copy_patch_spans(bpy.types.Operator):
     """Copy the density of another committed patch onto the one being adjusted.
 
-    Point at finished retopology and take its spans. Propagation already does
-    this across a *shared boundary*, where the two patches have to agree or
-    they crack; this is the other half -- two patches that never touch, a ring
-    here and a ring there, which want the same density for no reason the mesh
-    can work out on its own.
+    For patches that do not touch: propagation covers shared boundaries.
     """
     bl_idname = "retop.copy_patch_spans"
     bl_label = "Copy Patch Density"
@@ -3245,19 +2631,13 @@ class RETOP_OT_copy_patch_spans(bpy.types.Operator):
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         state = context.scene.plasticity_retop
-        # Ctrl+click is split by what is under the cursor, exactly as the
-        # plain click is: a *side* of the patch being adjusted opens the corner
-        # editor (`retop.edit_corners`, declared first), anything else copies
-        # the density of the patch the ray finds. So this one stands down
-        # whenever a side is hovered -- without which the editor could never be
-        # reached, since both are the same event.
+        # Stands down over a side: Ctrl+click there opens the corner editor.
         return (state.session_active and state.session_phase == 'ADJUST'
                 and not state.corner_edit and state.hovered_side == -1
                 and state.active_face_id != -1)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        # The pointer the modal left behind: an operator it dispatches never
-        # sees the event, the same arrangement the side tooltip uses.
+        # The pointer the modal left: a dispatched operator gets no event.
         cursor = overlay.cursor_window
         if cursor is None:
             self.report({'WARNING'}, "Cursor is not over the viewport")
@@ -3283,11 +2663,7 @@ class RETOP_OT_copy_patch_spans(bpy.types.Operator):
 class RETOP_OT_toggle_surface(bpy.types.Operator):
     """Gather the surface under the cursor into the next patch, or drop it.
 
-    One Plasticity face is one patch, which is the input contract and not
-    always the right unit of work: a boss with two fillet rings around it is
-    five surfaces that want a single sheet of retopology across them.
-    Shift+click marks the ones that should be filled together; clicking any of
-    them opens them as one patch, with the borders between them gone.
+    Clicking any gathered surface opens them all as one patch.
     """
     bl_idname = "retop.toggle_surface"
     bl_label = "Add Surface To Patch"
@@ -3306,8 +2682,7 @@ class RETOP_OT_toggle_surface(bpy.types.Operator):
         if obj is None:
             return {'CANCELLED'}
 
-        # The pointer the modal left behind: an operator it dispatches never
-        # gets the event, the same arrangement `copy_patch_spans` has.
+        # The pointer the modal left: a dispatched operator gets no event.
         cursor = overlay.cursor_window
         origin, direction = (ray_from_window(context, cursor[0], cursor[1])
                              if cursor is not None else (None, None))
@@ -3315,9 +2690,7 @@ class RETOP_OT_toggle_surface(bpy.types.Operator):
             self.report({'WARNING'}, "Cursor is not over the viewport")
             return {'CANCELLED'}
 
-        # The mesh's own surface, not the patch over it: once two surfaces are
-        # one patch every polygon of both answers with the patch, and this
-        # click could no longer take one of them back out.
+        # The raw surface, not the patch over it.
         hit_obj, face_id, _distance = _raycast_patch_ray(
             context, origin, direction, space=context.space_data, surfaces=True)
         if face_id is None or hit_obj != obj:
@@ -3332,8 +2705,7 @@ class RETOP_OT_toggle_surface(bpy.types.Operator):
 
 class RETOP_OT_split_patch(bpy.types.Operator):
     """Take the active patch back apart into the CAD surfaces it was built
-    from. The way back, and the reason building one is not destructive.
-    """
+    from."""
     bl_idname = "retop.split_patch"
     bl_label = "Split Into Surfaces"
     bl_description = ("Take this patch back apart into the Plasticity surfaces it was built "
@@ -3358,9 +2730,7 @@ class RETOP_OT_split_patch(bpy.types.Operator):
             self.report({'WARNING'}, f"Can't split this patch: {message}")
             return {'CANCELLED'}
 
-        # The patch it was open on no longer exists, so the session goes back
-        # to picking one -- which is what clearing active_face_id tells the
-        # modal to do.
+        # The open patch no longer exists: back to picking.
         if bpy.ops.retop.clear_preview.poll():
             bpy.ops.retop.clear_preview()
         state.active_face_id = -1
@@ -3373,10 +2743,7 @@ class RETOP_OT_split_patch(bpy.types.Operator):
 class RETOP_OT_tweak_mesh(bpy.types.Operator):
     """Hand the result mesh to Blender's Edit Mode, set up for retopology.
 
-    The session keeps running throughout -- the modal simply passes everything
-    through until Tab (or the mode dropdown) brings the viewport back. See
-    tweak.py for why this is a round trip into Blender rather than a pair of
-    object-mode tools.
+    The session keeps running; see tweak.py.
     """
     bl_idname = "retop.tweak_mesh"
     bl_label = "Hand-Edit Retopology"
@@ -3404,20 +2771,14 @@ class RETOP_OT_tweak_mesh(bpy.types.Operator):
 class RETOP_OT_end_tweak(bpy.types.Operator):
     """Take the viewport back from Edit Mode and reconcile the hand edits.
 
-    The repair is the whole reason this is an operator rather than a plain
-    `object.mode_set`: Blender knows nothing about `retop_patch_face_id` or
-    `retop_source_vid`, so a knife cut leaves faces no patch owns and vertices
-    claiming to be CAD corners they are nowhere near. See
-    `mesh_build.repair_manual_edits`.
+    Runs `mesh_build.repair_manual_edits`, which a plain mode switch would skip.
     """
     bl_idname = "retop.end_tweak"
     bl_label = "Back to Retop"
     bl_description = ("Leave Edit Mode, put the snapping settings back as they were, and let the "
                        "addon re-adopt the faces and drop the stray corner ids the hand edits "
                        "left behind")
-    # REGISTER without UNDO, like commit and delete: the step below is pushed
-    # by hand, and Blender pushing one of its own for an OPTYPE_UNDO operator
-    # run from the UI would put two identical states on the stack.
+    # Never 'UNDO': the step is pushed by hand, like commit and delete.
     bl_options = {'REGISTER'}
 
     @classmethod
@@ -3429,9 +2790,7 @@ class RETOP_OT_end_tweak(bpy.types.Operator):
         state = context.scene.plasticity_retop
         update_committed_count(
             context, bpy.data.objects.get(state.session_object_name))
-        # The repair writes to the result mesh, so it gets its own step -- same
-        # rule as a commit or a delete. Blender pushed one for leaving Edit
-        # Mode, but that one predates the attributes fixed above.
+        # The repair wrote to the result mesh: its own undo step.
         push_undo("Retop: hand edits")
         if adopted or cleared:
             self.report({'INFO'},
@@ -3445,18 +2804,8 @@ class RETOP_OT_end_tweak(bpy.types.Operator):
 def _global_keys_live(context: bpy.types.Context) -> bool:
     """Whether the addon's GLOBAL keys mean anything right now.
 
-    They are dispatched by Blender rather than by the modal, so unlike the
-    session's keys they are offered on every press from the moment the addon is
-    installed -- and '/' , Alt+X and V are keys other addons want too
-    (Hard Ops' own Alt+X is where this one's was borrowed from). Claiming a key
-    an addon is not currently being used for is how an addon ends up having to
-    be disabled to get its keys back, so by default these polls fail with no
-    session open and Blender hands the event on to whoever else bound it.
-
-    `keymap.global_keys_outside_session` is the way back for anyone who wants
-    the isolate and the mirror between sessions. Panel buttons are unaffected:
-    they call `retop.mirror_axis` and `retop.apply_mirror`, which are not bound
-    to anything and stay polled on having a result mesh.
+    With no session, these polls fail and Blender passes the key on, unless
+    `keymap.global_keys_outside_session` is on. Panel buttons are unaffected.
     """
     if keymap.global_keys_outside_session():
         return True
@@ -3466,9 +2815,7 @@ def _global_keys_live(context: bpy.types.Context) -> bool:
 class RETOP_OT_mirror_axis(bpy.types.Operator):
     """Turn the retopology's mirror on or off for one axis.
 
-    Symmetry is a Mirror modifier on `<Object>_Retop`, planed on the *source*
-    object's origin -- see mesh_build's symmetry section for why a modifier and
-    not baked geometry.
+    A Mirror modifier on `<Object>_Retop` (see mesh_build's symmetry section).
     """
     bl_idname = "retop.mirror_axis"
     bl_label = "Mirror Axis"
@@ -3509,9 +2856,7 @@ class RETOP_OT_mirror_axis(bpy.types.Operator):
 def _tag_viewports_redraw(context: bpy.types.Context) -> None:
     """Redraw every 3D view, so a POST_PIXEL overlay follows the pointer.
 
-    Every viewport rather than `context.area`: a modal's context area is
-    whichever one the operator was invoked from, and the gizmo is drawn in
-    whichever region the pointer is actually over.
+    Every viewport: the pointer may be over another one than the modal's.
     """
     window = getattr(context, "window", None)
     screen = getattr(window, "screen", None) if window else None
@@ -3523,10 +2868,7 @@ def _tag_viewports_redraw(context: bpy.types.Context) -> None:
 class RETOP_OT_mirror(bpy.types.Operator):
     """Alt+X, then X / Y / Z: arm the axis prompt and toggle what it picks.
 
-    Modelled on Hard Ops, and a modal rather than three bindings because that
-    is the reflex the key is borrowed from. It sits *above* the session modal
-    while it runs, so the axis keys can't collide with the session's own X
-    (delete patch) -- this operator sees them first.
+    A modal above the session's, so it sees the axis keys first.
     """
     bl_idname = "retop.mirror"
     bl_label = "Mirror Retopology"
@@ -3537,16 +2879,14 @@ class RETOP_OT_mirror(bpy.types.Operator):
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         if not _global_keys_live(context):
-            return False  # Alt+X goes back to Hard Ops, or to whoever else has it
+            return False  # the key passes to whoever else binds it
         _source, result = mesh_build.mirror_target(context)
         return result is not None
 
     def _restore_status(self, context: bpy.types.Context) -> None:
         """Give the status bar back to whoever had it.
 
-        The session writes its phase there and only rewrites it on a phase
-        change, so clearing the line unconditionally would leave the session
-        running with a blank status until the next transition.
+        Puts the session's line back when a session is running.
         """
         if context.workspace is None:
             return
@@ -3572,11 +2912,7 @@ class RETOP_OT_mirror(bpy.types.Operator):
             context.workspace.status_text_set(
                 f"Mirror {result.name}   |   X / Y / Z: toggle an axis   |   Esc: cancel"
                 + (f"   |   now: {' + '.join(on)}" if on else "   |   now: off"))
-        # And under the cursor as well, where the question was asked. The status
-        # bar is at the bottom of the window: with a hand on the keyboard and
-        # eyes on the part, it is the one place nobody looks. The gizmo also
-        # says which axes are *already* mirrored, which the key alone cannot --
-        # that state lives on the modifier.
+        # And a gizmo under the cursor, showing which axes are already on.
         overlay.mirror_state = tuple(axes)
         overlay.mirror_cursor = (event.mouse_x, event.mouse_y)
         overlay.enable_mirror_gizmo()
@@ -3585,12 +2921,9 @@ class RETOP_OT_mirror(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def modal(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
-        # Alt is still held from the binding that got us here, so its release
-        # arrives first; the same goes for any other modifier the user lets go
-        # of. Cancelling on those would make the prompt impossible to reach.
+        # Ignore modifier releases: Alt is still held from the binding.
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
-            # The gizmo follows the pointer: it is drawn where the question is
-            # being asked, and a picker that stays behind reads as stale UI.
+            # The gizmo follows the pointer.
             overlay.mirror_cursor = (event.mouse_x, event.mouse_y)
             _tag_viewports_redraw(context)
             return {'RUNNING_MODAL'}
@@ -3606,16 +2939,14 @@ class RETOP_OT_mirror(bpy.types.Operator):
             bpy.ops.retop.mirror_axis(axis=axis)
             return {'FINISHED'}
 
-        # Anything else cancels rather than being swallowed: an armed prompt
-        # nobody can get out of is worse than one that gives up easily.
+        # Anything else cancels.
         self._finish(context)
         if event.type not in {'ESC', 'RIGHTMOUSE'}:
             self.report({'INFO'}, "Mirror cancelled — X, Y or Z picks an axis")
         return {'CANCELLED'}
 
     def _finish(self, context: bpy.types.Context) -> None:
-        """Every exit goes through here: a draw handler nobody owns is the one
-        kind of leak the version string cannot report."""
+        """Every exit must go through here, or the draw handler leaks."""
         overlay.disable_mirror_gizmo()
         _tag_viewports_redraw(context)
         self._restore_status(context)
@@ -3624,11 +2955,8 @@ class RETOP_OT_mirror(bpy.types.Operator):
 class RETOP_OT_reset_corner_methods(bpy.types.Operator):
     """Put both corner-detection methods back on their defaults.
 
-    The two enums are a developer's knob (see the panel), so the rows that edit
-    them are hidden unless Developer Mode is on -- but the values live on the
-    scene, so a file saved with a non-default would otherwise be stuck on it
-    with no control anywhere to reach. This is the way back, and the panel only
-    offers it when there is something to undo.
+    The rows are hidden outside Developer Mode: this is the way back from a
+    stored non-default.
     """
     bl_idname = "retop.reset_corner_methods"
     bl_label = "Reset Corner Detection"
@@ -3697,7 +3025,7 @@ class RETOP_OT_toggle_see_through(bpy.types.Operator):
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
         state.result_see_through = not state.result_see_through
-        # The property's own update callback re-applies the look.
+        # The update callback re-applies the look.
         self.report({'INFO'},
                     "Retopo drawn through meshes" if state.result_see_through
                     else "Retopo occluded like any object")
@@ -3722,19 +3050,17 @@ class RETOP_OT_local_view(bpy.types.Operator):
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
         if not _global_keys_live(context):
-            return False  # '/' is plain view3d.localview again, one handler down
+            return False  # '/' falls through to view3d.localview
         space = context.space_data
         return space is not None and space.type == 'VIEW_3D'
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        # Delegate the actual toggle: matching Blender's own selection rules,
-        # framing and undo behaviour by hand is a losing game. When the setting
-        # is off, sync_local_view is a no-op and '/' behaves exactly as usual.
+        # Delegate the toggle to Blender's own operator.
         bpy.ops.view3d.localview('INVOKE_DEFAULT', frame_selected=self.frame_selected)
 
         space = context.space_data
         if space.local_view is None:
-            return {'FINISHED'}  # we just left local view, nothing to add
+            return {'FINISHED'}  # just left local view
 
         added = mesh_build.sync_local_view(context)
         if added:
@@ -3743,12 +3069,9 @@ class RETOP_OT_local_view(bpy.types.Operator):
 
 
 def _perform_reload() -> None:
-    """The actual unregister/reload/register cycle, run from a bpy.app.timers
-    callback (see RETOP_OT_reload_addon) -- i.e. on Blender's next event loop
-    tick, never from inside a still-running operator call. Unregistering an
-    operator's own class while its execute() is still on the call stack is
-    what crashed Blender the first time this was tried inline; deferring it
-    like this is the standard safe pattern for a self-reloading addon.
+    """The unregister/reload/register cycle, run from a bpy.app.timers
+    callback (RETOP_OT_reload_addon). Never call it from inside an operator:
+    unregistering its own class crashes Blender.
     """
     import importlib
     from . import (
@@ -3768,22 +3091,14 @@ def _perform_reload() -> None:
         keymap as keymap_mod,
         overlay as overlay_mod,
     )
-    # Submodules are collected from sys.modules, never listed by hand.
-    # Reloading a package re-runs its imports, but those resolve straight out
-    # of sys.modules, so a module missing from the reload list keeps running
-    # its old code -- and the mismatch surfaces as an AttributeError from a
-    # *reloaded* module calling a function the stale one doesn't have yet.
-    # That is precisely what a hand-written list did when generators/ngon.py
-    # was added, hence this sweep.
+    # Submodules are collected from sys.modules, never listed by hand: a
+    # missing one keeps its old code.
     package_name = __name__.rpartition(".")[0]
     generator_prefix = f"{package_name}.generators."
     generator_modules = [module for name, module in sorted(sys.modules.items())
                          if name.startswith(generator_prefix) and module is not None]
 
-    # Reloading unregisters the session operator's class, which kills any
-    # running modal without it ever reaching _finish. Tear the session down
-    # first so the scene isn't left claiming to be in a session that no longer
-    # listens to anything.
+    # End the session first: reloading kills the modal without _finish.
     try:
         end_session(bpy.context)
         if bpy.context.workspace:
@@ -3791,19 +3106,14 @@ def _perform_reload() -> None:
     except Exception:
         pass
 
-    # Nothing is saved and restored around the property group here, and that is
-    # deliberate: Blender keeps a PropertyGroup's values as ID properties on
-    # the scene, keyed by name, so deleting Scene.plasticity_retop and
-    # re-declaring it re-attaches to the same stored data. Every setting comes
-    # through untouched. tests/test_reload.py asserts it rather than trusting
-    # it -- it is a fact about Blender's storage, not about this code.
+    # Settings survive without saving them: Blender keeps them on the scene by
+    # name (tests/test_reload.py).
     ui.unregister()
     prefs_mod.unregister()
     unregister()
     state_mod.unregister()
 
-    # Order matters for the listed ones: each is reloaded before whatever
-    # imports it, so nothing is left holding a reference into a dead module.
+    # Each module is reloaded before whatever imports it.
     ordered = ([version_mod, constants_mod, patch_data_mod, sides_mod2, geometry_mod]
                + generator_modules
                + [generators_mod, cad_display_mod, mesh_build_mod,
@@ -3815,8 +3125,7 @@ def _perform_reload() -> None:
         importlib.reload(module)
         reloaded.add(module.__name__)
 
-    # Anything else the package has picked up since -- a module nobody thought
-    # to add above -- is reloaded too rather than silently left stale.
+    # Then any other submodule, so none stays stale.
     last = (__name__, prefs_mod.__name__, ui.__name__)
     for name, module in sorted(sys.modules.items()):
         if (name.startswith(f"{package_name}.") and module is not None
@@ -3829,39 +3138,25 @@ def _perform_reload() -> None:
 
     state_mod.register()
     sys.modules[__name__].register()
-    # After the operators, like register(): the preferences page draws the
-    # keymap items they just registered.
+    # After the operators: the preferences page draws their keymap items.
     prefs_mod.register()
     ui.register()
 
     print(f"[Plasticity Retop] Reloaded: v{version_mod.ADDON_VERSION} ({version_mod.BUILD_ID})")
-    return None  # one-shot timer, don't reschedule
+    return None  # one-shot timer
 
 
 # --- the session's keys, as operators -------------------------------------
 #
-# Each of these used to be a branch inside `_modal`. They are operators with a
-# real KeyMapItem now (see keymap.py), which is what puts them in Blender's own
-# keymap editor instead of a hand-rolled one -- and it is their `poll` that
-# decides whether the key means anything, because an item in the 3D View keymap
-# fires whether a session is running or not.
-#
-# None of them touches the modal instance. Everything they need is scene state,
-# which is why `typed_span` moved there; the modal notices a phase change on
-# its next event and catches its own bookkeeping up.
+# Each key is an operator with a real KeyMapItem (see keymap.py). Its poll
+# decides whether the key means anything.
+# None of them touches the modal instance: only scene state.
 
 
 def _in_phase(context: bpy.types.Context, *phases: str,
               during_corner_edit: bool = False) -> bool:
-    """Whether a session is in one of `phases` -- and not in the corner editor.
-
-    The editor is a sub-state of ADJUST rather than a phase of its own (the
-    patch is still open, so every `session_phase == 'ADJUST'` test in the
-    overlay must stay true), which means the exclusion has to live somewhere
-    the polls share. Here: one line, and every action below is inert for the
-    length of the edit without restating it. `during_corner_edit=True` is for
-    the two that have no reason to be -- the CAD edge and surface flow
-    displays, which are read *while* choosing corners.
+    """Whether a session is in one of `phases`, and not in the corner editor
+    (a sub-state of ADJUST). `during_corner_edit=True` allows the editor.
     """
     state = context.scene.plasticity_retop
     if not (state.session_active and state.session_phase in phases):
@@ -3885,28 +3180,21 @@ class RETOP_OT_nudge_span(bpy.types.Operator):
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
-        state.typed_span = ""  # scrolling takes over from a half-typed number
+        state.typed_span = ""  # scrolling replaces a half-typed number
         if state.ngon_mode and state.hovered_side != -1:
-            # Over a side, the wheel sets that side's vertex count -- or its
-            # group's, when the side was grouped with others in the corner
-            # editor. Away from the sides it still drives the detail angle.
+            # Over a side: that side's (or group's) vertex count.
             changed, message = nudge_ngon_side(context, state.hovered_side, self.delta)
             self.report({'INFO'} if changed else {'WARNING'}, message)
             return {'FINISHED'} if changed else {'CANCELLED'}
         if state.ngon_mode:
-            # An n-gon has no span to step, but it does have a density, and
-            # that is `ngon_angle` -- *inverted*, since it is degrees of
-            # boundary turn per kept vertex, so scrolling up lowers it.
-            # Multiplicative because the setting is: a 2 degree step is nothing
-            # at 90 and everything at 4.
+            # Otherwise `ngon_angle`: inverted, and multiplicative.
             factor = 1.25
             angle = (state.ngon_angle / factor if self.delta > 0
                      else state.ngon_angle * factor)
             state.ngon_angle = max(1.0, min(180.0, round(angle, 1)))
         else:
             prop = active_span_prop(state)
-            # Assigning fires the property's update callback, which regenerates
-            # the preview live.
+            # The update callback regenerates the preview.
             setattr(state, prop, max(1, getattr(state, prop) + self.delta))
         return {'FINISHED'}
 
@@ -3925,15 +3213,13 @@ class RETOP_OT_toggle_span_axis(bpy.types.Operator):
     def execute(self, context: bpy.types.Context) -> set[str]:
         state = context.scene.plasticity_retop
         if state.generator_name not in TWO_SPAN_GENERATORS:
-            # A key that does nothing and reports nothing reads as a broken
-            # key, which is how the silent version of this got reported as "the
-            # addon captures Tab".
+            # Say why nothing happens.
             self.report({'INFO'},
                         f"{state.generator_name or 'This generator'} has a single span: "
                         f"no direction to switch")
             return {'CANCELLED'}
         state.span_axis = 'V' if state.span_axis == 'U' else 'U'
-        state.typed_span = ""  # the number being typed applied to the other span
+        state.typed_span = ""  # it was being typed for the other span
         return {'FINISHED'}
 
 
@@ -3995,8 +3281,7 @@ class RETOP_OT_toggle_ngon(bpy.types.Operator):
             self.report({'WARNING'},
                         f"N-gon mode not available here: {state.ngon_unavailable_reason}")
             return {'CANCELLED'}
-        # The property's own update callback regenerates the preview and
-        # refreshes generator_name, so the panel and overlay follow.
+        # The update callback regenerates the preview.
         state.ngon_mode = not state.ngon_mode
         state.typed_span = ""
         return {'FINISHED'}
@@ -4069,15 +3354,8 @@ class RETOP_OT_toggle_surface_flow(bpy.types.Operator):
 def _patch_hover_wanted(context: bpy.types.Context) -> bool:
     """Whether the patch data display wants the hover modal running.
 
-    `context.scene` through a getattr, not straight: `register` calls this by
-    way of `sync_patch_hover`, and Blender registers an addon under a
-    **restricted** context -- a `_RestrictContext` with no `scene` on it at
-    all, because no file is loaded yet. Reaching for it there raised
-    `'_RestrictContext' object has no attribute 'scene'` and took the whole
-    registration with it, so enabling the addon (or deploying and re-enabling
-    it) failed outright while the very same code was fine once running. There
-    is nothing to want at that moment anyway: the scene the toggle lives on
-    arrives with `load_post`, which calls this again.
+    Always read `context.scene` through getattr: at registration the context
+    is restricted and has no scene. `load_post` asks again later.
     """
     scene = getattr(context, "scene", None)
     state = getattr(scene, "plasticity_retop", None)
@@ -4089,9 +3367,7 @@ def _patch_hover_wanted(context: bpy.types.Context) -> bool:
 def _start_patch_hover() -> None:
     """Invoke the hover modal in the first 3D viewport there is.
 
-    Run from a timer, so `bpy.context` is the real one but there is no area to
-    invoke into -- a modal operator has to be given a window and a VIEW_3D area
-    or it has nothing to register its handler on.
+    Run from a timer, so it supplies the window and area itself.
     """
     if RETOP_OT_patch_hover.running or not _patch_hover_wanted(bpy.context):
         return
@@ -4100,24 +3376,20 @@ def _start_patch_hover() -> None:
         return
     area = next((a for a in window.screen.areas if a.type == 'VIEW_3D'), None)
     if area is None:
-        # No viewport to hover over. Nothing to start, and nothing is wrong:
-        # the next sync (a toggle, a file load) will try again.
+        # No viewport: the next sync tries again.
         return
     try:
         with bpy.context.temp_override(window=window, area=area):
             bpy.ops.retop.patch_hover('INVOKE_DEFAULT')
     except (RuntimeError, AttributeError):
-        # No context to invoke into (headless, or mid-load). The display simply
-        # shows nothing until something asks again.
+        # No context to invoke into (headless, or mid-load).
         pass
 
 
 def sync_patch_hover() -> None:
     """Bring the hover modal in line with the scene properties.
 
-    Called from the property update and from `load_post`. The modal stops
-    itself when the toggle goes off -- it checks on every event -- so this only
-    ever has to handle the starting half.
+    Only starts it: the modal stops itself when the toggle goes off.
     """
     if not _patch_hover_wanted(bpy.context):
         return
@@ -4131,16 +3403,8 @@ def refresh_debug_hover(
 ) -> None:
     """Point the patch data display at whatever is under (mouse_x, mouse_y).
 
-    Shared by `RETOP_OT_patch_hover` and by the **session** modal, which has to
-    feed it: `_modal` answers a mouse move with RUNNING_MODAL, and a modal added
-    to the stack before it never sees the event -- so a display switched on
-    before a session started would freeze for the length of it, which is exactly
-    when the raw face ids are being read. One raycast, and only while the
-    display is on and following the cursor: `_patch_hover_wanted` is the first
-    thing checked.
-
-    Off the viewport the hover is *dropped* rather than left standing, or it
-    would go on naming a patch the cursor is nowhere near.
+    Shared by `RETOP_OT_patch_hover` and the session modal, which starves the
+    former of mouse moves. Off the viewport the hover is dropped.
     """
     if not _patch_hover_wanted(context):
         return
@@ -4165,28 +3429,15 @@ def refresh_debug_hover(
 class RETOP_OT_patch_hover(bpy.types.Operator):
     """Track the cursor so the patch debug display can follow it.
 
-    A draw handler is given no event, so hovering cannot be read from one --
-    the session solves this by having its own modal leave the position in
-    `overlay.cursor_window`, and this is the same arrangement for the debug
-    display, which has to work with no session at all.
-
-    It reads and never writes: every event is passed straight back to Blender,
-    so this can sit under the knife, the loop cut, a transform or Blender's own
-    selection without taking anything from them. The one thing it must not do
-    is outlive its toggle, so that is checked on every event rather than
-    trusted to whoever turned it off.
-
-    The hover lands in a module global on `overlay` rather than in a scene
-    property: a scene property written on every mouse move marks the file as
-    modified, and nothing about looking at a mesh should do that.
+    Works with no session. Passes every event through, and checks its toggle
+    on every event. Writes `overlay.debug_hover`, never a scene property.
     """
     bl_idname = "retop.patch_hover"
     bl_label = "Follow Cursor for Patch Data"
     bl_options = {'REGISTER'}
 
-    # Not an annotation: a class attribute on a registered class is read by the
-    # registration walk, and this is ours, not Blender's. One instance at a
-    # time is the whole point -- two would fight over the same global.
+    # Never annotated: registration reads class-body annotations. One instance
+    # at a time.
     running = False
 
     @classmethod
@@ -4260,12 +3511,7 @@ class RETOP_OT_print_patch_data(bpy.types.Operator):
 
 
 class RETOP_OT_back(bpy.types.Operator):
-    """One step out per press: clear typing, discard, leave the object, end.
-
-    A single operator rather than one per phase because it is a single idea --
-    "back out of whatever I am in" -- and because a keymap the user reads
-    should have one Esc in it, not four with mutually exclusive polls.
-    """
+    """One step out per press: clear typing, discard, leave the object, end."""
     bl_idname = "retop.back"
     bl_label = "Discard / Back Out"
     bl_description = ("Step back out: clear a half-typed span, then discard the patch, then leave "
@@ -4280,15 +3526,11 @@ class RETOP_OT_back(bpy.types.Operator):
         state = context.scene.plasticity_retop
 
         if state.session_phase == 'ADJUST':
-            # A first press only cancels a half-typed number, so a typo doesn't
-            # throw away the patch itself.
+            # A first press only cancels a half-typed number.
             if state.typed_span:
                 state.typed_span = ""
                 return {'FINISHED'}
-            # Guarded: there is nothing to discard on a patch whose preview
-            # failed to generate, and backing out of *that* is exactly when you
-            # need this key to work. The modal never hit it because it only
-            # reached this branch with a preview on screen.
+            # Guarded: a failing poll would raise out of the modal.
             if bpy.ops.retop.clear_preview.poll():
                 bpy.ops.retop.clear_preview()
             state.session_phase = 'PATCH'
@@ -4296,26 +3538,17 @@ class RETOP_OT_back(bpy.types.Operator):
             return {'FINISHED'}
 
         if state.session_phase == 'PATCH':
-            # Gathered surfaces are a step in, so Esc is a step out of them --
-            # the same rule that makes the first Esc in ADJUST clear a
-            # half-typed span rather than throw the patch away.
+            # A surface pick is a step in: Esc drops it first.
             if surface_selection(state):
                 discard_pending_composite(context)
-                # Guarded like the ADJUST branch above, and for the same reason:
-                # the preview may be empty already -- the pick had one surface,
-                # or the surfaces could not be built over -- and an operator
-                # whose poll fails *raises* out of the modal, which stops the
-                # session on the one key that exists to back out of things.
+                # Guarded: the preview may already be empty.
                 if bpy.ops.retop.clear_preview.poll():
                     bpy.ops.retop.clear_preview()
                 return {'FINISHED'}
             exit_session_object(context)
             return {'FINISHED'}
 
-        # OBJECT: nothing left to back out of but the session itself. Clearing
-        # session_active is what the modal watches to finish -- it owns the
-        # timer, the cursor and the draw handlers, and none of those is this
-        # operator's to tear down.
+        # OBJECT: ask the modal to end the session.
         state.session_active = False
         return {'FINISHED'}
 
@@ -4334,9 +3567,7 @@ class RETOP_OT_open_keymap_prefs(bpy.types.Operator):
         try:
             bpy.ops.preferences.addon_show(module=module)
         except (RuntimeError, TypeError):
-            # Imported directly rather than installed as an addon (the tests
-            # do this), so there is no addon entry to show. Falling back to the
-            # keymap section still gets the user to the same items.
+            # No addon entry (a plain import): open the keymap section.
             try:
                 bpy.ops.screen.userpref_show('INVOKE_DEFAULT')
                 context.preferences.active_section = 'KEYMAP'
@@ -4357,9 +3588,7 @@ class RETOP_OT_reload_addon(bpy.types.Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        # Schedule the reload for the next event loop tick instead of doing it
-        # inline: unregistering this very operator's class while its execute()
-        # is still running is unsafe (see _perform_reload's docstring).
+        # Deferred: never unregister this class from its own execute().
         bpy.app.timers.register(_perform_reload, first_interval=0.0)
         self.report({'INFO'}, "Reloading Plasticity Retop...")
         return {'FINISHED'}
@@ -4371,17 +3600,9 @@ def _on_undo_redo(
 ) -> None:
     """Bring session state back in line with what undo just restored.
 
-    An undo step can put the result mesh back to a state that has nothing to do
-    with the patch currently open: the faces a re-edit removed may be back, the
-    snapshot taken to restore them may be gone, the object being retopped may
-    not exist any more. Anything acted on afterwards would be acting on stale
-    references, so the active patch is simply dropped and the session returns to
-    picking.
-
-    Deliberately touches scene properties only -- no datablock is created,
-    freed or edited from a handler. Everything that needs one (the preview mesh
-    the step left holding a patch that is no longer open, most of all) is
-    deferred to the modal through _undo_needs_reconcile.
+    Drops the active patch and returns to picking. Scene properties only:
+    anything touching a datablock is deferred to the modal
+    (_undo_needs_reconcile).
     """
     global _undo_needs_reconcile
 
@@ -4389,24 +3610,17 @@ def _on_undo_redo(
     if state is None:
         return
 
-    # Whatever the step restored, the running modal's own idea of the world is
-    # now a guess: its hovered patch, the preview geometry sitting in the
-    # viewport and the side references cached for the overlay all describe a
-    # mesh state that is gone. The modal picks this up on its next event.
+    # The modal reconciles on its next event.
     _undo_needs_reconcile = True
 
-    # A pick in progress described a composite this handler may not take off
-    # the mesh -- but the step has already put the mesh back to whatever it was
-    # holding, so there is nothing left to take off. Only the scene's record of
-    # it goes, which is the one thing here is allowed to write.
+    # The undo already restored the mesh: only drop the pick's record.
     state.pending_composite_id = -1
     state.surface_selection = ""
     state.active_face_id = -1
     state.generator_name = ""
     state.num_sides = 0
     state.num_loops = 1
-    # The snapshot belongs to a mesh state undo has just replaced; restoring it
-    # later would overwrite whatever the user undid back to.
+    # Never restore a snapshot from before the undo.
     state.editing_committed = False
     state.reedit_removed_faces = 0
     state.reedit_backup_mesh = ""
@@ -4426,11 +3640,7 @@ def _on_undo_redo(
 def _on_load_post(_path: str = "") -> None:
     """Restart the patch hover modal for a file that had it switched on.
 
-    A modal does not survive a file load, but the scene property that asks for
-    one does -- Blender stores it with the rest of the scene. Without this, a
-    file saved with the debug display on reopens with the display frozen on
-    whatever the cursor last pointed at, which reads as an overlay that has
-    stopped working rather than as a modal that is no longer there.
+    A modal does not survive a file load, but the property asking for it does.
     """
     overlay.debug_hover = None
     sync_patch_hover()
@@ -4444,7 +3654,7 @@ _HANDLERS = (
 
 
 def _register_handlers() -> None:
-    _unregister_handlers()  # never stack duplicates across an addon reload
+    _unregister_handlers()  # never stack duplicates across a reload
     bpy.app.handlers.undo_post.append(_on_undo_redo)
     bpy.app.handlers.redo_post.append(_on_undo_redo)
     bpy.app.handlers.load_post.append(_on_load_post)
@@ -4454,8 +3664,7 @@ def _unregister_handlers() -> None:
     for list_name, function_name in _HANDLERS:
         handlers = getattr(bpy.app.handlers, list_name)
         for handler in list(handlers):
-            # By name: a module reload leaves the previous function object
-            # registered, and it is no longer identical to this one.
+            # By name: a reload leaves the previous function object registered.
             if getattr(handler, "__name__", "") == function_name:
                 handlers.remove(handler)
 
@@ -4504,32 +3713,13 @@ _addon_keymaps: list[tuple[bpy.types.KeyMap, bpy.types.KeyMapItem]] = []
 def _register_keymaps() -> None:
     """Register every action in `keymap.ACTIONS` as a real KeyMapItem.
 
-    All of them, session keys included: that is what puts them in Blender's own
-    keymap editor and in the addon's preferences page, and what makes Blender
-    -- rather than a hand-rolled table -- own the editing, the conflict display
-    and the persistence. Each operator's `poll` is what decides whether the key
-    means anything right now, since an item in the 3D View keymap fires whether
-    a session is running or not.
-
-    Three items share `TAB` on purpose (U/V, hand-edit, back from hand-edit)
-    and their polls are mutually exclusive by phase. Blender walks the items
-    and runs the first whose poll passes, which is exactly the behaviour the
-    modal used to spell out.
-
-    The '/' override can't follow a scene property, so when "Keep Retopo in
-    Isolate" is off RETOP_OT_local_view just forwards to view3d.localview and
-    nothing about '/' changes. Its poll does follow the *session*, as every
-    GLOBAL key's now does (`_global_keys_live`): outside one the item is
-    skipped and the key belongs to Blender and to other addons again. Alt+X is the
-    mirror, as in Hard Ops -- the reflex the key is borrowed from, and symmetry
-    is reached for far more often than the x-ray, which is why the x-ray sits
-    on V. *Not* Alt+Z: that is Blender's own viewport X-ray and taking it
-    over cost more than it gave, and it is a different question anyway.
+    Session keys included. Each operator's poll decides whether its key means
+    anything right now. See "Keys" in CLAUDE.md.
     """
     _unregister_keymaps()
     keyconfig = bpy.context.window_manager.keyconfigs.addon
     if keyconfig is None:
-        return  # background/headless Blender has no addon keyconfig
+        return  # no addon keyconfig in --background
 
     km = keyconfig.keymaps.new(name='3D View', space_type='VIEW_3D')
     for action_id in keymap.ACTION_IDS:
@@ -4551,10 +3741,9 @@ def _unregister_keymaps() -> None:
         try:
             km.keymap_items.remove(kmi)
         except Exception:
-            pass  # the keymap can already be gone on a full reload
+            pass  # the keymap may already be gone on a reload
     _addon_keymaps.clear()
-    # The overlay reads live items through this to name its keys; leaving it
-    # holding freed ones would have a draw handler dereferencing them.
+    # Never leave the overlay holding freed items.
     keymap.forget_all()
 
 
@@ -4563,24 +3752,15 @@ def register() -> None:
         bpy.utils.register_class(cls)
     _register_handlers()
     _register_keymaps()
-    # Installed for the life of the addon, unlike the session's overlay: the
-    # patch data display describes an *imported* mesh, which is something you
-    # look at before any session exists. Its callback early-outs on the scene
-    # toggle, so the cost when it is off is one getattr per redraw -- and it can
-    # never be found missing after a file load, which is what arming a handler
-    # from a property update would risk.
+    # The debug display's handler stays installed for the life of the addon.
     overlay.enable_patch_debug()
-    # A reload unregisters the operator class out from under any running modal
-    # instance, so the flag is cleared on the way in rather than trusted; then
-    # a file that had the hover on gets it back.
+    # Never trust the flag after a reload.
     RETOP_OT_patch_hover.running = False
     sync_patch_hover()
 
 
 def unregister() -> None:
-    # A session could still be running (e.g. Reload Addon Only was clicked
-    # mid-session); leaving its draw handler behind would leak an overlay that
-    # nothing can remove afterwards.
+    # A session may still be running: never leak its draw handlers.
     overlay.disable()
     overlay.disable_patch_debug()
     overlay.debug_hover = None
@@ -4588,9 +3768,7 @@ def unregister() -> None:
     _unregister_keymaps()
     _unregister_handlers()
     for cls in reversed(CLASSES):
-        # Tolerant for the same reason `state._drop` is: `__init__.register`
-        # unwinds a failed registration through here, and the classes after the
-        # one that raised were never registered at all.
+        # Tolerant: a failed registration unwinds through here.
         try:
             bpy.utils.unregister_class(cls)
         except Exception:

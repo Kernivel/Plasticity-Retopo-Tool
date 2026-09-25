@@ -177,6 +177,60 @@ SVG with a typo renders as nothing at all, and the build will not say so.
 tabs and collapsible blocks are not. An unsupported extension builds cleanly and
 reads as broken, so write formulas as inline code.
 
+## Writing code comments and docstrings
+
+Comments in the code are read next to the code, by someone about to change it.
+They say what the code does and what must not be done to it. **The reasoning
+behind a decision belongs in this file, not in the comment.** Measurements,
+bugs that happened, alternatives that were rejected: all of that is CLAUDE.md
+material. A comment that needs a paragraph of justification should point to the
+invariant here instead.
+
+**Lead with what the thing is, in one line.** The first line of a module or
+function docstring names its job. Leave secondary duties off it: the reader
+will find them below.
+
+**Keep the rule, cut its derivation.** Keep a warning that prevents a mistake,
+and say what to do instead. Drop the chain of reasoning that led to it.
+
+**One sentence, one fact. Often one per line.** Split a sentence joined by a
+semicolon, a ` -- ` or a "so ..." into separate sentences, or drop the second
+half.
+
+**Point to the owner instead of re-explaining it.** "Use the span propagation
+registry below" is enough; the registry's own comment says how it works.
+
+**No history, no anecdotes.** Leave out "used to", what the old version did,
+what a bug looked like on screen, and fixture numbers. The code as it is now
+is the only thing a comment describes.
+
+**Name identifiers exactly** (`PATCH_ID_ATTR`, `result_lift`). Name the UI when
+something is a user setting ("configurable in the UI") rather than describing
+its effect at length.
+
+Before and after, from the `mesh_build.py` header:
+
+```text
+# before
+Stitching adjacent patches: only a patch's *corner* vertices are guaranteed
+to be exact, un-resampled source-mesh vertices, so they are the only points
+safe to weld across neighboring patches purely by identity (the same source
+vertex index always maps to the same welded result vertex). [...] To actually
+get matching spans (and therefore a fully welded, seam-free result), see the
+span propagation registry below: every commit records, per pair of corner
+vertex ids, the span used along that boundary; [...]
+
+# after
+Stitching adjacent patches: only a patch's *corner* vertices are guaranteed
+to be exact.
+[...]
+To actually get matching spans use the span propagation registry below.
+```
+
+The five-line story of why the preview is lifted a little more than the result
+became `Preview and result are lifted by the *same* measure (result_lift).`
+The story is already in the invariants below, which is where it belongs.
+
 ## Input data contract
 
 The bridge writes two custom properties on each imported mesh:

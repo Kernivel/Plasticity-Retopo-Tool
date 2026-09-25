@@ -1,46 +1,17 @@
 """Fallback generator for patches with five or more sides.
 
-**The centre vertex is unavoidable; its valence is not.** A quad mesh of an
-odd-sided region has to put an irregular vertex somewhere, and the middle is
-where every retopology tool puts it. What this used to do, though, was emit one
-quad per *boundary vertex* -- so the pole's valence was the side count times
-the span, twenty-four spokes on a six-sided patch at span four, and there was
-no interior grid at all: the only points inside the patch were that centre and
-one midpoint per boundary segment. On a curved face the result sags between
-them, which is the "it makes a fan" the shape reports on sight.
+The patch is split into one Coons sub-patch per side. Each side is split at its
+midpoint, a spoke runs from there to the centre, and the quad between two
+consecutive spokes is filled and reprojected like every other generator.
+The centre's valence is the number of sides.
 
-So the patch is split into **one Coons sub-patch per side** instead -- the
-first half of the ring around the reference tool's N-Side mode, and the first
-step of Catmull-Clark subdivision seen from the other end. Each side is split
-at its midpoint, a spoke runs from that midpoint to the centre, and the quad
-between two consecutive spokes (half a side, spoke, spoke, half the next side)
-is filled by the same Coons solver and reprojection every other generator uses.
-The pole's valence drops to the number of *sides*, the interior becomes a real
-grid, and every interior point is put on the surface through the BVH.
+A side's segment count is set by the spokes of its two neighbours
+(`side_segments`), so several sides can be matched at once.
+`spoke_allocation` solves the spokes, and refuses a count it cannot honour.
 
-**Which makes the sides largely independent, and that is what lets several of
-them be matched at once.** A side is bounded by the spokes of its two
-*neighbours* -- `t[i] = s[i-1] + s[i+1]`, its own spoke only saying where it is
-split -- so choosing the spokes chooses every side's count. A patch whose left side must reproduce one committed neighbour
-and whose bottom must reproduce another needs only two spokes to come out
-right, where the single shared span this used to have could honour one of them
-and left the other as a crack ("another side drives the same span" was the
-whole story on an N-Side patch).
+With nothing matched, every side carries an even count (`even_span`).
 
-`spoke_allocation` is that solve. It is deliberately not a general one: the
-constraint `s[i-1] + s[i] = t[i]` over a cycle is only always solvable for odd
-`n` and needs an alternating-sum condition for even `n`, so rather than fail on
-a shape it cannot satisfy, it takes the wanted counts in priority order, fixes
-what each one implies, and reports which it could not honour. The caller drops
-those matches like any other it cannot reproduce.
-
-With nothing matched every spoke is the same, so every side carries an **even**
-count -- it is split at one of its own vertices, and `even_span` is what rounds
-the uniform case up to something buildable.
-
-**Per-side spans in the panel and hand-placed corners** are still what the
-reference tool's full N-Side mode adds, and still not implemented: what is here
-is the machinery under them.
+See "An N-Side patch is one Coons sub-patch per side" in CLAUDE.md.
 """
 import math
 from typing import TYPE_CHECKING, Any
@@ -60,10 +31,8 @@ def plane_basis(
 ) -> "tuple[mathutils.Vector, mathutils.Vector, mathutils.Vector] | None":
     """(origin, u, v) for the plane a boundary best lies in, or None.
 
-    The area vector doubles as the normal: summing `a.cross(b)` around a closed
-    polyline is Newell's method, and it is what `ring.loop_area_vector` uses for
-    the same reason -- it survives a boundary that is not quite planar, which
-    every real patch is not.
+    The normal is the area vector (Newell's method), which tolerates a boundary
+    that is not quite planar.
     """
     if len(points) < 3:
         return None
@@ -74,8 +43,7 @@ def plane_basis(
         return None
     normal.normalize()
 
-    # Any edge that is not parallel to the normal will do for `u`; the longest
-    # one is the best conditioned.
+    # `u` is the edge least parallel to the normal.
     origin = points[0]
     edge = max((b - a for a, b in zip(points, points[1:] + points[:1])),
                key=lambda d: (d - normal * d.dot(normal)).length_squared)
@@ -125,43 +93,11 @@ def _distance_to_outline(point: tuple[float, float],
 def interior_point(boundary: list[mathutils.Vector]) -> mathutils.Vector:
     """A point inside `boundary`, for the patch's centre.
 
-    This used to be the mean of the boundary points, and on a **convex** patch
-    that is inside and nothing more is needed. A patch left by a boolean cut is
-    not convex, and there the mean lands *outside* the region: projecting it
-    onto the surface then pulls it to the nearest place on the surface, which
-    is the boundary itself. The two sub-patches meeting at that spoke are quads
-    `C -> M -> Z -> P` with `Z` sitting exactly on `M`, i.e. two corners in one
-    place -- a zero-area cell whose normal is decided by float noise. Measured
-    on `Cube Two Booleans`, that is 34 faces reported as facing into the
-    surface, an edge of 1.5e-8 and a worst aspect ratio of 7.5 million, with
-    the vertex count, face count and deviation all looking perfectly healthy.
-
-    Triangulating the boundary gives candidates that are inside by
-    construction, however concave the outline, and costs one tessellation of a
-    polyline the generator has already walked -- nothing beside the per-point
-    reprojection around it.
-
-    **Which** candidate is not a detail, and "the largest triangle's centroid"
-    is not the answer: measured, it fixed the patch that was folding and made a
-    neighbouring one fold that had been clean. Being inside is necessary and
-    not sufficient. Every spoke runs from the centre to a side's midpoint, so
-    what the fan actually needs is a centre the whole boundary can *see* -- a
-    point of the polygon's kernel -- and the failure when it is missing is a
-    spoke crossing the outline and the quads either side of it turning over.
-
-    Scoring each candidate by its distance to the nearest boundary segment and
-    keeping the furthest is a discrete stand-in for that: the deepest point of
-    the shape is the one most likely to see all of it, and it cannot be the
-    hair's breadth from an edge that a sliver's centroid is. It is not a proof:
-    a polygon whose kernel is empty has no valid centre at all, and no choice
-    here can invent one. Measured on `Cube Two Booleans` this takes the
-    unwelded coincident vertices from 100 to 9 and the worst aspect ratio from
-    7.5 million to 2.8 million, and leaves the faces facing into the surface
-    where they were -- so the fold it does not reach is a separate question,
-    still open.
-
-    Falls back to the mean when the boundary is degenerate or the tessellation
-    returns nothing -- the caller then behaves exactly as it did before.
+    Never the mean of the boundary: on a concave patch it lies outside.
+    Candidates are the centroids of a triangulation of the boundary, and the
+    one furthest from the outline wins.
+    Falls back to the mean when the boundary is degenerate.
+    See "An N-Side patch" in CLAUDE.md.
     """
     mean = mathutils.Vector((0.0, 0.0, 0.0))
     for point in boundary:
@@ -198,9 +134,8 @@ def interior_point(boundary: list[mathutils.Vector]) -> mathutils.Vector:
 def even_span(span: int) -> int:
     """The segment count per side an N-Side patch can actually build.
 
-    At least two, and even: the side is split at its midpoint and that midpoint
-    has to be one of its own vertices, or the sub-patches on either side of it
-    would not share a boundary.
+    At least two, and even: the midpoint where the side is split must be one of
+    its own vertices.
     """
     span = max(2, int(span))
     return span if span % 2 == 0 else span + 1
@@ -212,15 +147,13 @@ def spoke_allocation(
 ) -> tuple[list[int], list[int]]:
     """(spoke counts, side indices whose wanted count could not be honoured).
 
-    `wanted[i]` is the number of segments side `i` has to end up with -- a
-    committed neighbour's vertex count, almost always. Side `i`'s count is
-    `s[i-1] + s[i+1]` (see `side_segments`), so each wanted count fixes a
-    *pair* of spokes, and two sides two apart share one and can disagree. `order` is the priority to resolve them in
-    (a pin before an automatic match, then the denser one); whatever is left
-    undecided gets `default_half`.
+    `wanted[i]` is the segment count side `i` must end up with.
+    Each wanted count fixes a pair of spokes (`side_segments`).
+    `order` is the priority to resolve them in. Undecided spokes get
+    `default_half`.
 
-    Refusing rather than approximating is the point: a match that comes back
-    with a count nobody asked for is a crack that looks like a weld.
+    Never approximate: a count nobody asked for is a crack that looks like a
+    weld.
     """
     spokes: list[int | None] = [None] * n
     refused = []
@@ -229,8 +162,7 @@ def spoke_allocation(
         total = wanted.get(i)
         if total is None:
             continue
-        # The two spokes this side's count is made of -- its neighbours', not
-        # its own. See `side_segments`.
+        # This side's count is made of its neighbours' spokes (`side_segments`).
         before, after = (i - 1) % n, (i + 1) % n
         fixed_before, fixed_after = spokes[before], spokes[after]
         if fixed_before is None and fixed_after is None:
@@ -250,8 +182,7 @@ def spoke_allocation(
                 spokes[after] = None
                 refused.append(i)
         elif fixed_before + fixed_after != total:
-            # Both spokes are already spoken for by neighbours of this side and
-            # they do not add up to what it wants. Nothing to give.
+            # Both spokes are already fixed and do not add up to what it wants.
             refused.append(i)
 
     resolved = [default_half if spoke is None else spoke for spoke in spokes]
@@ -261,12 +192,8 @@ def spoke_allocation(
 def side_segments(spokes: list[int]) -> list[int]:
     """How many segments each side ends up with, given the spokes.
 
-    Side `i` is split where its own spoke leaves it. What lies *before* that
-    split is the bottom of sub-patch `i`, which has to be as long as that
-    sub-patch's other u-direction edge -- spoke `i-1`; what lies after is the
-    left edge of sub-patch `i+1`, which has to match spoke `i+1`. So a side is
-    bounded by the spokes of its two *neighbours*, not by its own: `t[i] =
-    s[i-1] + s[i+1]`, and its own spoke only says where the split falls.
+    `t[i] = s[i-1] + s[i+1]`: a side is bounded by its neighbours' spokes.
+    Its own spoke only says where the side is split.
     """
     n = len(spokes)
     return [spokes[(i - 1) % n] + spokes[(i + 1) % n] for i in range(n)]
@@ -303,26 +230,21 @@ class NSideGenerator(Generator):
             raise ValueError("NSideGenerator expects at least 3 sides")
 
         n = len(sides)
-        # Spokes, one per side, are what everything else is derived from: side
-        # `i` runs from spoke `i-1` to spoke `i`, so `spokes` decides every
-        # side's segment count and where its midpoint falls. Given none, they
-        # are uniform and every side comes out with the same even count.
+        # One spoke count per side. They decide every side's segment count and
+        # where it is split. Uniform when none are given.
         spokes_counts = list(span_settings.get("spokes") or ())
         if len(spokes_counts) != n or any(count < 1 for count in spokes_counts):
             spokes_counts = [even_span(span_settings.get("span", 2)) // 2] * n
         segments_of = side_segments(spokes_counts)
 
-        # Each side resampled to its own count, split at the vertex where its
-        # spoke leaves it -- `spokes[i-1]` segments in, the rest out.
+        # Each side resampled to its own count, split after `spokes[i-1]`
+        # segments.
         rings = [geometry.resample_polyline_by_arclength(side, count + 1)
                  for side, count in zip(sides, segments_of)]
         splits = [spokes_counts[(i - 1) % n] for i in range(n)]
 
-        # The centre has to be *inside* the boundary, and on a patch left by a
-        # boolean cut the mean of the boundary points is not -- see
-        # `interior_point`. Read off the sides themselves rather than off
-        # `rings`: the resample has already thrown away most of the outline's
-        # shape, and it is the shape that decides where inside is.
+        # The centre must be inside the boundary (`interior_point`).
+        # Read off the original sides, not `rings`, which lost the outline's shape.
         outline = [point for side in sides for point in side[:-1]]
         centre = interior_point(outline)
 
@@ -334,20 +256,11 @@ class NSideGenerator(Generator):
                 return hit[0]
             return point
 
-        # And the projection can undo it: `find_nearest` answers with the
-        # closest point *on the surface*, which for a centre sitting over a
-        # concave notch is back on the boundary. Keep the projected point only
-        # while it is still inside; the unprojected one is off the surface by
-        # the patch's own sag, which every interior row is anyway until the
-        # Coons grid reprojects it.
+        # Over a concave notch, the projection can land back on the boundary.
         centre = project(centre)
 
-        # One spoke per side, from that side's midpoint to the centre. Built
-        # once and shared by the two sub-patches either side of it, so nothing
-        # here relies on a later weld to close the seam between them.
-        # Straight, then reprojected -- the same answer the Coons interiors get,
-        # and for the same reason: the chord is where the point wants to be, the
-        # surface is where it has to sit.
+        # One spoke per side, from its midpoint to the centre, straight then
+        # reprojected. Shared by the two sub-patches either side of it.
         spokes = []
         for i, ring in enumerate(rings):
             midpoint = ring[splits[i]]
@@ -370,10 +283,8 @@ class NSideGenerator(Generator):
                 uv: tuple[float, float]) -> int:
             """Vertex index for `key`, creating it once.
 
-            Keyed rather than deduplicated by position: the sub-patches share
-            whole spokes and half-sides by construction, and knowing *which*
-            vertex is shared is exactly what keeps a merge-by-distance out of
-            the generator.
+            Keyed, never deduplicated by position: the sub-patches share spokes
+            and half-sides by construction.
             """
             existing = index_of.get(key)
             if existing is not None:
@@ -394,10 +305,8 @@ class NSideGenerator(Generator):
                        disc_uv(side_angle(side, t / segments_of[side]), 1.0))
 
         def spoke_index(side: int, k: int) -> int:
-            # Both ends of a spoke belong to something else: the midpoint is a
-            # boundary vertex and the far end is the one centre. Keyed as those,
-            # or the two sub-patches meeting along this spoke would each get
-            # their own copy of a point they are supposed to share.
+            # A spoke's ends are a boundary vertex and the centre, keyed as those
+            # so both sub-patches share them.
             if k == 0:
                 return boundary_index(side, splits[side])
             if k == spokes_counts[side]:
@@ -409,11 +318,8 @@ class NSideGenerator(Generator):
         faces = []
         for i in range(n):
             previous = (i - 1) % n
-            # The sub-patch between spoke `previous` and spoke `i`. Its two
-            # directions are those spokes' counts, which is exactly why the
-            # sides can differ: `span_u` is spoke `previous`, `span_v` is spoke
-            # `i`, and side `i` gets `span_u` segments before its midpoint and
-            # `span_v` after it.
+            # The sub-patch between spoke `previous` (span_u) and spoke `i`
+            # (span_v).
             span_u = spokes_counts[previous]
             span_v = spokes_counts[i]
             # Corners: C = this side's first point, M = its midpoint,
@@ -425,9 +331,7 @@ class NSideGenerator(Generator):
 
             grid = geometry.coons_patch_grid(bottom, right, top, left, span_u, span_v)
 
-            # The sub-patch's four corners on the disc, for its interior UVs.
-            # Computed rather than read back off the grid: the last row is not
-            # filled in yet when the interior of the first one is reached.
+            # The sub-patch's four corners on the UV disc, for its interior UVs.
             corner_uvs = (
                 disc_uv(side_angle(i, 0.0), 1.0),        # C
                 disc_uv(side_angle(i, splits[i] / segments_of[i]), 1.0),  # M
@@ -449,9 +353,7 @@ class NSideGenerator(Generator):
                         local[vi][ui] = boundary_index(
                             previous, segments_of[previous] - vi)
                     else:
-                        # Interior of this sub-patch: nothing else can reach it,
-                        # so it is created here and reprojected like every other
-                        # interior point.
+                        # Interior point: created here and reprojected.
                         uv_u = ui / span_u
                         uv_v = vi / span_v
                         uv = tuple(
@@ -474,7 +376,6 @@ class NSideGenerator(Generator):
 
         result = GenerationResult(verts, faces, uvs,
                                   corner_local_indices, boundary_local_indices)
-        # What each side actually got, for the commit path to register: with
-        # per-side counts there is no single span to recompute it from.
+        # Per-side counts, for the commit path to register.
         result.side_allocation = segments_of
         return result

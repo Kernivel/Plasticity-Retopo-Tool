@@ -1,14 +1,12 @@
-"""Grid generation (transfinite / Coons interpolation) and surface
-reprojection helpers, independent of any Blender operator/UI code so they can
-be unit-exercised from a --background script.
+"""Grid generation (Coons interpolation), surface reprojection and interior
+relaxation. Independent of any operator or UI code.
 """
 from typing import TYPE_CHECKING
 
 import mathutils
 
 if TYPE_CHECKING:
-    # Imported for annotations only, so the two BVH helpers keep pulling
-    # bvhtree in lazily the way they always have.
+    # Annotations only: the BVH helpers import bvhtree lazily.
     import bpy
     from mathutils.bvhtree import BVHTree
 
@@ -119,24 +117,15 @@ def fan_collapsed_grid(
     side_bc: list[mathutils.Vector],
     side_ca: list[mathutils.Vector],
 ) -> list[list[mathutils.Vector]]:
-    """Build a triangular-domain grid for a 3-sided patch A-B-C by feeding a
-    Coons quad solver a degenerate quad where one corner is repeated: quad
-    corners (P00, P10, P11, P01) = (A, B, C, C).
+    """Grid for a 3-sided patch A-B-C: a Coons quad with one corner repeated,
+    (P00, P10, P11, P01) = (A, B, C, C). The last row collapses to apex C.
 
-    This is the standard "fan" strategy for filling a triangular patch with a
-    regular grid: every row is a normal quad strip except the last, which
-    degenerates into a fan of triangles meeting at apex C.
+    side_ab : span_u+1 points, A -> B (the Coons bottom side)
+    side_bc : span_v+1 points, B -> C (the Coons right side)
+    side_ca : span_v+1 points, C -> A. Already in the order coons_patch_grid
+              expects for its left side: do NOT reverse it.
 
-    side_ab : span_u+1 points, A -> B (becomes the Coons "bottom" side)
-    side_bc : span_v+1 points, B -> C (becomes the Coons "right" side)
-    side_ca : span_v+1 points, C -> A. This already matches the "P01 -> P00"
-              (v=1..0 at u=0) convention coons_patch_grid expects for its left
-              side verbatim -- do NOT reverse it. Must have the same point
-              count as side_bc, since both run in the v direction of the
-              collapsed quad.
-
-    Returns grid[v][u] exactly like coons_patch_grid, where row v=span_v
-    (the last row) is constant and equal to apex C.
+    Returns grid[v][u] like coons_patch_grid.
     """
     if len(side_bc) != len(side_ca):
         raise ValueError("side_bc and side_ca must have the same point count (shared span)")
@@ -155,9 +144,7 @@ def build_bvh_with_polygon_map(mesh: "bpy.types.Mesh") -> tuple["BVHTree", list[
     """BVH over every polygon of `mesh` (local object space), plus a list
     mapping each BVH triangle index back to the polygon it came from.
 
-    BVHTree.FromPolygons reports the index of the triangle it hit, and
-    fan-triangulating a polygon emits several triangles, so the caller needs
-    that map to get back to a polygon (and from there to a Plasticity face id).
+    A hit reports a triangle index; the map turns it back into a polygon.
     """
     from mathutils.bvhtree import BVHTree
 
@@ -203,11 +190,7 @@ def build_bvh_for_polygons(
 
 
 # How far one relaxation pass moves a vertex towards the average of its
-# neighbours. Under-relaxed on purpose: the full step is a Jacobi iteration of
-# the Laplace equation, which oscillates on exactly the cells this exists to
-# fix -- a long thin cell against a concave boundary overshoots, lands on the
-# far side of its neighbours and comes back next pass. Half a step converges
-# monotonically and the difference is one more iteration.
+# neighbours. Under-relaxed on purpose: a full step oscillates.
 RELAX_STRENGTH = 0.5
 
 
@@ -218,23 +201,11 @@ def cell_quality(
     """How square a face is, in [0, 1]: 1 for a square or an equilateral
     triangle, 0 for a degenerate or turned-over one.
 
-    Two terms multiplied, because each one alone calls a bad cell good. The
-    sine of the **smallest corner angle** catches what is squashed or folded --
-    a cell crushed against a concave boundary has an acute corner, a folded one
-    has a corner at 180 degrees -- and says nothing at all about a 1x100
-    rectangle, whose corners are four perfect right angles. The ratio of the
-    **shortest edge to the longest** catches exactly that, and says nothing
-    about a rhombus with a 5 degree corner. A stretched cell is the complaint
-    this whole pass exists to answer, so the measure it is steered by has to see
-    both.
+    The sine of the smallest corner angle times the shortest edge over the
+    longest. Neither term alone will do: a 1x100 rectangle has perfect angles,
+    a thin rhombus has equal edges.
 
-    Cheap enough to run per incident face per vertex per pass: a cross product
-    and a length per corner.
-
-    `reference_normal` makes it directional: a face whose normal has turned past
-    a right angle from it scores 0 whatever its shape. That is what stops a step
-    from turning a cell over *while keeping it square*, which no measure of the
-    angles can see.
+    With `reference_normal`, a face turned more than 90 degrees from it scores 0.
     """
     count = len(points)
     if count < 3:
@@ -253,8 +224,7 @@ def cell_quality(
         after = points[(i + 1) % count] - points[i]
         if before.length_squared == 0.0 or after.length_squared == 0.0:
             return 0.0
-        # The sine of the corner angle, via the cross product, so a corner at 0
-        # degrees and one at 180 both score 0 -- collapsed and folded alike.
+        # Sine of the corner angle: 0 at both 0 and 180 degrees.
         worst_angle = min(
             worst_angle, before.normalized().cross(after.normalized()).length)
         length = after.length
@@ -266,15 +236,9 @@ def cell_quality(
     return worst_angle * (shortest / longest)
 
 
-# The cell quality a relaxation pass works up to, and stops at. A cell twice as
-# long as it is wide scores 0.5 and is an ordinary retopology cell, not a defect
-# -- a patch is rarely square and its grid follows it -- so that is where this
-# stops: it is a repair for what is *worse* than that, not a beautifier.
-#
-# It is also what makes the pass affordable on every hover. Only the vertices
-# touching a cell below the target are tried, so a patch with nothing wrong
-# costs one sweep of its faces and returns, and the cost of the rest scales with
-# the size of the problem rather than with the size of the patch.
+# The cell quality relaxation works up to, and stops at. A 2:1 cell scores 0.5.
+# Only vertices touching a cell below it are tried, which keeps the pass cheap
+# enough for every hover.
 RELAX_QUALITY_TARGET = 0.5
 
 
@@ -291,63 +255,21 @@ def relax_interior_points(
 
     Returns how many vertices ended up somewhere other than where they started.
 
-    A Coons grid interpolates between opposite sides, which is the right answer
-    for a four-sided region whose sides face each other and a poor one as soon
-    as they do not: against a concave boundary -- the rim of a hole, a slot's
-    flank -- the cells bunch against the concavity and stretch away from it, and
-    around an acute corner they collapse. None of that is decided by the
-    boundary, so no choice of corners or spans can fix it. Moving the *interior*
-    points is the answer, and it costs nothing elsewhere: the boundary is
-    pinned, so every vertex a neighbour welds to -- by identity for a corner, by
-    proximity for the rest -- stays exactly where the generator put it.
+    Returns how many vertices ended up somewhere other than where they started.
 
-    `pinned` is the generator's own `boundary_local_indices`, never recomputed
-    from the topology here. What makes a vertex untouchable is that something
-    outside this patch may weld to it, which is a fact about the patch and not
-    about whether an edge of the preview happens to carry one face.
+    `pinned` is the generator's own `boundary_local_indices`: the boundary never
+    moves, so every weld to a neighbour holds.
 
-    Four things about the method, each of which was the alternative:
+    - A move is kept only if it improves the worst cell it touches.
+    - Uniform weights, never cotangent: those go negative and can turn a cell
+      over.
+    - Jacobi: every vertex reads the previous pass, so the result does not
+      depend on vertex order.
+    - Reprojected every pass. Does nothing without a BVH.
+    - A step whose projection is longer than the step itself is refused: the
+      point left the patch.
 
-    - **A move is taken only if it improves the worst cell it touches.** A plain
-      Laplacian pass is not an improvement everywhere: on a grid that is already
-      regular it pulls the interior towards equal *edge lengths*, which is not
-      where transfinite interpolation put them -- measured across the fixture,
-      the unguarded version improved four shapes' cell quality and made three
-      others' worse. Scoring each incident face before and after
-      (`cell_quality`) and keeping the move only when the worst of them rises
-      makes the pass one-directional by construction: a patch it has nothing to
-      offer comes back exactly as the generator built it. That is the difference
-      between a knob that has to be tuned per part and one that can be left on.
-    - **Uniform weights, not cotangent.** Cotangent weights are the better
-      smoother on a fixed triangulation and they go *negative* on an obtuse
-      triangle, which lets a vertex leave the hull of its neighbours -- i.e.
-      turns a cell over, which is what this is here to remove. A plain average
-      is unconditionally a convex combination.
-    - **Jacobi, not Gauss-Seidel.** Every vertex in a pass reads the previous
-      pass's positions, so the outcome does not depend on the order the
-      generator happened to emit its vertices in. Two patches of the same shape
-      must relax the same way, or a shared boundary stops being reproducible.
-    - **Reprojected every pass, not once at the end.** A Laplacian step moves a
-      point towards the chord between its neighbours, which on a curved surface
-      is *inside* it; iterating without putting it back compounds into a visible
-      shrink, and the deviation this addon is measured by is precisely that
-      distance. So the relaxation is surface-constrained: step, project, repeat.
-      It follows that there is nothing to do without a BVH -- with reprojection
-      off this would be the shrink and nothing else -- and the caller is the one
-      that knows.
-
-    And a step whose *projection* is longer than the step itself is refused. On
-    a curved surface the correction after a tangential move is second order and
-    far shorter than the move; a projection longer than its own cause means the
-    point has left the patch, and `find_nearest` is then answering with the
-    nearest point on the **boundary**, which drags the vertex onto an edge and
-    turns over the cells either side of it. That is the concave-centre fold
-    `generators.nside.interior_point` exists to avoid, arrived at from the other
-    direction. A patch so coarse against its own curvature that every step is
-    refused simply holds still.
-
-    This runs on every hover, so what it costs when there is nothing to do
-    matters more than what it costs when there is: see `RELAX_QUALITY_TARGET`.
+    See "The interior is relaxed after the grid is built" in CLAUDE.md.
     """
     if iterations <= 0 or bvh is None or not verts or not faces:
         return 0
@@ -360,7 +282,7 @@ def relax_interior_points(
         for i in range(count):
             a = face[i]
             b = face[(i + 1) % count]
-            if a != b:  # a collapsed row (a fan's apex) names itself twice
+            if a != b:  # a fan's apex names itself twice
                 neighbours[a].add(b)
                 neighbours[b].add(a)
             if index not in incident[a]:
@@ -373,8 +295,7 @@ def relax_interior_points(
     start = [verts[i].copy() for i in free]
 
     for _ in range(iterations):
-        # One score per face per pass, not one per incident vertex: every
-        # candidate below reads its "before" from here.
+        # One score per face per pass, read by every candidate below.
         quality = [cell_quality([verts[vi] for vi in face]) for face in faces]
         active = [i for i in free
                   if any(quality[f] < target for f in incident[i])]
@@ -398,7 +319,7 @@ def relax_interior_points(
                 continue  # nothing to project onto: leave it where it is
             candidate = hit[0]
             if (candidate - stepped).length > step:
-                continue  # the step left the patch -- see the docstring
+                continue  # the step left the patch
 
             if _improves(verts, faces, incident[i], i, candidate,
                          min(quality[f] for f in incident[i])):
@@ -421,18 +342,11 @@ def _improves(
     to: "mathutils.Vector",
     before: "float | None" = None,
 ) -> bool:
-    """Whether putting vertex `moved` at `to` raises the quality of the *worst*
-    face it belongs to. `before` is that worst quality, when the caller has
-    already scored the faces this pass and need not do it twice.
+    """Whether putting vertex `moved` at `to` raises the quality of the worst
+    face it belongs to. `before` is that worst quality, if already known.
 
-    The worst one, not every one: a relaxation step almost always takes a little
-    from one cell to give to another -- that is what evening them out is -- so
-    requiring every incident face to improve would refuse essentially every move
-    and the pass would do nothing at all. What must not happen is the worst cell
-    getting worse, and that is what this answers.
-
-    Each face keeps its *own* normal as the reference, so "improved" can never
-    include having turned it over.
+    Each face is scored against its own normal, so turning it over never counts
+    as an improvement.
     """
     if before is None:
         before = min(cell_quality([verts[vi] for vi in faces[f]])

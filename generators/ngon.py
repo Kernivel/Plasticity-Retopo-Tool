@@ -1,56 +1,14 @@
-"""Single-n-gon patch: no interior grid, no spans.
+"""Single-n-gon patch: no interior grid, no spans. For flat faces.
 
-For a planar (or near-planar) face, a Coons grid is wasted geometry -- one
-n-gon following the boundary carries the same shape. What it still has to get
-right is the *boundary*: a straight side collapses to its two corners, while a
-curved side keeps enough points to stay round. That is the "densify curved
-edges" rule -- point count comes from how much the boundary turns, not from
-how long it is.
+The boundary is selected, never resampled: a vertex is kept every
+`ngon_angle` degrees of turn (`side_points`). Straight sides collapse to their
+corners, curves stay round, and a chamfer keeps its own vertex.
 
-**The boundary is selected, never resampled.** Points are *kept* from the
-source boundary rather than spread evenly along it by arc length, and that
-distinction is the whole correctness of this generator. `sides.py` only calls
-a vertex a corner when the boundary turns sharper than
-`corner_angle_threshold` (45 degrees of deviation by default), so a chamfer --
-which usually deviates 20-40 degrees -- is *not* a corner and lands in the
-middle of a side. Arc-length resampling put its points wherever the even
-spacing fell and cut a straight chord across the chamfer; accumulating turn
-and keeping the vertex where it happens reproduces it exactly, because the
-kept points are genuine CAD boundary vertices.
+A face with holes is filled by `generate_holed`: each hole is bridged with two
+edges into the face that contains it, so `k` holes give `k + 1` n-gons.
+Every bridge is checked (`_bridge_is_clear`) before it is drawn.
 
-The trade-off that buys: an n-gon side no longer lines up point-for-point with
-a *grid* neighbour along a shared edge (a grid resamples evenly, this doesn't),
-so only their shared corners weld. Raising `corner_angle_threshold` until the
-feature reads as a real corner restores both the shape and the welding.
-
-A face **with holes** is filled by `generate_holed`, which bridges each hole to
-the boundary around it with two edges. That is the only way to do it: a Blender
-n-gon has a single loop, and the alternative (one "keyhole" face running up to
-the hole and back) needs the bridge vertices duplicated, which the boundary weld
-would then merge back and destroy the face. Two faces need no duplicates and
-stay manifold.
-
-**Any number of holes, one at a time.** Each hole is bridged into whichever face
-already built *contains* it, splitting that one in two, so `k` holes come out as
-`k + 1` n-gons. The containment test is a point-in-polygon in the patch's own
-plane, which costs nothing and is available for free here: n-gon mode is only
-offered on a face that is already flat, so the projection is the face.
-
-**Where a bridge lands is arbitrary but not unchecked.** With one hole in a
-convex outline any pair of edges will do, which is why this started as "nearest
-pair, then roughly opposite" and stayed that way for a year. It stops being true
-the moment there is a second hole or a concave outline: a bridge drawn across
-another hole, or out through a notch in the boundary, leaves a face that
-self-intersects -- which Blender tessellates into a bowtie rather than
-refusing. So the old heuristic is still tried *first*, and kept when it is
-sound; `_bridge_is_clear` is what says whether it is, and a search over the
-remaining pairs by length is the fallback. A patch whose every pair fails takes
-the heuristic anyway: a bowtie is visible and fixable, and nothing is a better
-answer than something here.
-
-Reached explicitly (like the Ring generator, and unlike the span-based ones):
-it's a mode the user toggles during a session, not something a side count
-selects.
+A mode the user toggles, never selected by side count.
 """
 import math
 from typing import TYPE_CHECKING, Any
@@ -66,9 +24,8 @@ if TYPE_CHECKING:
 
 DEFAULT_ANGLE = 20.0  # degrees of boundary turn per kept point
 
-# Below this, a vertex is straight as far as anyone cares. Without it, the
-# rounding noise of a dense tessellation would accumulate along a dead-straight
-# edge and sprinkle it with pointless vertices.
+# Turns below this are ignored, so tessellation noise never accumulates along a
+# straight edge.
 TURN_EPSILON = 0.05
 
 
@@ -98,20 +55,10 @@ def side_points(
 ) -> list[mathutils.Vector]:
     """The boundary vertices this side keeps, first and last always included.
 
-    Walks the side accumulating how much it has turned since the last kept
-    vertex and keeps one every `angle_per_segment` degrees. Three behaviours
-    fall out of that single rule:
-
-    - a straight run never accumulates, so it collapses to its two corners
-      however long it is;
-    - a curve accumulates steadily, so it keeps a vertex every
-      `angle_per_segment` degrees of arc and stays round;
-    - a lone kink (a chamfer, a shallow crease) crosses the threshold on its
-      own vertex, so it is kept *exactly where it is* -- which is what an
-      arc-length resample could not do, and why chamfers used to be cut off.
-
-    A feature shallower than `angle_per_segment` is deliberately dropped: that
-    is what the setting means. Lower it to keep finer ones.
+    Keeps a vertex every time the accumulated turn reaches `angle_per_segment`
+    degrees. A straight run collapses to its two corners, a curve keeps a vertex
+    every `angle_per_segment` degrees, and a lone kink keeps its own vertex.
+    Features shallower than `angle_per_segment` are dropped.
     """
     if len(points) <= 2:
         return list(points)
@@ -146,18 +93,11 @@ def loop_points(
     """Walk one boundary loop's sides and return
     (points, corner_indices, segments_per_side).
 
-    Each side drops its last point -- it is the next side's first -- so the
-    result is a closed ring of distinct points, and `corner_indices` says where
-    in it each side started. Those are the patch's real corners, the only
-    points that weld across patches by identity.
+    `points` is a closed ring of distinct points; `corner_indices` says where
+    each side starts in it.
 
-    `forced_segments` maps a side's index in this loop to an exact segment
-    count, and switches that side from curvature selection to plain
-    arc-length resampling. That is the point of it: a neighbour that already
-    committed N segments along the shared edge put them at even spacing, so
-    matching the *count* is only half of it -- the positions have to match too,
-    or the two boundaries still don't weld. Every other side keeps following
-    its own curvature.
+    `forced_segments` maps a side's index to an exact segment count. That side
+    is resampled by arc length instead of by curvature.
     """
     forced_segments = forced_segments or {}
     points = []
@@ -198,8 +138,7 @@ def _plane_frame(
     points: list[mathutils.Vector],
 ) -> tuple[mathutils.Vector, mathutils.Vector, mathutils.Vector]:
     """(origin, tangent, bitangent) of a best-fit plane through `points`,
-    Newell's method. A patch retopped as an n-gon is planar or nearly so, so
-    this frame is the face itself rather than an approximation of it.
+    by Newell's method.
     """
     normal = mathutils.Vector((0.0, 0.0, 0.0))
     count = len(points)
@@ -212,8 +151,7 @@ def _plane_frame(
         normal = mathutils.Vector((0.0, 0.0, 1.0))
     normal.normalize()
 
-    # Any vector not parallel to the normal gives a usable tangent frame; UV
-    # rotation is arbitrary for a planar projection.
+    # Any vector not parallel to the normal will do: UV rotation is arbitrary.
     reference = (mathutils.Vector((1.0, 0.0, 0.0))
                  if abs(normal.x) < 0.9 else mathutils.Vector((0.0, 1.0, 0.0)))
     tangent = (reference - normal * reference.dot(normal)).normalized()
@@ -230,10 +168,7 @@ def _flatten(
 
 
 def _plane_uvs(points: list[mathutils.Vector]) -> list[tuple[float, float]]:
-    """UVs from a best-fit plane through the boundary, scaled into 0..1. A
-    patch retopped as an n-gon is planar or nearly so, which is exactly when a
-    planar projection is the right unwrap.
-    """
+    """UVs from a best-fit plane through the boundary, scaled into 0..1."""
     raw = _flatten(points, _plane_frame(points))
     min_u = min(u for u, _ in raw)
     max_u = max(u for u, _ in raw)
@@ -250,9 +185,8 @@ Segment2D = tuple[tuple[float, float], tuple[float, float]]
 
 # --- the 2D predicates a bridge is checked against -------------------------
 #
-# All of this runs in the patch's own plane, which is what lets it be this
-# plain: n-gon mode is only offered on a face that is already flat, so there is
-# no projection error to carry and nothing near-degenerate to be robust to.
+# All of this runs in the patch's own plane: n-gon mode is only offered on a
+# flat face.
 
 def _side_of(
     a: tuple[float, float], b: tuple[float, float], p: tuple[float, float]
@@ -267,10 +201,8 @@ def _segments_cross(
 ) -> bool:
     """Whether a-b and c-d cross *properly*, each strictly straddling the other.
 
-    Touching at a shared endpoint is deliberately not a crossing, and that is
-    the case that matters: a bridge starts and ends on a boundary vertex, so it
-    shares an endpoint with four boundary edges by construction, and a test
-    calling those crossings would refuse every bridge there is.
+    Touching at a shared endpoint is not a crossing: every bridge shares its
+    endpoints with boundary edges.
     """
     d1 = _side_of(a, b, c)
     d2 = _side_of(a, b, d)
@@ -305,12 +237,9 @@ def _bridge_is_clear(
 ) -> bool:
     """Whether a bridge from `start` to `end` stays inside the region.
 
-    Two conditions, and neither implies the other. It may cross no boundary
-    edge and no bridge already drawn, or the faces either side of it overlap.
-    And its midpoint must be inside the outer loop and outside every hole: a
-    segment between two vertices of one concave loop can clear every edge in
-    the patch and still run entirely *outside* the face, which is what a notch
-    in the outline does.
+    It must cross no boundary edge and no bridge already drawn.
+    Its midpoint must be inside the outer loop and outside every hole: a bridge
+    can cross no edge and still run outside a concave face.
     """
     midpoint = ((start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5)
     if not _point_inside(midpoint, loops_uv[0]):
@@ -336,11 +265,8 @@ def _containing_face(
 ) -> int:
     """Which of the faces built so far encloses `point`.
 
-    A hole yet to be cut lies strictly inside exactly one of them, so this is a
-    lookup rather than a judgement. It falls back to the first face instead of
-    raising: a point-in-polygon that answers nothing means the loops were not
-    what this was told they are, and a hole cut into the wrong face is easier
-    to see -- and to report -- than a patch that refused to generate at all.
+    Falls back to the first face rather than raising: a visibly wrong cut beats
+    a patch that refuses to generate.
     """
     for index, cycle in enumerate(faces):
         if _point_inside(point, [flat[v] for v in cycle]):
@@ -348,10 +274,7 @@ def _containing_face(
     return 0
 
 
-# A bridge is normally found on the first try, so this cap only bites on a
-# boundary that is genuinely hard to cut -- where scanning a dense outline
-# against a dense hole pair by pair would cost more than the fill itself, on
-# every hover.
+# Cap on the bridge search, which runs on every hover.
 MAX_BRIDGE_CANDIDATES = 400
 
 
@@ -381,11 +304,10 @@ def find_bridges(
 ) -> tuple[tuple[int, int], tuple[int, int]]:
     """The two bridges cutting `hole_uv` into `face_uv`, as positions in each.
 
-    The historical heuristic -- nearest pair, then roughly opposite it -- is
-    tried first and kept whenever it is sound, so a face that was already being
-    filled correctly comes out exactly as before. Only when it is not do we pay
-    for the search, and a boundary where nothing at all works takes the
-    heuristic anyway: a visible bowtie beats a face that was never emitted.
+    Tries the nearest pair, then roughly opposite it, and keeps them when both
+    are clear. Otherwise searches the pairs by length.
+    When nothing is clear, returns the heuristic anyway: a visible bowtie beats
+    a face that was never emitted.
     """
     n_face = len(face_uv)
     n_hole = len(hole_uv)
@@ -401,8 +323,7 @@ def find_bridges(
               key=lambda j: (hole_uv[j][0] - face_uv[i_b][0]) ** 2
               + (hole_uv[j][1] - face_uv[i_b][1]) ** 2)
     if j_b == j_a:
-        # Degenerate: the whole hole is nearest to one point. Any second
-        # attachment will do -- this is an arbitrary cut by definition.
+        # The whole hole is nearest to one point: any second attachment will do.
         j_b = (j_a + n_hole // 2) % n_hole
     heuristic = ((i_a, j_a), (i_b, j_b))
 
@@ -422,9 +343,8 @@ def find_bridges(
     if first is None:
         return heuristic
 
-    # The second bridge is kept away from the first, so neither face comes back
-    # a sliver: a cut leaving three vertices on one side is valid and useless.
-    # Relaxed to "not the same vertex" when nothing that far round works.
+    # Keep the second bridge a quarter of the way round from the first, so
+    # neither face is a sliver. Relaxed when nothing that far works.
     for gap_face, gap_hole in ((max(1, n_face // 4), max(1, n_hole // 4)), (1, 1)):
         for i, j in candidates:
             if _cyclic_gap(i, first[0], n_face) < gap_face:
@@ -452,10 +372,8 @@ class NgonGenerator(Generator):
         span_settings: dict[str, Any],
         bvh: "BVHTree | None" = None,
     ) -> GenerationResult:
-        """`sides` are the outer loop's sides in boundary order, consecutive
-        sides sharing their corner point. `bvh` is ignored: every vertex sits
-        on the boundary, i.e. already exactly on the CAD surface -- there is
-        nothing in the interior to reproject.
+        """`sides` are the outer loop's sides in boundary order.
+        `bvh` is ignored: every vertex is already on the boundary.
         """
         if not sides:
             raise ValueError("NgonGenerator needs at least one side")
@@ -485,17 +403,11 @@ class NgonGenerator(Generator):
         """Fill a face with one or more holes: `k` holes come back as `k + 1`
         n-gons, joined by two bridge edges each.
 
-        `loops_sides` is [outer_sides, hole_sides, ...], outer first (the caller
-        sorts them -- which loop comes out of the boundary walk first is hash
-        order). Corner indices are emitted in that same loop order, to match
-        the order `PreparedPatch.corner_source_ids` flattens them in, or the
-        welding would pair a corner with the wrong source vertex.
+        `loops_sides` is [outer_sides, hole_sides, ...], outer first.
+        Corner indices are emitted in that loop order, to match
+        `PreparedPatch.corner_source_ids`.
 
-        Holes are inserted one at a time, each into whichever face already
-        built contains it. That is what makes several of them work at all: a
-        hole cut into the wrong face leaves one face with a loop it does not
-        enclose and another enclosing a loop it never mentions, which no amount
-        of choosing the bridges well would repair.
+        Each hole is cut into the face already built that contains it.
         """
         if len(loops_sides) < 2:
             raise ValueError("generate_holed expects an outer loop and at least one hole")
@@ -538,9 +450,7 @@ class NgonGenerator(Generator):
             drawn.append((face_uv[a1], hole_uv[b1]))
             drawn.append((face_uv[a2], hole_uv[b2]))
 
-            # The hole's loop is wound opposite to the outer one (both are
-            # boundary half-edges of the same patch), so walking both *forward*
-            # is what closes each face consistently.
+            # A hole is wound opposite to the outer loop, so walk both forward.
             n_face = len(cycle)
             n_hole = len(hole)
             faces[target] = ([cycle[k] for k in _arc(a1, a2, n_face)]

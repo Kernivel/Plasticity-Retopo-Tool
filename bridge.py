@@ -1,37 +1,15 @@
 """Finding the Plasticity bridge addon, and drawing *its own* panel inside ours.
 
 The bridge (https://github.com/nkallen/plasticity-blender-addon, MIT,
-(c) 2023 Plastic Software, LLC) is what puts `mesh["groups"]` and
-`mesh["face_ids"]` on an imported mesh -- the whole input contract this addon
-reads. Nothing here talks to it at runtime, but the first thing a user does
-after changing the part in Plasticity is a *Refresh* in its panel, which means
-leaving the Retop tab for another one and coming back.
+(c) 2023 Plastic Software, LLC) writes `mesh["groups"]` and `mesh["face_ids"]`.
+Its panel is drawn in a Retop tab so Refresh is at hand.
 
-**Nothing is vendored and nothing is reimplemented.** A bundled copy would
-register the same classes the user's own installation does -- the bl_idnames
-are fixed (`wm.connect_button`, `wm.list`, `OBJECT_PT_plasticity_panel`) and so
-are a dozen `bpy.types.Scene.prop_plasticity_*` -- so whichever of the two
-unregisters first would strip the other's scene properties out from under it.
-That is the "already registered as a subclass" restart-Blender failure
-`__init__.register`'s unwind exists to make survivable, walked into on purpose.
-Bundling would not even buy what it looks like it buys: the protocol is
-negotiated with *Plasticity itself* at the handshake (the client fills
-`supported_messages` from what the server advertises), so a frozen client is
-the one that stops speaking when Plasticity updates, not the user's.
+Never vendor or reimplement it: a bundled copy would register the same classes
+as the user's own. See "The bridge's panel, inside ours" in CLAUDE.md.
 
-So the bridge is **detected and delegated to**. `draw_bridge_panel` calls the
-bridge's own `PlasticityPanel.draw` with a layout of our choosing, which is a
-1:1 copy in the strict sense -- the same code drawing the same rows, Connect /
-Server / Disconnect / Refresh included, following their updates for free. It
-is safe to do because that `draw` touches `self` only through `self.layout`:
-everything else it reads comes from `context.scene` and its own module-level
-client.
-
-What this module will *not* do is assume anything about the bridge beyond
-`bl_info`. Every read goes through `getattr` with a default, because a
-property has to be able to disappear in a later version without taking a panel
-draw down with it -- a `draw` that raises leaves a blank panel and no message,
-which reads exactly like a feature that does not work.
+`draw_bridge_panel` calls the bridge's own `PlasticityPanel.draw` with our
+layout. Every read goes through `getattr` with a default, and a panel draw
+never raises.
 """
 import sys
 import time
@@ -40,23 +18,14 @@ from typing import Any, NamedTuple
 
 import bpy
 
-# What the bridge calls itself in `bl_info`. The *package* name cannot be
-# matched on: it is whatever folder the user installed it under --
-# `plasticity-blender-addon`, `plasticity-blender-addon-main` from a zip of the
-# default branch, or `bl_ext.<repo>.<name>` as a 4.2+ extension.
+# What the bridge calls itself in `bl_info`. Never match on the package name,
+# which depends on how it was installed.
 BRIDGE_ADDON_NAME = "Plasticity"
 
-# The bridge this addon has been used against. Reported, never enforced: the
-# input contract is `groups` / `face_ids`, and a bridge that keeps it works
-# whatever its version number says. A version check that *blocked* would turn
-# every bridge update into a broken addon, which is the failure mode the check
-# is supposed to warn about.
+# The bridge version this addon has been tested with. Reported, never enforced.
 TESTED_VERSION = (2, 2, 1)
 
-# Scanning is a dict walk over `sys.modules`, and a panel draws on every mouse
-# move across it. Cheap, but not free, and the answer changes only when an
-# addon is enabled or disabled -- so a miss is remembered for this long, and
-# the bridge becoming available mid-session heals itself within it.
+# How long a failed lookup is remembered. A panel draws on every mouse move.
 _SCAN_TTL_SECONDS = 2.0
 
 _cached_name: str | None = None
@@ -66,10 +35,8 @@ _last_scan: float = 0.0
 class BridgeStatus(NamedTuple):
     """What the bridge is doing, as far as it can be read from outside it.
 
-    `installed` is the only field that can be trusted on its own: the rest come
-    back at their defaults both when the bridge is absent and when a future
-    version has renamed them, which are deliberately the same answer here --
-    neither is something a panel can act on.
+    Only `installed` is reliable on its own. The rest fall back to defaults
+    when the bridge is absent or has renamed them.
     """
     installed: bool
     version: tuple[int, ...] | None
@@ -82,9 +49,7 @@ class BridgeStatus(NamedTuple):
 def forget() -> None:
     """Drop the memoised lookup.
 
-    Needed by the tests, which install and remove a stand-in bridge faster than
-    the TTL. Not needed in Blender: enabling or disabling an addon is picked up
-    by the TTL on its own.
+    For the tests, which swap a stand-in bridge faster than the TTL.
     """
     global _cached_name, _last_scan
     _cached_name = None
@@ -92,14 +57,8 @@ def forget() -> None:
 
 
 def _looks_like_bridge(candidate: ModuleType | None) -> bool:
-    """Two facts, because neither is sufficient.
-
-    `bl_info["name"]` is the bridge's own claim to be the bridge, and it is
-    what an addon is identified by everywhere else in Blender. But this
-    addon's own package name also contains "plasticity", as does every one of
-    the bridge's submodules, so the name filter alone matches things that are
-    not it. `plasticity_client` is the module attribute everything else here
-    reads through, so requiring it means a match is also usable.
+    """`bl_info["name"]` must match, and the module must have
+    `plasticity_client`: the name alone also matches other modules.
     """
     info = getattr(candidate, "bl_info", None)
     if not isinstance(info, dict) or info.get("name") != BRIDGE_ADDON_NAME:
@@ -122,11 +81,7 @@ def _scan() -> str | None:
 def module() -> ModuleType | None:
     """The bridge's top-level module, or None when it isn't enabled.
 
-    The cached name is re-validated rather than trusted: disabling the bridge
-    leaves its entry in `sys.modules` in some Blender versions and removes it
-    in others, and reloading it replaces the object. Checking that what we hand
-    back still looks like the bridge costs one `getattr` and makes both
-    behaviours the same.
+    The cached name is re-validated on every call, never trusted.
     """
     global _cached_name, _last_scan
 
@@ -178,12 +133,8 @@ def version_note() -> str | None:
     """A sentence about the installed bridge's version, or None when there is
     nothing worth saying.
 
-    Silent on the tested version: a note that draws on every redraw to say only
-    "this is fine" is a note nobody reads on the day it stops saying that. A
-    *newer* bridge is not a fault either -- it is untested, and saying which of
-    the two it is, is the honest distinction. Nothing here blocks: the contract
-    is `groups` / `face_ids`, and a bridge that keeps it works whatever its
-    version says.
+    Silent on the tested version and older ones within the same major.
+    Never blocks anything.
     """
     state = status()
     if not state.installed:
@@ -208,10 +159,7 @@ class _PanelProxy:
     """Stands in for a `bpy.types.Panel` instance so the bridge's own `draw`
     can be given a layout of our choosing.
 
-    Passing our panel instance straight through would work and be wrong:
-    `self.layout` is then the whole N-panel, so the bridge's rows would land
-    outside the box they belong in and any nesting we do around them would be
-    ignored.
+    Passing our own panel would put the bridge's rows outside our box.
     """
 
     def __init__(self, layout: bpy.types.UILayout) -> None:
@@ -232,18 +180,14 @@ def draw_bridge_panel(layout: bpy.types.UILayout, context: bpy.types.Context) ->
     """Draw the bridge's own panel body into `layout`. Returns why it couldn't,
     or None when it did.
 
-    The exception is caught and *returned* rather than raised, because this is
-    called from a panel draw: one that raises aborts the rest of the panel and
-    prints to a console nobody has open, so the tab would simply be missing its
-    lower half with nothing saying why. The one thing this cannot undo is the
-    rows the bridge had already emitted before it raised -- so the caller
-    reports the failure underneath them, which is where the gap is.
+    Exceptions are returned as a sentence, never raised: this runs inside a
+    panel draw. The caller prints it under the rows already drawn.
     """
     panel = bridge_panel_class()
     if panel is None:
         return "The Plasticity bridge is installed but its panel could not be read."
     try:
         panel.draw(_PanelProxy(layout), context)
-    except Exception as exc:  # a panel draw may not raise; see above
+    except Exception as exc:  # a panel draw may not raise
         return f"The bridge's panel failed to draw: {type(exc).__name__}: {exc}"
     return None

@@ -2,17 +2,13 @@ from typing import Any
 
 import bpy
 
-# NOTE: no `from __future__ import annotations` here, nor in any other module
-# that registers a Blender class. Every property below is declared *as an
-# annotation* with nothing after an `=`, so PEP 563 stringifies the very thing
-# Blender reads to register it. Blender 5.0 resolves those strings back, but
-# bl_info says 4.2 and the failure mode is silent -- the group registers
-# nothing and the panel simply draws empty. See tests/test_registration.py.
+# NOTE: never `from __future__ import annotations` in a module that registers
+# a Blender class: properties are declared as annotations, and stringifying them
+# can silently register nothing. See tests/test_registration.py.
 
 
 def _live_update(self: "RetopPatchState", context: bpy.types.Context) -> None:
-    # Lazy import: operators.py isn't guaranteed to be loaded yet when this
-    # module's properties are first registered (see __init__.py import order).
+    # Lazy import: operators may not be loaded yet at registration.
     from . import operators
     operators.regenerate_active_preview(context)
 
@@ -55,11 +51,8 @@ def _patch_debug_update(
 ) -> None:
     """Start or stop the cursor-following modal, then redraw.
 
-    Hover needs a mouse position and a draw handler has none, so the debug
-    display's Hover scope is fed by a modal that does nothing but read it.
-    Starting it is deferred through a timer rather than done here: an update
-    callback runs with a restricted context, and `bpy.ops` with INVOKE_DEFAULT
-    wants a window -- the same reason the reload operator defers its own work.
+    The start is deferred through a timer: an update callback has a restricted
+    context.
     """
     from . import operators
     operators.sync_patch_hover()
@@ -69,10 +62,7 @@ def _patch_debug_update(
 def _redraw_update(self: "RetopPatchState", context: bpy.types.Context) -> None:
     """Tag the 3D views, for a property only a draw handler reads.
 
-    Blender redraws the viewport for a property some *Blender* drawing depends
-    on; an addon's own overlay is not that, so toggling one from the sidebar
-    would otherwise take effect on the next mouse move over the viewport and
-    read as a dead checkbox.
+    Blender does not redraw the viewport for an addon's own overlay setting.
     """
     for window in getattr(context.window_manager, "windows", ()):
         for area in window.screen.areas:
@@ -82,52 +72,37 @@ def _redraw_update(self: "RetopPatchState", context: bpy.types.Context) -> None:
 
 class RetopPatchState(bpy.types.PropertyGroup):
     active_face_id: bpy.props.IntProperty(name="Active Face Id", default=-1)
-    # The surfaces Shift+click has gathered, as a JSON list of face ids,
-    # waiting to be opened as one patch. A scene property rather than an
-    # attribute on the modal, for the same reason `typed_span` is: the
-    # operators that build it have no way to reach the running instance, and
-    # the overlay draws it.
+    # The surfaces Shift+click has gathered, as a JSON list of face ids.
+    # On the scene: the operators and the overlay cannot reach the modal.
     surface_selection: bpy.props.StringProperty(
         name="Surface Selection", default="", update=_redraw_update)
-    # The composite written to the mesh while those surfaces are being picked,
-    # so the preview can show the patch they make as it grows -- and so every
-    # way out of the pick can take it back apart again. -1 when there is none.
+    # The composite written to the mesh while surfaces are being picked, or -1.
+    # Every way out of the pick must take it back off.
     pending_composite_id: bpy.props.IntProperty(
         name="Pending Composite", default=-1)
-    # The surface Shift+click would take, while Shift is actually held. Written
-    # by the modal on every mouse move, read by the overlay -- the same
-    # arrangement `copy_hover_face_id` has, and for the same reason: a draw
-    # handler is given no event to read the keyboard or the pointer from.
+    # The surface Shift+click would take, while Shift is held, or -1.
+    # Written by the modal, read by the overlay.
     surface_hover_face_id: bpy.props.IntProperty(
         name="Surface Under Cursor", default=-1)
     generator_name: bpy.props.StringProperty(name="Generator", default="")
     num_sides: bpy.props.IntProperty(name="Num Sides", default=0)
-    # Whether N-gon mode can run on the active patch at all: it needs a flat
-    # face, and at most one hole. Written by the generation path, read by the
-    # panel and the N keybind so both can say why rather than just do nothing.
-    # Set when the corner detection produced a side count that should not be
-    # trusted -- the angle test flagging every boundary vertex of a coarsely
-    # tessellated circle, which is indistinguishable from a real polygon and so
-    # is reported rather than silently overruled.
+    # Why the side count should not be trusted, or "" (sides.corners_are_uniform).
     corner_warning: bpy.props.StringProperty(name="Corner Warning", default="")
-    # Why the generator in use is not the one the patch's shape would suggest --
-    # currently only "this annulus is not a band", which routes a plate with a
-    # small hole to the n-gon fill instead of a stretched ring.
+    # Why the generator differs from what the shape suggests, or "", e.g. a
+    # holed face routed to the n-gon fill.
     generator_note: bpy.props.StringProperty(name="Generator Note", default="")
+    # Whether N-gon mode can run on the active patch (it needs a flat face), and
+    # why not. Read by the panel and the N key.
     ngon_available: bpy.props.BoolProperty(name="N-gon Available", default=True)
     ngon_unavailable_reason: bpy.props.StringProperty(name="Why Not", default="")
-    # Boundary loops of the active patch: 1 is the usual case, 2 is a band
-    # (a face with a hole, or a tube) handled by the Ring generator, and more
-    # than 2 means only the outer boundary is used -- the panel says so.
+    # Boundary loops of the active patch. 2 may be a band; more means holes.
     num_loops: bpy.props.IntProperty(name="Boundary Loops", default=1)
     source_object_name: bpy.props.StringProperty(name="Source Object", default="")
-    # The active patch already existed in the result mesh: its geometry was
-    # taken out when it was picked (see mesh_build.remove_patch_from_result)
-    # and the snapshot below puts it back if the re-edit is discarded.
+    # The active patch was already committed: its faces were taken out on pick,
+    # and the snapshot below puts them back if the re-edit is discarded.
     editing_committed: bpy.props.BoolProperty(name="Re-editing Committed Patch", default=False)
     reedit_removed_faces: bpy.props.IntProperty(name="Faces Removed For Re-edit", default=0)
-    # Cached for the panel: counting committed patches walks the result mesh's
-    # face attribute, and the panel redraws on every mouse move during a session.
+    # Cached for the panel, which redraws on every mouse move.
     committed_patch_count: bpy.props.IntProperty(name="Committed Patches", default=0)
     reedit_backup_mesh: bpy.props.StringProperty(name="Re-edit Snapshot", default="")
     reedit_result_object: bpy.props.StringProperty(name="Re-edit Result Object", default="")
@@ -145,13 +120,12 @@ class RetopPatchState(bpy.types.PropertyGroup):
         description="Which span the mouse wheel adjusts on a quad patch (Tab switches)",
     )
 
-    # N-gon mode: fill the patch with a single face following its boundary
-    # instead of a span grid. Toggled with N during a session.
+    # N-gon mode: one face following the boundary instead of a grid. N toggles.
     ngon_mode: bpy.props.BoolProperty(
         name="N-gon", default=False,
         description="Fill the patch with one n-gon following its boundary instead of a span "
-                     "grid. Meant for flat faces, where a grid is only wasted geometry. Not "
-                     "available on a patch with a hole -- an n-gon has a single loop",
+                     "grid. Meant for flat faces, where a grid is only wasted geometry. A face "
+                     "with holes is filled as one n-gon per hole plus one",
         update=_live_update,
     )
     ngon_angle: bpy.props.FloatProperty(
@@ -184,9 +158,8 @@ class RetopPatchState(bpy.types.PropertyGroup):
                      "no committed neighbour are unaffected",
         update=_live_update,
     )
-    # How many sides wanted to drive the same span with different counts on the
-    # last generation. A grid has one count per direction, so only one of them
-    # can win; the panel says so rather than letting the loser look matched.
+    # How many matches were outvoted on the last generation: a grid has one
+    # count per direction. The panel reports it.
     match_conflicts: bpy.props.IntProperty(name="Match Conflicts", default=0)
     ngon_show_verts: bpy.props.BoolProperty(
         name="Show N-gon Vertices", default=True,
@@ -200,12 +173,6 @@ class RetopPatchState(bpy.types.PropertyGroup):
         description="Size of the N-gon vertex dots, in pixels",
     )
 
-    # Two settings, not one, because the two modes want opposite things from a
-    # corner. A grid's side count *chooses the generator*, so extra corners turn
-    # a quad into an N-Side and its clean grid into a fan -- which is what
-    # topological corners do to a bevel, whose long side borders face after
-    # face. An n-gon just follows the boundary: extra corners cost nothing there
-    # and are the only way a shallow chamfer survives.
     resolution: bpy.props.EnumProperty(
         name="Resolution",
         items=[
@@ -224,6 +191,8 @@ class RetopPatchState(bpy.types.PropertyGroup):
         update=_live_update,
     )
 
+    # Two settings, since the modes want opposite things: extra corners turn a
+    # grid into an N-Side fan, but cost an n-gon nothing. Behind Developer Mode.
     corner_method_spans: bpy.props.EnumProperty(
         name="Corners (Grid)",
         items=[
@@ -344,7 +313,7 @@ class RetopPatchState(bpy.types.PropertyGroup):
         description="Draw the retopology on top of everything else, so it stays visible through "
                      "the CAD surface and anything else in the scene. Off: it is occluded like "
                      "any other object, which is how you check it actually sits on the surface "
-                     "rather than floating off it. Alt+X toggles it",
+                     "rather than floating off it. V toggles it",
         update=_result_appearance_update,
     )
     result_show_wire: bpy.props.BoolProperty(
@@ -374,11 +343,6 @@ class RetopPatchState(bpy.types.PropertyGroup):
     )
 
     # --- CAD structure display (see cad_display.py) ---------------------------
-    #
-    # The bridge sends a triangle soup: which triangles belong to which CAD face
-    # is in the mesh, but nothing draws it, so a Plasticity import reads as one
-    # undifferentiated field of triangles. These put the model's own structure
-    # back on screen while a session runs.
     show_cad_edges: bpy.props.BoolProperty(
         name="Show CAD Edges", default=False,
         description="Draw the Plasticity edges -- the borders between CAD faces -- over the "
@@ -386,9 +350,7 @@ class RetopPatchState(bpy.types.PropertyGroup):
                      "writes into the mesh, so it needs no live connection. E toggles it",
     )
     show_brep_vertices: bpy.props.BoolProperty(
-        # Off by default: on a real part every junction is a dot, and a few
-        # hundred of them bury the edges they punctuate. It answers a question
-        # you ask about one corner, not one you leave standing.
+        # Off by default: hundreds of dots bury the edges.
         name="Show CAD Vertices", default=False,
         description="Dot every junction where two CAD edges meet -- a genuine B-rep vertex, as "
                      "opposed to the many boundary vertices the mesher put down. Those are the "
@@ -418,9 +380,7 @@ class RetopPatchState(bpy.types.PropertyGroup):
                      "model's layout readable; one patch is what keeps a dense part legible",
     )
     cad_display_xray: bpy.props.BoolProperty(
-        # Off by default: through-the-mesh reads well on a flat layout and
-        # turns a curved or enclosed part into a thicket, since the far side
-        # shows through the near one. The readable default is the honest one.
+        # Off by default: the far side would show through on a curved part.
         name="Draw Through the Mesh", default=False,
         description="Draw the CAD edges and surface flow over everything, including the parts of "
                      "the model in front of them. Off: they are occluded like real geometry, so "
@@ -429,11 +389,7 @@ class RetopPatchState(bpy.types.PropertyGroup):
                      "enough not to z-fight with the surface they lie on",
     )
     show_cracks: bpy.props.BoolProperty(
-        # On by default, unlike every other overlay here. The others answer a
-        # question you chose to ask; this one reports a defect in finished
-        # work, and it is invisible from every angle until you look for it --
-        # the two patches are still there, still the right shape, simply not
-        # joined. A warning nobody switched on is the only kind that warns.
+        # On by default, unlike the other overlays: it reports a defect.
         name="Show Cracked Borders", default=True,
         description="Dash the CAD edges where two committed patches were both retopologized but "
                      "did not weld to each other -- the seam left behind when one patch's spans "
@@ -502,12 +458,7 @@ class RetopPatchState(bpy.types.PropertyGroup):
                      "of fully welding",
     )
 
-    # --- picking a neighbour to match (see operators.adopt_side_reference) ---
-    #
-    # A patch's automatic span comes from whichever committed neighbour the
-    # propagation registry happens to answer for first, which is the wrong one
-    # as often as not on a patch with several retopped neighbours. This is the
-    # manual override: point at the shared boundary you actually want to match.
+    # --- matching a side to a committed neighbour (see sidematch.py) ---
     match_mode: bpy.props.BoolProperty(
         name="Match Neighbour", default=True,
         description="Highlight the sides of the patch being adjusted, so clicking one matches "
@@ -515,69 +466,37 @@ class RetopPatchState(bpy.types.PropertyGroup):
                      "nothing else to do while adjusting, so a click away from any side commits "
                      "and a click on one matches it. M turns the highlighting off",
     )
-    # Index into the active patch's flattened side list (all loops, in order),
-    # or -1. Written by the modal on mouse move, read by the overlay.
+    # Index into the active patch's flat side list, or -1. Written by the modal,
+    # read by the overlay.
     hovered_side: bpy.props.IntProperty(name="Hovered Side", default=-1)
-    # The committed patch under the cursor while another one is being adjusted,
-    # or -1: the one Ctrl+click would take a density from. Written by the modal
-    # on mouse move, read by the overlay, and never anything to act on by
-    # itself -- what the click does is decided when the click happens.
+    # The committed patch Ctrl+click would copy a density from, or -1.
+    # Written by the modal, read by the overlay.
     copy_hover_face_id: bpy.props.IntProperty(name="Copy Source", default=-1)
-    # The patch this one last copied a density from, and whether that copy was
-    # taken with the two spans exchanged. Clicking the same patch again turns
-    # that over -- which is the only way to resolve U against V, since neither
-    # patch has an opinion the other can read (see `copy_spans_from`). Per
-    # patch: cleared with the rest of it by `set_active_patch`.
+    # The patch last copied from, and whether U and V were swapped. Clicking it
+    # again swaps them. Per patch: cleared by `set_active_patch`.
     copy_source_face_id: bpy.props.IntProperty(name="Copied From", default=-1)
     copy_source_swapped: bpy.props.BoolProperty(name="Copied Swapped", default=False)
-    # {flat side index: segment count} as JSON, for N-gon mode -- a grid has
-    # nowhere to put a per-side count, so adopting a reference there writes
-    # span_u/span_v/span directly. Cleared whenever the active patch changes.
+    # {flat side index: PIN_* kind} as JSON: the sides matched or excluded by
+    # hand. Cleared whenever the active patch changes.
     side_overrides: bpy.props.StringProperty(name="Side Overrides", default="")
 
     # --- the corner set of the active patch (Ctrl+click a side to edit it) ---
     #
-    # A Plasticity face with five B-rep vertices is filled by the N-Side fan,
-    # and the fan is often not what the shape wants: a pentagon born of a quad
-    # with one corner cut reads as a *quad* whose bottom side is two sides in a
-    # row. Demoting that junction -- keeping the vertex, dropping its status as
-    # a side boundary -- is what turns the five sides into four groups, and
-    # `find_generator` then picks the Quad it should have had all along.
-    #
-    # A sub-state of ADJUST rather than a phase of its own: the patch is still
-    # open and still has spans, so every `session_phase == 'ADJUST'` test in the
-    # overlay and the operators stays true. What the flag does is take the
-    # mouse and the commit keys for the length of the edit -- see
-    # `operators._in_phase`, which is where the exclusion lives once.
+    # Grouping sides lets e.g. a five-sided face be built as a quad.
+    # A sub-state of ADJUST, not a phase: it takes the mouse and the commit keys
+    # while open (`operators._in_phase`).
     corner_edit: bpy.props.BoolProperty(name="Editing Corners", default=False)
-    # The side whose group bubble is under the cursor, by flat index. A corner
-    # is named by the side it *starts*, so side `i`'s bubble drives corner `i`
-    # and the two share one index space. Clicking it merges the side into the
-    # group before it, or splits it back out -- **binary, not a 1-2-3-4 cycle**,
-    # because a group has to be a contiguous arc of the boundary (it becomes one
-    # side of a Coons patch) and a free numbering can say things that are not a
-    # patch. Those two choices per side already express every valid grouping,
-    # `1,1,2,2,3,4` on a hexagon included; the number is only how it reads.
+    # The side whose group bubble is under the cursor, by flat index, or -1.
     hovered_bubble: bpy.props.IntProperty(name="Hovered Group Bubble", default=-1)
-    # {side index: group number} as JSON, for the sides whose number the user
-    # has actually set. Per patch: cleared by `set_active_patch` with the pins,
-    # since both name a side by an index that means nothing on the next patch.
-    # Only the changes are stored, not the whole numbering -- the default is
-    # one group per side and `sidematch.group_numbers` fills it in.
+    # {side index: group number} as JSON, only for sides the user changed
+    # (`sidematch.group_numbers` fills in the rest). Per patch.
     side_groups: bpy.props.StringProperty(name="Side Groups", default="")
-    # What is wrong with the current grouping, or "". A number used in two
-    # separate places, or a boundary left with one group -- reported rather
-    # than made unreachable, because a click whose outcome cannot be predicted
-    # from what is on screen is worse than one that can be undone.
+    # What is wrong with the current grouping, or "" (sidematch.group_problems).
     group_warning: bpy.props.StringProperty(name="Group Warning", default="")
-    # What to put back on Esc. The edit is a session in miniature -- several
-    # clicks, then accept or cancel -- so it owes the user a way out that does
-    # not commit the patch.
+    # The grouping to put back on Esc.
     side_groups_backup: bpy.props.StringProperty(name="Group Backup", default="")
     # {group key: segments} as JSON, set with Ctrl+wheel over a side in n-gon
-    # mode. A group of sides is resampled evenly to that count, split over its
-    # sides by length so the corners inside it stay vertices. Per patch, like
-    # the grouping it is keyed on (see `sidematch.ngon_group_key`).
+    # mode (`sidematch.ngon_group_key`). Per patch.
     ngon_group_counts: bpy.props.StringProperty(
         name="N-gon Side Counts", default="")
 
@@ -598,10 +517,8 @@ class RetopPatchState(bpy.types.PropertyGroup):
 
     # --- hand-editing the result mesh (see tweak.py) ---
     #
-    # Merge by distance, vertex snapping and the knife are Edit Mode operators,
-    # so correcting a failed match by hand means handing the viewport to
-    # Blender for a moment. These are the settings that round trip is set up
-    # with, plus the two strings it needs to undo the setup.
+    # The settings the Edit Mode round trip is set up with, and what it needs to
+    # undo the setup.
     tweak_merge_distance: bpy.props.FloatProperty(
         name="Auto-Merge Distance", default=1e-3, min=0.0, soft_max=100.0, precision=4,
         description="Threshold (in the Length Unit above) for Blender's Auto Merge while "
@@ -632,17 +549,13 @@ class RetopPatchState(bpy.types.PropertyGroup):
                      "vertex snapping, for when you are welding two retopo vertices together and "
                      "the surface is in the way",
     )
-    # Tool settings as they were before the round trip, as JSON. On the scene
-    # rather than a module global so an addon reload mid-edit doesn't lose the
-    # user's own snapping configuration.
+    # Tool settings before the round trip, as JSON. On the scene so a reload
+    # mid-edit keeps them.
     tweak_saved_tool_settings: bpy.props.StringProperty(
         name="Saved Tool Settings", default="")
     tweak_return_object: bpy.props.StringProperty(
         name="Hand-edit Return Object", default="")
     # The object the round trip is about, and the phase it started from.
-    # Neither is derivable afterwards when Tab was pressed in the OBJECT phase:
-    # the session holds no object there, and the repair on the way back needs
-    # one. Same reasoning as the settings snapshot for living on the scene.
     tweak_source_object: bpy.props.StringProperty(
         name="Hand-edit Source Object", default="")
     tweak_return_phase: bpy.props.StringProperty(
@@ -650,10 +563,8 @@ class RetopPatchState(bpy.types.PropertyGroup):
 
     # --- symmetry (see mesh_build.set_mirror_axes) ---
     #
-    # Which axes are on lives on the Mirror modifier itself, not here: they
-    # belong to one object, and two objects being retopped in the same file
-    # have no reason to agree on them. These two are how the mirror behaves,
-    # which is a preference and does carry across objects.
+    # The mirrored axes live on each object's Mirror modifier. These two are
+    # how the mirror behaves, for every object.
     mirror_clip: bpy.props.BoolProperty(
         name="Clip at the Plane", default=True,
         description="Stop vertices being dragged across the mirror plane while hand-editing, and "
@@ -661,10 +572,8 @@ class RetopPatchState(bpy.types.PropertyGroup):
                      "as the two halves overlapping",
         update=_mirror_settings_update,
     )
-    # Digits typed so far for direct span entry. On the scene rather than the
-    # modal instance because the keys that clear it -- U/V, N-gon, the span
-    # wheel -- are real operators now (see keymap.py), and an operator has no
-    # way to reach the running modal's attributes. The overlay echoes it.
+    # Digits typed so far for direct span entry. On the scene so the operators
+    # that clear it can reach it.
     typed_span: bpy.props.StringProperty(name="Typed Span", default="")
 
     mirror_merge_distance: bpy.props.FloatProperty(
@@ -705,10 +614,7 @@ class RetopPatchState(bpy.types.PropertyGroup):
              'OUTLINER_COLLECTION', 3),
             ('KEYS', "Keybinds", "Keyboard and mouse bindings of the session", 'EVENT_A', 4),
             ('SYSTEM', "System", "Version and addon reloading", 'PREFERENCES', 5),
-            # Last, not first, although the bridge is where the pipeline starts:
-            # the tabs are drawn in list order, so putting it first would shift
-            # every existing one along and cost the muscle memory of everyone
-            # who already uses them. Move it if it earns the first slot.
+            # Last, so the existing tabs keep their position.
             ('BRIDGE', "Bridge", "The Plasticity bridge's own panel, drawn here",
              'EVENT_P', 6),
         ],
@@ -723,10 +629,8 @@ class RetopPatchState(bpy.types.PropertyGroup):
 
     # --- patch data debug display (see cad_display.patch_labels) --------------
     #
-    # The raw numbers the bridge writes, on screen. Not a retopology control:
-    # this is for reading the *input*, when a patch comes out looking like it
-    # belongs to the wrong CAD face and the question is what the mesh actually
-    # says. Behind Developer Mode in the panel for that reason.
+    # The raw numbers the bridge writes, on screen, to debug the input.
+    # Behind Developer Mode.
     debug_patch_ids: bpy.props.BoolProperty(
         name="Show Patch Data", default=False,
         description="Write each patch's Plasticity face id over the surface, with the "
@@ -743,9 +647,7 @@ class RetopPatchState(bpy.types.PropertyGroup):
                                       "Edit Mode)", '', 1),
             ('ALL', "All", "Every patch at once -- a wall of text on a real part", '', 2),
         ],
-        # Hover by default: it is the only one that answers the question where
-        # the question is asked, without a selection to make first and unmake
-        # afterwards.
+        # Hover by default: it needs no selection and works in Edit Mode.
         default='HOVER',
         description="Which patches to label",
         update=_patch_debug_update,
@@ -767,18 +669,13 @@ class RetopPatchState(bpy.types.PropertyGroup):
     # --- collapsible UI sections (sub-sections inside a tab) ---
     show_patch_settings: bpy.props.BoolProperty(name="Patch Settings", default=True)
     show_ngon_settings: bpy.props.BoolProperty(name="N-gon Mode", default=True)
-    # One section, because there is one distance: the preview's lift *is* the
-    # result's, times a margin. Two panels each with an offset slider read as
-    # two independent settings, which is exactly what they are not.
+    # One section for preview and result: they share one offset.
     show_appearance: bpy.props.BoolProperty(name="Appearance", default=False)
     show_cad_structure: bpy.props.BoolProperty(name="Plasticity Structure", default=True)
 
 
-# Multipliers for the Resolution preset. Powers of two, so each step is one
-# subdivision level up or down -- a scale people already read by eye.
-# Powers of two so each step is one subdivision level, times 0.75 across the
-# board: what the generators compute from edge lengths reads about a quarter
-# too dense in practice, and every preset was inheriting that.
+# Multipliers for the Resolution preset: powers of two, times 0.75, since the
+# computed spans read about a quarter too dense.
 RESOLUTION_TRIM = 0.75
 RESOLUTION_FACTORS: dict[str, float] = {
     'VERY_LOW': 0.25 * RESOLUTION_TRIM,
@@ -794,10 +691,8 @@ def scale_default_spans(
 ) -> dict[str, Any]:
     """Apply the Resolution preset to a generator's computed spans.
 
-    Only ever the *computed* defaults: propagation from a committed neighbour
-    and the spans a patch was committed with are both applied after this, and
-    must both beat it -- scaling them would break the very welds they exist to
-    make.
+    Only the computed defaults. Propagated and committed spans are applied
+    after this and must never be scaled.
     """
     factor = RESOLUTION_FACTORS.get(state.resolution, 1.0)
     if factor == 1.0:
@@ -831,10 +726,8 @@ def register() -> None:
     bpy.types.Scene.plasticity_retop = bpy.props.PointerProperty(type=RetopPatchState)
 
 
-# Teardown has to survive a partial registration. `__init__.register` unwinds
-# the modules that took when a later one fails, so this can be handed classes
-# that never registered -- and an exception here would replace the one saying
-# why registration failed with one about the cleanup.
+# Teardown must survive a partial registration: it may be handed classes that
+# never registered.
 def _drop(cls) -> None:
     try:
         bpy.utils.unregister_class(cls)
@@ -843,8 +736,7 @@ def _drop(cls) -> None:
 
 
 def unregister() -> None:
-    # The property may never have been attached (a registration that failed
-    # between the classes and this line), so it is dropped rather than deleted.
+    # The property may never have been attached.
     if hasattr(bpy.types.Scene, "plasticity_retop"):
         del bpy.types.Scene.plasticity_retop
     for cls in reversed(CLASSES):

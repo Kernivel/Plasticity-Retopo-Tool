@@ -1,24 +1,17 @@
 """Parsing of Plasticity "patches" (CAD faces) out of the triangulated mesh
 produced by the plasticity-blender-addon bridge.
 
-The bridge stores two custom properties each imported mesh:
+The bridge stores two custom properties on each imported mesh:
   mesh["groups"]    -- flat list of [loop_start, loop_count] pairs, in polygon order
   mesh["face_ids"]  -- one Plasticity face id per group, same order as the pairs
 
-This means that len(groups) == 2*len(face_ids), with each pair in group matching a value in face_ids.
+So len(groups) == 2 * len(face_ids).
 
-A "patch" is the set of triangles that share one face_id. This module rebuilds,
-for a given mesh, the polygon->face_id mapping and the boundary loop(s) of each
-patch (the edges where a patch touches a different patch or the outer boundary
-of the solid).
+A "patch" is the set of polygons sharing one face id. This module rebuilds the
+polygon -> face id map and each patch's boundary loops.
 
-**Everything here is cached per mesh** (see `analyse`). The parse walks every
-polygon, builds a KD-tree over the vertices that can carry a duplicate and a
-directed-half-edge table over every triangle corner -- and the session used to redo all of it on *every mouse
-move*, because hovering a patch re-prepares it. On a CAD part of any size that
-is the difference between a smooth hover and a stuttering one. Nothing in a
-Plasticity mesh changes while it is being retopologized, so the result is keyed
-by a fingerprint of the mesh's own contents and reused until that changes.
+Everything is cached per mesh, keyed on a fingerprint of its contents (see
+`analyse`). Never re-parse on a hover.
 """
 import array
 import json
@@ -29,8 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # Annotations only: this module is pure mesh parsing and pulls the heavy
-    # Blender types in lazily, where it needs them at all.
+    # Annotations only: this module imports Blender lazily.
     import bpy
     import mathutils
 
@@ -61,18 +53,15 @@ class Patch:
 def polygon_face_ids(mesh: "bpy.types.Mesh") -> tuple[list[int], list[int]]:
     """Return a list mapping polygon index -> face_id, using mesh['groups']/['face_ids'].
 
-    Mirrors the group-walking logic used by the bridge itself when it writes
-    these attributes (handler.py: safe_mesh_import_data), so it stays correct
-    even though group ranges are expressed in loop-index space while we index
-    by polygon.
+    Walks the groups the way the bridge writes them (handler.py:
+    safe_mesh_import_data): ranges are in loop-index space.
     """
     groups = mesh.get("groups")
     face_ids = mesh.get("face_ids")
     n_polys = len(mesh.polygons)
 
     if not groups or not face_ids:
-        # No patch metadata (e.g. a plain, non-Plasticity mesh): treat everything
-        # as a single patch so callers still have something to work with.
+        # No patch data: the whole mesh is one patch.
         return [0] * n_polys, [-1] if n_polys else []
 
     result = [0] * n_polys
@@ -92,51 +81,28 @@ def polygon_face_ids(mesh: "bpy.types.Mesh") -> tuple[list[int], list[int]]:
 
 # --- One patch from several CAD faces ----------------------------------------
 #
-# One Plasticity face is one patch, and that is the whole input contract -- but
-# a CAD model is cut into faces by the modelling history, not by what wants a
-# single grid over it. A boss with two fillet rings around it is five surfaces
-# that the retopology has every reason to cross in one sheet, and the pipeline
-# already knows how to do that: `compute_boundary_loops` cancels every directed
-# edge whose reverse is emitted by the *same* patch, which is how a face's own
-# triangulation edges disappear. Hand it the union of several faces' polygons
-# and their shared borders cancel by exactly the same rule.
+# A composite is one patch over several Plasticity surfaces. It is assembled
+# here, at the parse, so everything downstream sees one patch with one id.
+# The borders between its surfaces cancel like triangulation edges do.
+# See "One patch can cover several CAD surfaces" in CLAUDE.md.
 #
-# A patch built that way is a **composite**, and it is assembled here, at the
-# parse, so that nothing downstream learns about it: corners, sides,
-# `find_generator`, matching, the commit, the re-edit, the crack report and
-# `cad_display` all keep seeing one patch with one id. Doing it at generation
-# time instead would mean teaching every one of them that an id can stand for a
-# set.
-#
-# The id a composite carries is synthetic and negative, below `NO_PATCH` (-1),
-# so it can never collide with a Plasticity face id nor with the sentinel the
-# result mesh already stamps on unclaimed faces. It is stored, because
-# `PATCH_ID_ATTR` on committed faces names it and has to keep meaning the same
-# patch across sessions and file loads.
+# Its id is synthetic and negative, at or below this, so it never collides with
+# a Plasticity face id or NO_PATCH (-1).
 COMPOSITE_ID_BASE = -1000
-# Mesh custom property holding them, as JSON: {"-1000": [12, 13, 14]}. On the
-# mesh rather than the object because that is what `analyse` is keyed by and
-# what the bridge writes `groups`/`face_ids` on -- a composite is a statement
-# about the same data those are.
+# Mesh custom property holding them, as JSON: {"-1000": [12, 13, 14]}.
 COMPOSITE_PROP = "retop_composites"
-# One point per surface of each composite, in mesh local space, parallel to its
-# surface list: {"-1000": [[x, y, z], ...]}. A face id is only a name, and
-# Plasticity renames faces -- a whole block of them shifted by a constant on a
-# real part, with no vertex moving -- so a composite that remembered nothing but
-# names could only be reported as lost. The position of a point inside each
-# surface is what survives a renumbering, and
-# `mesh_build.reanchor_composites` reads the surfaces back from it.
-# Kept apart from COMPOSITE_PROP so `mesh_fingerprint`, which reads that one,
-# is not invalidated by bookkeeping that changes nothing about the patches.
+# One point inside each surface of each composite, in mesh local space,
+# parallel to its surface list: {"-1000": [[x, y, z], ...]}.
+# Lets `mesh_build.reanchor_composites` find the surfaces again after Plasticity
+# renames them.
+# Kept apart from COMPOSITE_PROP, which `mesh_fingerprint` reads.
 COMPOSITE_ANCHORS_PROP = "retop_composite_anchors"
 
 
 def read_composites(mesh: "bpy.types.Mesh") -> dict[int, list[int]]:
     """The composites stored on `mesh`, as {composite id: [surface face ids]}.
 
-    Surfaces are always *raw* Plasticity face ids: adding one more to a
-    composite rebuilds it flat rather than nesting, so nothing here has to
-    resolve a chain.
+    Surfaces are always raw Plasticity face ids, never nested composites.
     """
     raw = mesh.get(COMPOSITE_PROP)
     if not raw:
@@ -144,7 +110,7 @@ def read_composites(mesh: "bpy.types.Mesh") -> dict[int, list[int]]:
     try:
         stored = json.loads(raw)
     except (TypeError, ValueError):
-        return {}  # hand-edited or written by something else: not our business
+        return {}  # not ours to read
     composites: dict[int, list[int]] = {}
     for key, surfaces in (stored or {}).items():
         try:
@@ -159,9 +125,8 @@ def write_composites(
 ) -> None:
     """Store `composites` on `mesh`, or drop the property when there are none.
 
-    The cache invalidates itself: `mesh_fingerprint` reads this property, so a
-    composite written here is picked up by the next `analyse` without anyone
-    having to remember to call `invalidate`.
+    `mesh_fingerprint` reads this property, so the cache invalidates itself.
+    Also writes the anchors.
     """
     if composites:
         mesh[COMPOSITE_PROP] = json.dumps(
@@ -174,8 +139,7 @@ def write_composites(
 def read_composite_anchors(
     mesh: "bpy.types.Mesh",
 ) -> dict[int, list[tuple[float, float, float]]]:
-    """The anchors stored beside the composites: {composite id: [point per
-    surface]}, each list parallel to that composite's surface list."""
+    """The stored anchors: {composite id: [one point per surface]}."""
     raw = mesh.get(COMPOSITE_ANCHORS_PROP)
     if not raw:
         return {}
@@ -197,11 +161,8 @@ def surface_anchor_points(
 ) -> list[tuple[float, float, float]] | None:
     """A point strictly inside each of `surfaces`, or None if one has no polygon.
 
-    A polygon *centre*, never the mean of the surface: the mean of a concave
-    face is outside it and the mean of an annulus is in its hole. The polygon
-    nearest that mean is on the surface by construction, and its centre is
-    inside the polygon rather than on an edge another surface shares -- which is
-    what lets the nearest-polygon lookup that reads it back be unambiguous.
+    The centre of the polygon nearest the surface's mean, never the mean itself:
+    that can lie outside a concave surface.
     """
     face_id_of_poly, _declared = polygon_face_ids(mesh)
     wanted = set(surfaces)
@@ -226,9 +187,7 @@ def _write_composite_anchors(
 ) -> None:
     """Anchor every composite whose surfaces the mesh still declares.
 
-    One that no longer applies keeps the anchors it had: those are exactly what
-    will find its surfaces again, and recomputing them from surfaces that are
-    gone would have nothing to read.
+    A composite that no longer applies keeps its previous anchors.
     """
     previous = read_composite_anchors(mesh)
     declared = set(mesh.get("face_ids") or ())
@@ -249,10 +208,8 @@ def _write_composite_anchors(
 
 
 def next_composite_id(composites: dict[int, list[int]]) -> int:
-    """An id no existing composite uses. Allocated downwards from
-    COMPOSITE_ID_BASE so it stays stable once written -- deriving it from a
-    position in the table would renumber every other one the moment a composite
-    was taken apart."""
+    """An id no existing composite uses, allocated downwards from
+    COMPOSITE_ID_BASE. Never reuse or renumber an id."""
     return min([COMPOSITE_ID_BASE + 1] + list(composites)) - 1
 
 
@@ -262,12 +219,9 @@ def applicable_composites(
     """Split the stored composites into the ones this mesh can still honour and
     the ids of the ones it cannot.
 
-    A composite needs two or more surfaces and every one of them still declared
-    by the mesh. A re-export renumbers every Plasticity face id even when no
-    vertex moves, so a stored composite *will* stop applying one day -- and one
-    that quietly stops applying looks exactly like an addon that forgot it, so
-    the ones that fell through are handed back for the panel to report rather
-    than dropped in silence.
+    A composite needs two or more surfaces, all declared by the mesh and
+    claimed by no other composite. Dropped ones are returned for the panel to
+    report.
     """
     composites = read_composites(mesh)
     if not composites:
@@ -279,8 +233,7 @@ def applicable_composites(
     dropped: list[int] = []
     for composite_id, surfaces in sorted(composites.items(), reverse=True):
         unique = list(dict.fromkeys(surfaces))
-        # `claimed` is not defensive book-keeping: two composites naming one
-        # face would put its polygons in both, and the second would silently win.
+        # Two composites naming one face: the later one is dropped.
         if len(unique) < 2 or not declared.issuperset(unique) or claimed.intersection(unique):
             dropped.append(composite_id)
             continue
@@ -292,9 +245,7 @@ def applicable_composites(
 def parse_surface_selection(raw: str) -> list[int]:
     """The face ids in a stored surface selection, in the order they were picked.
 
-    Here rather than in `operators` because the *overlay* has to read the same
-    string to draw it, and two parsers of one format is how they come to
-    disagree. Pure text: this module still pulls in no Blender.
+    Here so the overlay and the operators share one parser.
     """
     if not raw:
         return []
@@ -310,10 +261,8 @@ def format_surface_selection(face_ids: "Sequence[int]") -> str:
 
 
 def patch_neighbour_ids(patch: Patch) -> set[int]:
-    """Every face id this patch borders. What contiguity is checked against: a
-    composite whose surfaces only touch at a point has a pinched boundary, and
-    one whose surfaces do not touch at all has two outer loops, which the whole
-    loop-count pipeline reads as a band."""
+    """Every face id this patch borders. Used to check a composite is
+    contiguous."""
     return {neighbour for loop in patch.boundary_neighbours
             for neighbour in loop if neighbour is not NO_NEIGHBOUR}
 
@@ -325,12 +274,8 @@ def build_patches(
     """Return ({face_id: Patch} with poly_indices filled in and boundary_loops
     still empty, polygon->face-id map, every declared face id).
 
-    `composites` folds several Plasticity faces into one patch -- see the
-    section above. The remap is applied to the polygon->face-id map itself
-    rather than to the grouping alone, so `build_directed_owners` carries the
-    composite ids too and every later reader (the neighbour of a boundary
-    segment, the topological corner test, `cad_display`) is consistent with it
-    for free.
+    `composites` folds several faces into one patch. The remap is applied to
+    the polygon -> face id map itself, so every later reader agrees with it.
     """
     face_id_of_poly, face_ids = polygon_face_ids(mesh)
 
@@ -358,9 +303,7 @@ class GroupEntry:
     """One `[loop_start, loop_count]` pair, the face id it carries, and the
     polygons that pair turns out to cover.
 
-    `poly_start`/`poly_count` are derived rather than stored by the bridge: the
-    ranges are expressed in *loop* index space, and one group spans however many
-    polygons the tessellation of that CAD face took.
+    `poly_start`/`poly_count` are derived: the bridge stores loop ranges.
     """
     face_id: int
     loop_start: int
@@ -373,20 +316,13 @@ class GroupEntry:
 class GroupReport:
     """What `mesh["groups"]`/`["face_ids"]` say, and whether they still fit.
 
-    The ranges are read back rather than trusted because `polygon_face_ids`
-    walks them positionally: it advances to the next group when a polygon's
-    `loop_start` passes the current group's end. That is correct exactly while
-    the ranges still tile the mesh's loop array on polygon boundaries -- which
-    they do as imported, and stop doing the moment anything re-topologizes the
-    mesh underneath them (a triangulate, a decimate, a join, a modifier
-    applied). Nothing raises when they don't: polygons are simply assigned to
-    the wrong CAD face, so every patch boundary in the file is quietly wrong.
-    That is the one failure here worth reporting without being asked.
+    The ranges must tile the loop array on polygon boundaries. Anything that
+    re-topologizes the mesh after import breaks that silently, and
+    `polygon_face_ids` then assigns polygons to the wrong faces.
     """
     entries: list[GroupEntry]
     problems: list[str]
-    # polygon size (vertices) -> how many polygons have it. The bridge offers an
-    # untriangulated export, so this says which was used rather than assuming.
+    # polygon size (vertices) -> how many polygons have it.
     polygon_sizes: dict[int, int]
     loop_total: int
 
@@ -398,9 +334,7 @@ class GroupReport:
     def triangulated(self) -> bool:
         """Whether every polygon is a triangle. Vacuously true for an empty mesh.
 
-        Nothing here requires it -- `polygon_face_ids` walks loop ranges and
-        `geometry.build_bvh_with_polygon_map` fan-triangulates whatever it is
-        given -- so this is reported, never enforced.
+        Reported, never required.
         """
         return set(self.polygon_sizes) <= {3}
 
@@ -408,9 +342,7 @@ class GroupReport:
 def group_report(mesh: "bpy.types.Mesh") -> GroupReport:
     """Read `groups`/`face_ids` back out of `mesh`, with their integrity.
 
-    Walks the mesh once, at C speed where it can: the polygon loop ranges come
-    out through `foreach_get` rather than attribute access per polygon, since a
-    real part has tens of thousands of them and this is asked for from a panel.
+    Uses `foreach_get`: a panel asks for this.
     """
     groups = list(mesh.get("groups") or ())
     face_ids = list(mesh.get("face_ids") or ())
@@ -436,10 +368,8 @@ def group_report(mesh: "bpy.types.Mesh") -> GroupReport:
             f"{len(groups)} group values for {len(face_ids)} face ids "
             f"(expected {2 * len(face_ids)})")
 
-    # Which loop indices a polygon actually begins at. A group range that starts
-    # or ends anywhere else cannot be walked back to a whole polygon, which is
-    # the corruption worth naming -- `polygon_face_ids` would hand that
-    # polygon's triangles to whichever face the range happens to straddle.
+    # The loop index each polygon starts at. A range starting or ending
+    # anywhere else is corrupt.
     poly_at_loop = {int(start): index for index, start in enumerate(starts)}
 
     entries: list[GroupEntry] = []
@@ -481,9 +411,8 @@ def group_report(mesh: "bpy.types.Mesh") -> GroupReport:
 
     duplicates = [fid for fid, n in Counter(e.face_id for e in entries).items() if n > 1]
     if duplicates:
-        # Not fatal -- `build_patches` merges them into one patch, which is
-        # probably what was meant -- but the bridge emits one group per face, so
-        # this says the file is not what this code was written against.
+        # Not fatal (`build_patches` merges them), but the bridge emits one
+        # group per face.
         problems.append(
             "Face id repeated across groups: "
             + ", ".join(str(fid) for fid in duplicates[:6]))
@@ -500,25 +429,11 @@ def weld_candidates(mesh: "bpy.types.Mesh") -> Sequence[int] | None:
     edge that Blender's own connectivity leaves unshared (fewer than two
     polygons on it). Returned as a sorted index array.
 
-    A vertex strictly inside a patch, whose every edge already has a polygon
-    on both sides, is by construction not coincident with anything -- two
-    triangles sharing an edge share its vertex indices, so there is no second
-    copy of that point to merge it with. Only the borders between patches,
-    which the bridge tessellates once per face, put two vertices at the same
-    position.
+    An interior vertex already shares its index with its neighbours, so it has
+    no duplicate to merge.
 
-    Returns None when *every* vertex qualifies, which is the caller's signal
-    to skip the filtering entirely. That is what a fully unwelded soup looks
-    like -- every edge carries one polygon -- and it is why scoping the weld
-    is safe whatever the bridge turns out to emit: a mesh with no native
-    interior sharing degrades exactly to the old whole-mesh behaviour.
-
-    Every step is `foreach_get` plus a numpy reduction, because the Python
-    version of this cost more than the KD-tree it exists to shrink: counting
-    edge uses by hand is one interpreted iteration per triangle *corner*,
-    which on a real part is more work than welding the whole mesh. Without
-    numpy the answer is None -- filtering nothing is always correct, only
-    slower.
+    Returns None when every vertex qualifies (a fully unwelded soup), or
+    without numpy: the caller then welds the whole mesh.
     """
     try:
         import numpy as np
@@ -537,8 +452,7 @@ def weld_candidates(mesh: "bpy.types.Mesh") -> Sequence[int] | None:
         edge_verts = np.empty(n_edges * 2, dtype=np.int32)
         mesh.edges.foreach_get("vertices", edge_verts)
     except (AttributeError, TypeError, RuntimeError, ValueError):
-        # A Blender without `MeshLoop.edge_index`: weld everything rather than
-        # guess at the connectivity.
+        # No `MeshLoop.edge_index`: weld everything.
         return None
 
     uses = np.bincount(edge_of_loop, minlength=n_edges)
@@ -557,11 +471,7 @@ def weld_candidates(mesh: "bpy.types.Mesh") -> Sequence[int] | None:
 def shortest_edge(mesh: "bpy.types.Mesh") -> float:
     """The shortest non-degenerate edge of `mesh`, or infinity if it has none.
 
-    What the weld may not reach across. Computed with `foreach_get` plus a
-    numpy reduction where numpy is there, since it runs on every parse and the
-    Python version is one interpreted iteration per edge; without numpy the
-    answer is infinity, which is the previous behaviour exactly -- an uncapped
-    epsilon, only correct on a part whose features are all larger than it.
+    What the weld may not reach across. Infinity without numpy.
     """
     n_edges = len(mesh.edges)
     n_verts = len(mesh.vertices)
@@ -587,46 +497,15 @@ def build_weld_map(mesh: "bpy.types.Mesh", epsilon: float = 1e-5) -> list[int]:
     """Return a list mapping raw vertex index -> canonical "welded" vertex
     index, merging vertices within `epsilon` of each other.
 
-    The Plasticity bridge tessellates each CAD face independently, so the two
-    faces meeting along a B-rep edge each carry their own copy of every vertex
-    on it. Boundary detection has to treat those copies as one point, or every
-    patch border reads as two unrelated free edges -- and, on a mesh whose
-    interior is *also* unshared, every internal triangulation edge looks like a
-    patch boundary too. This mirrors a "Merge by Distance" pass without
-    modifying the mesh.
+    The bridge tessellates each face separately, so a shared border has two
+    copies of every vertex. Mirrors a Merge by Distance without modifying the
+    mesh. Only `weld_candidates` take part.
 
-    Only `weld_candidates` takes part: an interior vertex has nothing to merge
-    with, and leaving it out of the KD-tree both costs less and removes any
-    chance that proximity alone collapses two distinct points on a densely
-    tessellated fillet. When nothing can be excluded the whole mesh goes in,
-    which is the previous behaviour exactly.
+    The epsilon is capped at half the shortest edge: welding across a real edge
+    breaks the boundary walk.
 
-    **The epsilon is capped by the mesh's own shortest edge, and that cap is
-    not a refinement.** An edge is the mesh saying outright that its two ends
-    are distinct points of the surface; welding across one destroys it. The
-    triangle carrying it goes degenerate, its two directed corners are dropped
-    as `a == b`, and the patch's directed boundary -- balanced by construction,
-    one outgoing and one incoming per polygon corner -- stops being balanced.
-    `compute_boundary_loops` then walks into a dead end, hands back an *open
-    chain* as if it were a loop, and every reader closes it with `% n`: a chord
-    from its last vertex straight back to its first, drawn across a face the
-    model never divided, with the patch reporting five or seven boundary loops
-    where it has one. A part whose smallest features sit at the epsilon
-    triggers that readily -- on one, 205 real edges were collapsed in a single
-    object and 101 of its 245 loops came back open.
-
-    Capping rather than testing adjacency pair by pair, because the pairwise
-    test cannot answer this: when two genuinely distinct positions both fall
-    inside the epsilon, the cluster has to be *split* by position, and which
-    copy is edge-joined to which is an accident of how the bridge happened to
-    emit the triangles. Half the shortest edge is the largest radius at which
-    no cluster can span two of them. The copies this exists to merge are
-    unaffected: they are the same double rounded the same way twice, so they
-    sit at a distance of zero, not of the epsilon.
-
-    `epsilon` is absolute, in the mesh's own local units. See the note in
-    CLAUDE.md: on a part far from the origin it is close enough to the float32
-    ulp that two faces' copies of a shared vertex can fail to meet.
+    `epsilon` is absolute, in the mesh's local units. See "The weld may never
+    reach across a real edge" in CLAUDE.md.
     """
     from mathutils.kdtree import KDTree
 
@@ -669,14 +548,8 @@ def build_directed_owners(
 ) -> dict[tuple[int, int], int]:
     """(a, b) -> face id of the polygon that traverses that directed edge.
 
-    This is the closest thing to edge identity the bridge makes available. The
-    protocol carries no edge ids at all (only vertices/faces/normals/groups/
-    face_ids), but a patch's boundary half-edge (a, b) is matched by the
-    neighbouring patch's (b, a), so the *neighbour* of every boundary segment
-    is recoverable -- and the vertex where that neighbour changes is a genuine
-    B-rep vertex, the junction between two CAD edges.
-
-    Built once per mesh and shared by every patch, since it is global.
+    A patch's boundary half-edge (a, b) is matched by its neighbour's (b, a),
+    which names the neighbour. The bridge sends no edge data.
     """
     if weld_map is None:
         weld_map = range(len(mesh.vertices))
@@ -721,22 +594,16 @@ def compute_boundary_loops(
 ) -> list[Loop]:
     """Fill patch.boundary_loops from patch.poly_indices.
 
-    A boundary edge of the patch is an edge used by exactly one polygon of the
-    patch on one winding direction and by no other polygon of the *same*
-    patch on the other winding direction (i.e. it's a patch-to-patch or
-    patch-to-void border, not an internal triangulation edge).
+    A boundary half-edge is one whose reverse no other polygon of the same
+    patch emits.
 
-    `weld_map`, if given, maps each raw vertex index to a canonical index
-    shared by all vertices at (nearly) the same position -- required for
-    correct results on the Plasticity bridge's unwelded triangle soups (see
-    build_weld_map). The returned loop indices are expressed in this same
-    canonical space.
+    `weld_map` maps raw vertex indices to welded ones (`build_weld_map`). The
+    loops are returned in welded index space.
     """
     if weld_map is None:
         weld_map = range(len(mesh.vertices))  # identity mapping
 
-    # directed_edge (a, b) -> True if some polygon of the patch has this
-    # ordered edge in its loop (i.e. traverses a -> b along the polygon winding)
+    # Every directed edge (a, b) some polygon of the patch traverses.
     directed_present = set()
 
     for poly_idx in patch.poly_indices:
@@ -750,32 +617,16 @@ def compute_boundary_loops(
                 continue  # degenerate edge after welding
             directed_present.add((a, b))
 
-    # A directed edge (a, b) is a boundary half-edge of the patch if the
-    # reverse (b, a) is not also emitted by another polygon of this same
-    # patch (that would mean it's shared internally, i.e. both sides belong
-    # to the patch and cancel out).
-    # One vertex can carry more than one outgoing boundary half-edge -- a
-    # boundary that touches itself at a point -- so this is a multimap. Keyed
-    # by a single target, the second half-edge was dropped and the walk that
-    # needed it died.
+    # Boundary half-edges: those whose reverse is absent.
+    # A multimap: a vertex can carry several outgoing boundary half-edges.
     outgoing: dict[int, list[int]] = {}
     for (a, b) in directed_present:
         if (b, a) not in directed_present:
             outgoing.setdefault(a, []).append(b)
 
-    # Walk the half-edges into closed loops.
-    #
-    # A patch's directed boundary is balanced -- each polygon contributes one
-    # outgoing and one incoming at every corner, and cancelling a pair removes
-    # one of each at both ends -- so it decomposes into closed cycles and every
-    # walk returns to where it started. A chain that does *not* is the mesh
-    # telling us something is wrong with it, and it must not be handed back as
-    # a loop: every reader closes a loop with `% n`, so an open chain draws a
-    # chord from its last vertex to its first, straight across a face the model
-    # never divided, and counts as an extra boundary loop besides. Dropping the
-    # fragment loses part of one patch's border; keeping it invents geometry
-    # across the whole part. The usual cause was the weld collapsing a real
-    # edge, which `build_weld_map` no longer does.
+    # Walk the half-edges into closed loops. Only closed loops are returned:
+    # an open chain would be closed with `% n` by every reader, drawing a chord
+    # across the face.
     loops = []
     while outgoing:
         start = next(iter(outgoing))
@@ -806,28 +657,13 @@ def compute_boundary_loops(
     return loops
 
 
-# How far a boundary segment may sit off a foreign one before the two stop
-# being the same CAD edge, as a share of the whole mesh's extent.
-#
-# Of the *extent*, not of the segment's own length, and that is the whole of
-# it. Two faces sharing a CAD edge put their boundaries on the same curve, so
-# the only thing between their chords is float rounding, which scales with
-# coordinate magnitude and not with feature size. Measured across four objects
-# of a real part, a genuine shared border sits within 1e-7 of the extent at the
-# 95th percentile -- coincident, in other words. Scaling by the segment instead
-# lets a long one reach a long way *sideways*, which answers a different
-# question: a separate sheet 0.02 above a 4-unit edge is 0.5% of that edge and
-# would be taken as its neighbour (tests/test_match_specificity.py builds
-# exactly that stack-up). At a share of the extent it is 4e-3, four hundred
-# times outside this limit, while every real border is two orders inside it.
+# How far a boundary segment may sit off a foreign one and still be the same
+# CAD edge, as a share of the mesh's extent. Never of the segment's own length:
+# a long segment would then reach a separate sheet nearby.
+# See "A neighbour missed by half-edge pairing" in CLAUDE.md.
 NEIGHBOUR_GAP_RATIO = 1e-5
-# How many sample points the boundary index may hold. Segments are sampled at
-# one *uniform* spacing rather than a few points each, so that the query radius
-# is a constant and every lookup returns a handful of hits instead of however
-# many happen to lie within a multiple of the segment's own length. That
-# distinction is the difference between 8 seconds and a tenth of one on a
-# 35k-polygon object: a long straight edge searched at four times its own
-# length swept a large part of the mesh, once per orphan.
+# Max sample points in the boundary index. Segments are sampled at one uniform
+# spacing, so the query radius stays constant.
 NEIGHBOUR_INDEX_POINTS = 400_000
 
 
@@ -847,31 +683,13 @@ def resolve_neighbours_by_geometry(
 ) -> int:
     """Name the face across every boundary segment the half-edge pairing missed.
 
-    `boundary_neighbours_for_loop` finds the neighbour by looking for the same
-    edge walked the other way, which is exact and free -- and which requires
-    the two faces to have put the *same vertices* on the CAD edge they share.
-    Plasticity tessellates each face on its own, and on a real part it does not
-    always agree with itself: the finer side drops vertices in the middle of
-    the coarser side's segments, so the reversed half-edge is not there and the
-    segment reports no neighbour at all.
+    Half-edge pairing fails where two faces tessellate a shared edge
+    differently (a T-junction). The neighbour is then the patch whose own
+    boundary segment this one lies along.
 
-    That reads downstream as an open boundary, and an open boundary is not a
-    quiet degradation. `detect_topological_corners` fires wherever the
-    neighbour changes, so every one of those segments becomes a phantom B-rep
-    vertex; the side count is what picks the generator, so the patch is filled
-    by the wrong one; and `cad_display` draws the shared border as a string of
-    unrelated edges. Measured on one CAD part, 2327 of 4857 boundary segments
-    of a single object -- half of them -- came back unmatched this way.
-
-    So the pairing falls back to geometry for exactly those: the neighbour is
-    the patch whose own boundary segment this one *lies along*. Nothing here
-    touches a segment that already found its opposite, and nothing is built at
-    all when none of them missed -- a cleanly tessellated mesh pays only the
-    scan that finds nothing to do.
-
+    Only touches unpaired segments, and builds nothing when there are none.
+    A real open boundary is left alone.
     Mutates `boundary_neighbours` in place and returns how many it filled in.
-    A segment with genuinely nothing across it (a real open boundary) is left
-    alone, which is the honest answer rather than the nearest one.
     """
     from mathutils.kdtree import KDTree
 
@@ -904,10 +722,8 @@ def resolve_neighbours_by_geometry(
     if limit <= 0.0:
         return 0
 
-    # Sample every segment at one spacing, so the index resolves the boundary
-    # evenly however coarsely any single face was tessellated. The median
-    # segment is the natural choice -- it is what the mesher itself settled on
-    # -- floored so a part with a few very long edges cannot blow the index up.
+    # One spacing for every segment: the median segment length, floored so
+    # the index stays bounded.
     lengths = sorted((b - a).length for _owner, a, b in segments)
     total_length = sum(lengths)
     spacing = max(lengths[len(lengths) // 2],
@@ -974,13 +790,10 @@ def loop_extent(loop: Loop, positions: Positions) -> float:
 
 
 def sort_loops_outer_first(loops: list[Loop], positions: Positions) -> list[Loop]:
-    """Order a patch's boundary loops with the outer one first.
+    """Order a patch's boundary loops with the outer one (largest extent) first.
 
-    compute_boundary_loops walks a *set* of half-edges, so the order it returns
-    depends on hash iteration -- on a patch with a hole, "the first loop" could
-    just as easily be the hole. Anything picking a single loop must go through
-    here, or it silently retopologizes the hole instead of the face. The outer
-    boundary is the one enclosing the others, so it has the largest extent.
+    Loop order out of compute_boundary_loops is random: anything picking a
+    single loop must go through here.
     """
     return sorted(loops, key=lambda loop: loop_extent(loop, positions), reverse=True)
 
@@ -989,10 +802,7 @@ def sort_loops_outer_first(loops: list[Loop], positions: Positions) -> list[Loop
 class MeshPatches:
     """Everything one parse of a mesh produces, cached as a unit.
 
-    Handed out read-only: callers may look at any of it, but anything that
-    wants to *change* a patch must copy first, or the next hover inherits the
-    edit. `positions` in particular is shared, which is why
-    `generators.base.resolve_side_points` copies each point it hands on.
+    Shared and read-only: copy before changing anything.
     """
     patches: dict[int, Patch]      # face_id -> Patch, boundary loops computed
     face_id_of_poly: list[int]     # polygon index -> face id
@@ -1001,27 +811,19 @@ class MeshPatches:
     # (a, b) -> face id traversing that directed edge
     directed_owners: dict[tuple[int, int], int]
     positions: Positions           # vertex index -> mesh local space
-    # composite patch id -> the Plasticity surfaces it stands for. Empty on a
-    # mesh nobody has built one on, which is every mesh until asked.
+    # composite patch id -> the Plasticity surfaces it stands for.
     composites: dict[int, list[int]] = field(default_factory=dict)
-    # Composites that could not be applied -- a surface the mesh no longer
-    # declares, which is what a re-export leaves behind. Reported, never kept.
+    # Composites that could not be applied. Reported by the panel.
     dropped_composites: list[int] = field(default_factory=list)
 
 
 def mesh_fingerprint(mesh: "bpy.types.Mesh") -> Fingerprint:
-    """A cheap value that changes whenever the mesh's geometry does.
+    """A cheap value that changes whenever the mesh or its composites do.
 
-    Counts alone are not enough: the bridge re-imports into the *same*
-    datablock, and a moved vertex with the topology untouched has to invalidate
-    too. So the vertex coordinates go through a CRC -- one C-level
-    `foreach_get` plus one CRC pass, which is orders of magnitude cheaper than
-    the parse it guards (a KD-tree over the same vertices, and a Python loop
-    over every triangle corner).
+    A CRC of the vertex coordinates and ids, since the bridge re-imports into
+    the same datablock.
     """
-    # The composites are part of what `analyse` produces, so they are part of
-    # what invalidates it: joining two surfaces moves no vertex, and without
-    # this the cached analysis would keep handing back the patches from before.
+    # Composites are included: writing one moves no vertex.
     composites = str(mesh.get(COMPOSITE_PROP) or "")
     return geometry_fingerprint(mesh) + (zlib.crc32(composites.encode("utf-8")),)
 
@@ -1029,16 +831,9 @@ def mesh_fingerprint(mesh: "bpy.types.Mesh") -> Fingerprint:
 def geometry_fingerprint(mesh: "bpy.types.Mesh") -> "tuple[int, int, int, int, int, int]":
     """The same, minus the composites -- what the mesh's own surfaces depend on.
 
-    Kept apart so that building a composite does not invalidate everything that
-    describes the *model*: the B-rep edges and vertices `cad_display` draws are
-    the same curves before and after, and rebuilding them on every Shift+click
-    would be a full re-parse for a picture that did not change.
-
-    The ids the bridge wrote are part of it, not only their count: Plasticity
-    renames faces without moving a vertex (a whole block shifted by a constant,
-    on a real part), and a fingerprint blind to that kept handing back the
-    patches under their old names until something else invalidated the cache.
-    One entry per *face*, not per polygon, so it costs next to nothing.
+    Used by what describes the model itself, which a composite does not change.
+    Includes the face ids and groups: Plasticity can rename faces without
+    moving a vertex.
     """
     count = len(mesh.vertices)
     coords = array.array("f", bytes(4 * 3 * count))
@@ -1051,13 +846,9 @@ def geometry_fingerprint(mesh: "bpy.types.Mesh") -> "tuple[int, int, int, int, i
             len(face_ids), zlib.crc32(coords.tobytes()), zlib.crc32(ids.tobytes()))
 
 
-# mesh name -> (fingerprint, MeshPatches). Keyed by name rather than by the
-# datablock so a dead mesh can never keep itself alive through this dict; a
-# stale entry under a reused name is caught by the fingerprint anyway.
+# mesh name -> (fingerprint, MeshPatches). Keyed by name, never by datablock.
 _cache: dict[str, tuple[Fingerprint, "MeshPatches"]] = {}
-# The same, with no composite applied -- see `analyse_surfaces`. A second slot
-# rather than a second dict keyed differently, so `invalidate` has one place to
-# clear and the limit still counts meshes rather than parses.
+# The same, with no composite applied (`analyse_surfaces`).
 _surface_cache: dict[str, tuple["tuple[int, ...]", "MeshPatches"]] = {}
 _CACHE_LIMIT = 8  # a session works on one object; a few neighbours is plenty
 
@@ -1065,9 +856,7 @@ _CACHE_LIMIT = 8  # a session works on one object; a few neighbours is plenty
 def invalidate(mesh: "bpy.types.Mesh | None" = None) -> None:
     """Drop the cached parse of `mesh`, or of everything when given nothing.
 
-    Only needed when a mesh changes in a way the fingerprint cannot see -- it
-    sees geometry, not the `groups`/`face_ids` custom properties being rewritten
-    with identical counts. Called on addon reload and when a session ends.
+    Called on addon reload and when a session ends.
     """
     if mesh is None:
         _cache.clear()
@@ -1080,18 +869,14 @@ def invalidate(mesh: "bpy.types.Mesh | None" = None) -> None:
 def analyse(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> MeshPatches:
     """The full parse of `mesh`, from cache when the mesh has not changed.
 
-    This is the entry point everything else should use: patches, their boundary
-    loops, the polygon->face-id map, the weld map, the directed-owner table and
-    the vertex positions all come out of one pass and are consistent with each
-    other by construction.
+    The single entry point: everything in the result comes from one pass.
     """
     fingerprint = mesh_fingerprint(mesh)
     cached = _cache.get(mesh.name)
     if cached is not None and cached[0] == fingerprint:
         return cached[1]
 
-    # The declared ids straight off the mesh, not through `polygon_face_ids`:
-    # that walks every polygon, and all this needs is the list the bridge wrote.
+    # The declared ids straight off the mesh: no polygon walk needed.
     composites, dropped_composites = applicable_composites(
         mesh, mesh.get("face_ids") or ())
     analysis = _parse(mesh, weld_epsilon, composites, dropped_composites)
@@ -1106,15 +891,8 @@ def analyse_surfaces(mesh: "bpy.types.Mesh", weld_epsilon: float = 1e-5) -> Mesh
     """The same parse with **no composite applied**: one patch per Plasticity
     surface, as the bridge wrote them.
 
-    What describes the *model* rather than the work reads this -- the B-rep
-    edges and vertices `cad_display` draws, and the surface picker, which has
-    to name the individual surface under the cursor even when it is already
-    part of a patch. A composite is this addon's decision; the edges the model
-    was built from do not stop existing because a patch was laid across them,
-    and an overlay that says they did is reporting the wrong thing.
-
-    On a mesh with no composite it hands back `analyse`'s own result, so
-    nothing pays for a second parse until someone builds one.
+    For what describes the model: CAD edges and vertices, the surface picker.
+    Returns `analyse`'s own result when the mesh has no composite.
     """
     composites, _dropped = applicable_composites(mesh, mesh.get("face_ids") or ())
     if not composites:
@@ -1139,9 +917,7 @@ def _parse(
     composites: dict[int, list[int]],
     dropped_composites: list[int],
 ) -> MeshPatches:
-    """One full parse. Shared by `analyse` and `analyse_surfaces`, which differ
-    only in whether the composites are folded in -- everything below is the
-    same work either way, and two copies of it would drift."""
+    """One full parse, shared by `analyse` and `analyse_surfaces`."""
     patches, face_id_of_poly, face_ids = build_patches(mesh, composites)
     weld_map = build_weld_map(mesh, weld_epsilon)
     directed_owners = build_directed_owners(mesh, face_id_of_poly, weld_map)
@@ -1149,8 +925,7 @@ def _parse(
         compute_boundary_loops(mesh, patch, face_id_of_poly, weld_map, directed_owners)
 
     positions = {v.index: v.co.copy() for v in mesh.vertices}
-    # Only after every patch has its loops: the fallback pairs a segment with
-    # another patch's segment, so it needs all of them to exist first.
+    # After every patch has its loops: the fallback needs all of them.
     resolve_neighbours_by_geometry(patches, positions)
 
     return MeshPatches(

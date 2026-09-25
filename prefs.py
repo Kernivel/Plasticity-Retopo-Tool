@@ -1,22 +1,9 @@
 """The addon's preferences page, which is where the keybinds live.
 
-Drawn with `rna_keymap_ui.draw_kmi` -- Blender's own keymap rows, the ones the
-keymap editor uses. Not a stylistic choice: the keys *are* real `KeyMapItem`s
-(see keymap.py), so this is simply the widget that edits them. Anything else
-would be a second, worse keymap editor drawn next to the real one, which is
-what the hand-rolled version in the N-panel had become.
+Drawn with `rna_keymap_ui.draw_kmi`, Blender's own keymap rows: the keys are
+real `KeyMapItem`s (see keymap.py). Never build a second keymap editor.
 
-Everything the rows offer comes free with them: the modifier toggles, the
-key-type dropdown, the map-type switch between Keyboard and Mouse, the per-item
-enable checkbox, and the restore-to-default arrow that appears once an item is
-user-modified. None of it is this module's to implement, and the same items
-show up under Preferences > Keymap > Add-ons for anyone who never opens this
-page.
-
-The N-panel's Keybinds tab is a button that opens this, plus the read-only list
-of what is *not* remappable. That split is the point: a tab that tried to edit
-fifteen bindings in a 300px column was unreadable, and the columns stretched to
-whatever the longest key label happened to be.
+The N-panel's Keybinds tab opens this page.
 """
 import os
 
@@ -24,20 +11,16 @@ import bpy
 
 from . import keymap
 
-# Written into a deployed copy by scripts/deploy.py, and nothing else. Its
-# presence is what tells this code apart from the same files installed from a
-# release zip -- there is no other difference, and asking the user to say which
-# they have is asking them to answer a question the deploy already knew.
+# Written into a deployed copy by scripts/deploy.py, and nothing else.
+# Must match the literal in scripts/deploy.py (tests/test_deploy_marker.py).
 DEV_MARKER_NAME = ".deployed"
 
 
 def _addon_keymap_items() -> list[tuple[bpy.types.KeyMap, bpy.types.KeyMapItem]]:
     """The addon's registered items, newest registration first in ACTIONS order.
 
-    Read from the registry `operators._register_keymaps` fills rather than by
-    walking the keyconfig: two of our items can share a key and an operator
-    (the two wheel directions of `retop.nudge_span`), so matching them back by
-    idname alone would pair them up wrong.
+    Read from the registry `operators._register_keymaps` fills, never by idname:
+    two items can share an operator.
     """
     keyconfig = bpy.context.window_manager.keyconfigs.addon
     if keyconfig is None:
@@ -55,20 +38,8 @@ def _addon_keymap_items() -> list[tuple[bpy.types.KeyMap, bpy.types.KeyMapItem]]
 def developer_mode() -> bool:
     """Whether the addon's own development affordances are shown.
 
-    Off by default: the reload button and the stale-load warning only mean
-    anything when the addon is being *edited* from a checkout. Installed from a
-    release zip there is nothing to reload against, and a button that reloads
-    the code you just installed is at best noise.
-
-    Read through `keymap.preferences`, which returns None when the package is
-    imported plainly rather than as an installed addon -- which is the tests
-    and `--background`. Missing preferences read as off, so nothing here can
-    make a headless run depend on a user setting.
-
-    Deploying turns it on by itself -- see `seed_developer_mode` -- but this
-    still reads the setting rather than the marker, because turning it off has
-    to keep working in a deployed copy. The deploy decides the *default*, not
-    the answer.
+    Off by default, and off in the tests and `--background` (no preferences).
+    Always reads the setting, never the deploy marker, so it can be turned off.
     """
     prefs = keymap.preferences()
     return bool(getattr(prefs, "developer_mode", False))
@@ -77,34 +48,22 @@ def developer_mode() -> bool:
 def deploy_stamp() -> str:
     """What the last deploy into this copy wrote, or "" if it was not deployed.
 
-    A stamp rather than a flag: each deploy writes a new one, which is what
-    lets Developer Mode come back on every time you deploy while still staying
-    off in between if you turned it off.
+    A stamp, not a flag: each deploy writes a new one.
     """
     marker = os.path.join(os.path.dirname(os.path.abspath(__file__)), DEV_MARKER_NAME)
     try:
         with open(marker, "r", encoding="utf-8") as handle:
             return handle.read().strip()
     except OSError:
-        # No marker (a release zip), or unreadable. Either way this is not a
-        # working copy as far as anything here is concerned.
+        # No marker (a release zip), or unreadable.
         return ""
 
 
 def seed_developer_mode() -> None:
     """Turn Developer Mode on when the code was just deployed from a checkout.
 
-    Deploying *is* the statement that this is a working copy, so having to then
-    go and tick a box in the preferences is a step that knows nothing the
-    deploy did not already know -- and forgetting it looks exactly like a
-    deploy that did not land, which is the one failure the version string
-    exists to report.
-
-    Seeded once per deploy, not forced on every registration: the stamp the
-    last seeding acted on is remembered, so Developer Mode can still be turned
-    off in a deployed copy and stays off until the next deploy writes a new
-    one. Silent everywhere else -- `keymap.preferences()` is None in the tests
-    and in `--background`, so nothing headless can come to depend on this.
+    Once per deploy stamp, so it can still be turned off until the next deploy.
+    Silent when `keymap.preferences()` is None.
     """
     stamp = deploy_stamp()
     if not stamp:
@@ -116,8 +75,8 @@ def seed_developer_mode() -> None:
         prefs.dev_seed_stamp = stamp
         prefs.developer_mode = True
     except AttributeError:
-        # Preferences from an older registration, mid-reload. Nothing here is
-        # worth failing a register() over.
+        # Preferences from an older registration, mid-reload. Never fail
+        # register() over this.
         pass
 
 
@@ -142,9 +101,7 @@ def draw_keymap(layout: bpy.types.UILayout) -> None:
         if not items:
             continue
         row = column.row()
-        # The label in its own fixed-width split rather than inside the row:
-        # `draw_kmi` builds a full-width block, and putting a label beside it
-        # in a plain row makes every column as wide as the longest key name.
+        # A fixed-width split for the label, or the columns stretch.
         split = row.split(factor=0.25)
         split.label(text=keymap.label_of(action_id))
         body = split.column()
@@ -157,8 +114,7 @@ class RETOP_AddonPreferences(bpy.types.AddonPreferences):
     # Must be the package name for Blender to attach this to the addon entry.
     bl_idname = __package__
 
-    # Annotated, never assigned: that is how Blender registers a property, and
-    # it is the one class-body annotation a registered class may carry.
+    # Annotated, never assigned: that is how Blender registers a property.
     global_keys_outside_session: bpy.props.BoolProperty(
         name="Global Keys Outside a Session",
         description=("Keep Isolate ('/'), Mirror (Alt+X) and Retopo X-ray (V) live when no "
@@ -169,10 +125,8 @@ class RETOP_AddonPreferences(bpy.types.AddonPreferences):
         default=False,
     )
 
-    # Not drawn: it is bookkeeping for `seed_developer_mode`, holding the stamp
-    # of the deploy that last switched Developer Mode on. Blender keeps it with
-    # the rest of the preferences, which is what makes "on again after the next
-    # deploy, off in between" survive a restart.
+    # Not drawn. The stamp of the deploy that last switched Developer Mode on
+    # (`seed_developer_mode`).
     dev_seed_stamp: bpy.props.StringProperty(default="")
 
     developer_mode: bpy.props.BoolProperty(
@@ -204,9 +158,7 @@ def register() -> None:
         try:
             bpy.utils.register_class(cls)
         except Exception:
-            # Running from a plain import rather than as an installed addon
-            # (the tests do): there is no addon entry for these preferences to
-            # attach to, and that must not take the rest of the addon down.
+            # A plain import (the tests) has no addon entry to attach to.
             pass
     # After the classes: it writes to the preferences it just registered.
     seed_developer_mode()
